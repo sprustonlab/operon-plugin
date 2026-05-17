@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "operon": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/operon-mcp-server",
+      "args": [],
+      "env": {},
+      "capabilities": ["claude/channel"]
+    }
+  }
+}

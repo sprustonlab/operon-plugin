@@ -1,0 +1,12 @@
+{
+  "name": "operon-plugin",
+  "description": "A Guided, Self-Revisable plugin for AI Research Software Operations in Claude Code",
+  "version": "0.1.0",
+  "author": {
+    "name": "Boaz Mohar",
+    "email": "boazmohar@gmail.com"
+  },
+  "homepage": "https://github.com/SprustonLab/operon-plugin",
+  "repository": "https://github.com/SprustonLab/operon-plugin",
+  "license": "Apache-2.0"
+}

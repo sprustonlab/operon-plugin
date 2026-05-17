@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+.venv/
+venv/
+
+# Tests / build artifacts
+.test_results/
+
+# Operon project-local state (defensive: should never live inside this repo)
+.operon/
+
+# OS
+.DS_Store
+Thumbs.db

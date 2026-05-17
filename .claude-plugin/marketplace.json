@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "operon-plugin-marketplace",
+  "description": "Marketplace for operon-plugin: a Guided, Self-Revisable plugin for AI Research Software Operations in Claude Code",
+  "owner": {
+    "name": "Boaz Mohar, SprustonLab",
+    "email": "boazmohar@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "operon-plugin",
+      "description": "A Guided, Self-Revisable plugin for AI Research Software Operations in Claude Code",
+      "author": {
+        "name": "Boaz Mohar",
+        "email": "boazmohar@gmail.com"
+      },
+      "category": "development",
+      "version": "0.1.0",
+      "source": "./plugins/operon-plugin",
+      "homepage": "https://github.com/SprustonLab/operon-plugin",
+      "repository": "https://github.com/SprustonLab/operon-plugin",
+      "license": "Apache-2.0"
+    }
+  ]
+}
