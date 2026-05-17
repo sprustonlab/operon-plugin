@@ -290,10 +290,14 @@ def _assemble_system_prompt(
             _, phase_body = _parse_identity_md(phase_text)
             parts.append(phase_body.rstrip())
 
-    # Step 3: ## Constraints block. Phase 6 will populate this with
-    # projected Rules; Phase 3 leaves it intentionally empty. Per the
-    # task brief we omit the heading entirely rather than emit an empty
-    # section, so the assembled prompt stays clean until Phase 6.
+    # Step 3: ## Constraints block. Per SPEC §5 step 3 the assembled
+    # prompt always ends with the heading; the body lists projected
+    # Rules and advance checks for (role, current_phase). Phase 6 will
+    # populate the body; Phase 3 emits the heading with a placeholder
+    # body so the prompt shape is stable across phases (downstream
+    # agent behavior can rely on the heading existing).
+    constraints_body = "(no Rules apply in this phase)"
+    parts.append(f"## Constraints\n\n{constraints_body}")
     assembled = "\n\n".join(p for p in parts if p).strip() + "\n"
     return assembled, frontmatter
 
@@ -361,11 +365,14 @@ def _atomic_write_handle_file(handle: str, record: dict[str, Any]) -> Path:
 
 
 def _read_phase_state() -> tuple[str, str | None]:
-    """Read `(active_workflow, current_phase)` from phase_state.json.
+    """Read `(workflow_id, current_phase)` from phase_state.json.
 
     Returns `(workflow_id, current_phase)`. Raises `SpawnAgentError` if
-    the file is missing or lacks `active_workflow`. `current_phase` may
-    be None (no advance has happened yet).
+    the file is missing or lacks `workflow_id`. `current_phase` may be
+    None (no advance has happened yet).
+
+    Per SPEC §11 and §6.5 keys table the canonical field name in
+    `phase_state.json` is `workflow_id` (not `active_workflow`).
     """
     try:
         path = paths.phase_state_file()
@@ -382,10 +389,10 @@ def _read_phase_state() -> tuple[str, str | None]:
         raise SpawnAgentError(f"Failed to read phase state '{path}': {exc}") from exc
     if not isinstance(data, dict):
         raise SpawnAgentError(f"phase_state.json '{path}' must contain a JSON object.")
-    workflow_id = data.get("active_workflow")
+    workflow_id = data.get("workflow_id")
     if not isinstance(workflow_id, str) or not workflow_id:
         raise SpawnAgentError(
-            f"phase_state.json '{path}' missing non-empty 'active_workflow'."
+            f"phase_state.json '{path}' missing non-empty 'workflow_id'."
         )
     current_phase = data.get("current_phase")
     if current_phase is not None and not isinstance(current_phase, str):
@@ -445,13 +452,20 @@ def _spawn_subprocess(
     env = dict(os.environ)
     env[identity.ENV_HANDLE_VAR] = handle
     try:
+        # stdout/stderr -> DEVNULL: Popen pipe buffers cap at ~64KB on
+        # Linux. Without a drainer thread the spawned `claude --bg`
+        # blocks on its next write once the buffer fills, deadlocking
+        # the new session. Phase 4 may wire a real drainer if we ever
+        # need to capture stdout (e.g. parse the `backgrounded · <id>`
+        # confirmation line); for Phase 3 the pre-generated session_id
+        # makes stdout-parsing unnecessary, so discarding is safe.
         return subprocess.Popen(
             argv,
             cwd=str(project_path),
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except (OSError, FileNotFoundError) as exc:
         raise SpawnAgentError(
@@ -504,6 +518,16 @@ def _do_spawn(args: dict[str, Any]) -> dict[str, Any]:
     # 2) Coordinator identity gate.
     caller_record = _require_coordinator()
     caller_handle = caller_record.get("handle")
+    if not isinstance(caller_handle, str) or not caller_handle:
+        # Defensive: _require_coordinator already validated the role,
+        # but the `handle` field is the chain-of-trust anchor for the
+        # new agent's `spawned_by`. A missing/blank value would silently
+        # propagate `None` and break later chain-of-trust checks
+        # (`get_applicable_rules`, `get_agent_info` cross-Agent gate).
+        raise SpawnAgentError(
+            "Coordinator handle record is missing the 'handle' field; "
+            "cannot anchor spawned_by chain-of-trust."
+        )
 
     # 3) Read the active workflow + phase.
     workflow_id, current_phase = _read_phase_state()

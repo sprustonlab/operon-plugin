@@ -19,9 +19,12 @@ src/operon_mcp_server/            # Python MCP server package
 
 ## Status
 
-Bootstrap (Phase 0 of the implementation plan in `claudechic/.project_team/claude_code_port/SPEC_APPENDIX.md` §F).
-Directory skeleton only; the MCP server, workflows, hooks, rules, and
-skills are populated in subsequent phases.
+Pre-release. The MCP server, workflows, hooks, rules, and skills are
+landed phase by phase per the implementation plan in
+`claudechic/.project_team/claude_code_port/SPEC_APPENDIX.md` §F.
+The current phase is whatever the most recent commit on `main` says it
+is; the README intentionally does not pin a phase number to avoid
+drifting from reality.
 
 ## Install for development
 
