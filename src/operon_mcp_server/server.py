@@ -23,9 +23,7 @@ from typing import Any
 import anyio
 import mcp.types as mcp_types
 from mcp.server import Server
-from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
-from mcp.types import ServerCapabilities
 
 from .tools import bind_handle as bind_handle_tool
 from .tools import whoami as whoami_tool
@@ -43,18 +41,18 @@ SERVER_NAME = "operon"
 #: sync with `pyproject.toml`'s `[project] version`.
 SERVER_VERSION = "0.0.1"
 
-
-def _build_capabilities() -> ServerCapabilities:
-    """Construct the capabilities advertised at `initialize` time.
-
-    The `claude/channel` capability is a Claude-Code-specific extension
-    that lets the server push messages into running sessions (see
-    SPEC.md section 6 and section 7.2). `ServerCapabilities` is a
-    pydantic model with `extra='allow'`, so we attach the capability as
-    a top-level field -- mirroring how it is declared in
-    `plugins/operon-plugin/.mcp.json`.
-    """
-    return ServerCapabilities(**{"claude/channel": {}})
+#: Non-standard Claude-Code capabilities advertised under the
+#: `experimental` field of `capabilities` per the MCP spec. The
+#: `claude/channel` extension lets the server push messages into
+#: running sessions (SPEC.md sections 6 and 7.2). Per the MCP spec all
+#: non-standard capabilities MUST be nested under `experimental` --
+#: Phase 1 placed it at top level (via pydantic extra-field), which
+#: caused Claude Code to silently ignore the capability AND, because
+#: the `tools` capability was not declared at all, Claude Code never
+#: even asked for `tools/list`. We now delegate capability
+#: construction to the SDK helper which auto-derives `tools` from the
+#: registered `@server.list_tools()` handler.
+EXPERIMENTAL_CAPABILITIES: dict[str, dict[str, Any]] = {"claude/channel": {}}
 
 
 #: Routing table: tool name -> (handler coroutine). Includes HIDDEN
@@ -100,10 +98,13 @@ def _build_server() -> Server:
 async def _run() -> None:
     """Run the stdio MCP server until the peer disconnects."""
     server = _build_server()
-    init_options = InitializationOptions(
-        server_name=SERVER_NAME,
-        server_version=SERVER_VERSION,
-        capabilities=_build_capabilities(),
+    # Use the SDK helper: it auto-derives `capabilities.tools` from the
+    # registered `@server.list_tools()` handler and nests our
+    # `claude/channel` extension under `experimental` per MCP spec. The
+    # helper also sets `server_name` / `server_version` from the
+    # `Server(name, version=...)` arguments.
+    init_options = server.create_initialization_options(
+        experimental_capabilities=EXPERIMENTAL_CAPABILITIES,
     )
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, init_options)
