@@ -1,11 +1,15 @@
 """operon-plugin MCP server entry point.
 
-Phase 3: single-agent spawn. Registered tools (visibility per SPEC.md
-section 7.1):
+Phase 4: inter-agent messaging. Registered tools (visibility per
+SPEC.md section 7.1):
 
 - `whoami` -- visible to All roles.
 - `spawn_agent` -- visible to Coordinator only.
 - `bind_handle` -- HIDDEN (hook-only; routed by qualified name).
+- `message_agent` -- visible to All roles.
+- `broadcast_message` -- visible to All roles.
+- `interrupt_agent` -- visible to Coordinator only.
+- `close_agent` -- visible to Coordinator only.
 
 Role-scoped `tools/list` filtering is applied per SPEC.md section 7.1:
 each MCP subprocess returns only the tools visible to its env-anchored
@@ -14,9 +18,10 @@ looking up `_handles/<handle>.json`, and reading the `role` field. If no
 identity context is available (env unset, handle file missing) the
 server defaults to the least-privilege view (All-class tools only).
 
-Per SPEC.md section 16 the server will eventually also host the
-`claude/channel` push path, `elicitation/create` issuance, and a
-`watchdog` filesystem-watch loop. None of that is wired here yet.
+Per SPEC.md section 6.6 each MCP subprocess also runs a background
+filesystem-watch loop over its OWN `mailbox/<self>/inbox/` and
+`mailbox/<self>/control/` directories. Implemented in `watch.py`;
+started lazily on the first `tools/list` fire that resolves identity.
 """
 
 from __future__ import annotations
@@ -29,8 +34,12 @@ import mcp.types as mcp_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from . import identity
+from . import identity, watch
 from .tools import bind_handle as bind_handle_tool
+from .tools import broadcast_message as broadcast_message_tool
+from .tools import close_agent as close_agent_tool
+from .tools import interrupt_agent as interrupt_agent_tool
+from .tools import message_agent as message_agent_tool
 from .tools import spawn_agent as spawn_agent_tool
 from .tools import whoami as whoami_tool
 
@@ -77,6 +86,10 @@ _TOOL_VISIBILITY: dict[str, str] = {
     whoami_tool.TOOL_NAME: _VISIBILITY_ALL,
     spawn_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
     bind_handle_tool.TOOL_NAME: _VISIBILITY_HIDDEN,
+    message_agent_tool.TOOL_NAME: _VISIBILITY_ALL,
+    broadcast_message_tool.TOOL_NAME: _VISIBILITY_ALL,
+    interrupt_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
+    close_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
 }
 
 #: Routing table: tool name -> handler coroutine. Includes HIDDEN tools
@@ -86,6 +99,10 @@ _TOOL_HANDLERS = {
     whoami_tool.TOOL_NAME: whoami_tool.call,
     spawn_agent_tool.TOOL_NAME: spawn_agent_tool.call,
     bind_handle_tool.TOOL_NAME: bind_handle_tool.call,
+    message_agent_tool.TOOL_NAME: message_agent_tool.call,
+    broadcast_message_tool.TOOL_NAME: broadcast_message_tool.call,
+    interrupt_agent_tool.TOOL_NAME: interrupt_agent_tool.call,
+    close_agent_tool.TOOL_NAME: close_agent_tool.call,
 }
 
 #: Tool descriptors keyed by name (used by the role-scoped filter to
@@ -95,6 +112,10 @@ _TOOL_HANDLERS = {
 _TOOL_DESCRIPTORS: dict[str, mcp_types.Tool] = {
     whoami_tool.TOOL_NAME: whoami_tool.tool_descriptor(),
     spawn_agent_tool.TOOL_NAME: spawn_agent_tool.tool_descriptor(),
+    message_agent_tool.TOOL_NAME: message_agent_tool.tool_descriptor(),
+    broadcast_message_tool.TOOL_NAME: broadcast_message_tool.tool_descriptor(),
+    interrupt_agent_tool.TOOL_NAME: interrupt_agent_tool.tool_descriptor(),
+    close_agent_tool.TOOL_NAME: close_agent_tool.tool_descriptor(),
 }
 
 _log = logging.getLogger(__name__)
@@ -154,8 +175,19 @@ def _filter_tools_for_role(role: str | None) -> list[mcp_types.Tool]:
     return visible
 
 
-def _build_server() -> Server:
-    """Create the MCP `Server` instance with tool handlers attached."""
+def _build_server(
+    watch_state: dict[str, Any],
+    write_stream_holder: dict[str, Any],
+    task_group_holder: dict[str, Any],
+) -> Server:
+    """Create the MCP `Server` instance with tool handlers attached.
+
+    `watch_state`, `write_stream_holder`, and `task_group_holder` are
+    threaded through so the `list_tools` callback can lazily start the
+    background watch loop on first identity resolution. The holders
+    are populated by `_run()` after the stdio streams and task group
+    exist.
+    """
     server: Server = Server(SERVER_NAME, version=SERVER_VERSION)
 
     @server.list_tools()
@@ -165,6 +197,19 @@ def _build_server() -> Server:
         # bound mid-session (e.g. SessionStart hook fires after first
         # ping) picks up the new visibility on the next request.
         role = _resolve_caller_role()
+        # Opportunistic: start the watch loop on the first list_tools
+        # fire where identity is resolvable. Per SPEC §6.6 the watch
+        # loop is per-subprocess and only meaningful once we know which
+        # mailbox is ours.
+        write_stream = write_stream_holder.get("stream")
+        task_group = task_group_holder.get("tg")
+        if write_stream is not None and task_group is not None:
+            try:
+                await watch.start_watch_loop_if_ready(
+                    write_stream, task_group, watch_state,
+                )
+            except Exception as exc:  # pragma: no cover (defensive)
+                _log.exception("Failed to start watch loop: %s", exc)
         return _filter_tools_for_role(role)
 
     @server.call_tool()
@@ -180,8 +225,19 @@ def _build_server() -> Server:
 
 
 async def _run() -> None:
-    """Run the stdio MCP server until the peer disconnects."""
-    server = _build_server()
+    """Run the stdio MCP server until the peer disconnects.
+
+    Phase 4: also runs a background filesystem-watch loop (`watch.py`)
+    concurrently with the MCP protocol loop via `anyio.create_task_group`.
+    The watch loop is started lazily on first `list_tools` so identity
+    is resolvable (the SessionStart hook may bind it after `initialize`
+    but before `tools/list`).
+    """
+    watch_state: dict[str, Any] = {"started": False}
+    write_stream_holder: dict[str, Any] = {}
+    task_group_holder: dict[str, Any] = {}
+
+    server = _build_server(watch_state, write_stream_holder, task_group_holder)
     # Use the SDK helper: it auto-derives `capabilities.tools` from the
     # registered `@server.list_tools()` handler and nests our
     # `claude/channel` extension under `experimental` per MCP spec. The
@@ -191,7 +247,17 @@ async def _run() -> None:
         experimental_capabilities=EXPERIMENTAL_CAPABILITIES,
     )
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, init_options)
+        write_stream_holder["stream"] = write_stream
+        async with anyio.create_task_group() as tg:
+            task_group_holder["tg"] = tg
+            # The server.run() coroutine is the MCP protocol loop; the
+            # watch loop is start_soon-scheduled lazily from
+            # _list_tools. When server.run() returns (peer disconnect),
+            # cancel the task group so the watch loop unwinds too.
+            try:
+                await server.run(read_stream, write_stream, init_options)
+            finally:
+                tg.cancel_scope.cancel()
 
 
 def main() -> None:

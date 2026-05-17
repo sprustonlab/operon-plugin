@@ -46,6 +46,7 @@ renames, no platform-gated APIs. `subprocess.Popen` is used to launch
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -57,6 +58,8 @@ from typing import Any
 import mcp.types as mcp_types
 
 from .. import identity, paths, roster
+
+_log = logging.getLogger(__name__)
 
 #: MCP tool name. Coordinator-only per SPEC section 7.1.
 TOOL_NAME = "spawn_agent"
@@ -242,7 +245,9 @@ def _parse_identity_md(text: str) -> tuple[dict[str, str], str]:
         if ":" not in line:
             # Tolerate unparseable lines rather than failing the spawn:
             # SPEC says malformed identity content surfaces as bad agent
-            # behavior, not a spawn-time error.
+            # behavior, not a spawn-time error. Log so future readers
+            # know fields got dropped (B5 carryover from Phase 3).
+            _log.debug("identity.md frontmatter: skipped unparseable line %r", raw_line)
             continue
         key, _, value = line.partition(":")
         fields[key.strip()] = value.strip().strip('"').strip("'")
