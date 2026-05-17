@@ -1,3 +1,20 @@
 {
-  "hooks": {}
+  "_comment": "operon-plugin hooks. Phase 2 wires SessionStart to bind_handle per SPEC.md section 8 and section 6.5 step 6. The mcp_tool handler form invokes mcp__operon__bind_handle directly; bind_handle reads OPERON_AGENT_HANDLE from its own subprocess env and validates against the session_id supplied by the hook's JSON payload. The matcher 'startup|resume|clear' fires on all SessionStart sources; bind_handle is idempotent so resume/clear re-fires against the same handle succeed.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "tool": "mcp__operon__bind_handle",
+            "arguments": {
+              "handle": "${env:OPERON_AGENT_HANDLE}",
+              "session_id": "${hook_input.session_id}"
+            }
+          }
+        ]
+      }
+    ]
+  }
 }

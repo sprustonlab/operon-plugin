@@ -25,9 +25,11 @@ skills are populated in subsequent phases.
 
 ## Install for development
 
+Requires Python >= 3.10.
+
 ```bash
 # from this repo root
-pip install -e .
+pip install -e .   # installs operon_mcp_server in editable mode + its deps (mcp, watchdog)
 claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-plugin/
 ```
 
