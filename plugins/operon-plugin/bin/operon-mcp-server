@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# operon-plugin MCP server entry shim.
+#
+# Invoked by Claude Code as the command in .mcp.json (resolved via
+# ${CLAUDE_PLUGIN_ROOT}/bin/operon-mcp-server). Hands control to the
+# Python entry point defined in pyproject.toml.
+#
+# Cross-platform note: this shebang serves Linux/macOS. On Windows,
+# Claude Code launches the documented path directly; the Python
+# interpreter on PATH is responsible for executing the module.
+exec python -m operon_mcp_server.server "$@"
