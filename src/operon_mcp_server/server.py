@@ -37,11 +37,17 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from . import identity, watch
+from .tools import activate_workflow as activate_workflow_tool
+from .tools import advance_phase as advance_phase_tool
 from .tools import bind_handle as bind_handle_tool
 from .tools import broadcast_message as broadcast_message_tool
 from .tools import close_agent as close_agent_tool
+from .tools import get_agent_info as get_agent_info_tool
+from .tools import get_applicable_rules as get_applicable_rules_tool
+from .tools import get_phase as get_phase_tool
 from .tools import interrupt_agent as interrupt_agent_tool
 from .tools import message_agent as message_agent_tool
+from .tools import set_artifact_dir as set_artifact_dir_tool
 from .tools import spawn_agent as spawn_agent_tool
 from .tools import whoami as whoami_tool
 
@@ -124,6 +130,13 @@ _TOOL_VISIBILITY: dict[str, str] = {
     broadcast_message_tool.TOOL_NAME: _VISIBILITY_ALL,
     interrupt_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
     close_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
+    # Phase 5: workflow + phase engine.
+    activate_workflow_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
+    set_artifact_dir_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
+    advance_phase_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
+    get_phase_tool.TOOL_NAME: _VISIBILITY_ALL,
+    get_applicable_rules_tool.TOOL_NAME: _VISIBILITY_ALL,
+    get_agent_info_tool.TOOL_NAME: _VISIBILITY_ALL,
 }
 
 #: Routing table: tool name -> handler coroutine. Includes HIDDEN tools
@@ -137,6 +150,13 @@ _TOOL_HANDLERS = {
     broadcast_message_tool.TOOL_NAME: broadcast_message_tool.call,
     interrupt_agent_tool.TOOL_NAME: interrupt_agent_tool.call,
     close_agent_tool.TOOL_NAME: close_agent_tool.call,
+    # Phase 5: workflow + phase engine.
+    activate_workflow_tool.TOOL_NAME: activate_workflow_tool.call,
+    set_artifact_dir_tool.TOOL_NAME: set_artifact_dir_tool.call,
+    advance_phase_tool.TOOL_NAME: advance_phase_tool.call,
+    get_phase_tool.TOOL_NAME: get_phase_tool.call,
+    get_applicable_rules_tool.TOOL_NAME: get_applicable_rules_tool.call,
+    get_agent_info_tool.TOOL_NAME: get_agent_info_tool.call,
 }
 
 #: Tool descriptors keyed by name (used by the role-scoped filter to
@@ -150,6 +170,13 @@ _TOOL_DESCRIPTORS: dict[str, mcp_types.Tool] = {
     broadcast_message_tool.TOOL_NAME: broadcast_message_tool.tool_descriptor(),
     interrupt_agent_tool.TOOL_NAME: interrupt_agent_tool.tool_descriptor(),
     close_agent_tool.TOOL_NAME: close_agent_tool.tool_descriptor(),
+    # Phase 5 tools.
+    activate_workflow_tool.TOOL_NAME: activate_workflow_tool.tool_descriptor(),
+    set_artifact_dir_tool.TOOL_NAME: set_artifact_dir_tool.tool_descriptor(),
+    advance_phase_tool.TOOL_NAME: advance_phase_tool.tool_descriptor(),
+    get_phase_tool.TOOL_NAME: get_phase_tool.tool_descriptor(),
+    get_applicable_rules_tool.TOOL_NAME: get_applicable_rules_tool.tool_descriptor(),
+    get_agent_info_tool.TOOL_NAME: get_agent_info_tool.tool_descriptor(),
 }
 
 _log = logging.getLogger(__name__)

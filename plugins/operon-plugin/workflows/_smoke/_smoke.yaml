@@ -1,0 +1,26 @@
+workflow_id: _smoke
+
+# Throwaway 2-phase workflow used by Phase 4/5 smoke tests. Exists to
+# exercise the workflow loader + phase engine without dragging in
+# project_team's full multi-phase ordering. See SPEC §11.
+#
+# Phase ordering:
+#   vision  -- initial phase, advances on user manual-confirm
+#   main    -- second phase, advances on artifact-dir-ready-check
+#
+# Both phases declare a single advance check so the smoke script can
+# verify check-success and check-failure paths.
+
+phases:
+  - id: vision
+    file: vision
+    advance_checks:
+      - type: manual-confirm
+        prompt: "Approve advance from `vision` to `main`?"
+
+  - id: main
+    file: main
+    advance_checks:
+      - type: artifact-dir-ready-check
+        on_failure:
+          message: "Artifact directory not set -- call set_artifact_dir(...) first."
