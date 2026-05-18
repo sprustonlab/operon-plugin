@@ -219,6 +219,31 @@ def _bootstrap_fresh(project_root: Path) -> str:
     return handle
 
 
+def _env_handle_file_exists(env_handle: str, start: Path) -> bool:
+    """Check whether `OPERON_AGENT_HANDLE` points at a real file.
+
+    Phase 14 followup: a stale env value from a previous test session
+    must NOT short-circuit auto-bootstrap when the user launches in a
+    fresh project. The handle is "stale relative to this project" if
+    any of these is true:
+
+      - the project has no `.operon/` ancestor of cwd
+      - `_active.json` is missing or unreadable
+      - `<run-dir>/_handles/<env_handle>.json` does not exist
+
+    spawn_agent-spawned workers are safe: the Coordinator writes the
+    worker's handle file BEFORE the subprocess Popen (SPEC §6.5
+    step 1), so the same validation passes for them.
+    """
+    try:
+        h_file = paths.handle_file(env_handle, start)
+    except paths.OperonPathError:
+        # Either no .operon/ ancestor OR _active.json missing/corrupt.
+        # Both mean "no resolvable active run" -> env is stale.
+        return False
+    return h_file.is_file()
+
+
 def auto_bootstrap_if_needed(start: Path | None = None) -> str | None:
     """Resolve or create identity context per Phase 14 dispatch.
 
@@ -228,8 +253,12 @@ def auto_bootstrap_if_needed(start: Path | None = None) -> str | None:
     same value without re-running the lookup.
 
     Behavior:
-      1. If `OPERON_AGENT_HANDLE` env is set, return it. NO bootstrap.
-         Existing fixture / spawn_agent flows preserved verbatim.
+      1. If `OPERON_AGENT_HANDLE` env is set AND the handle file
+         exists in the current project's active run -> return env
+         value (no bootstrap, fixture / spawn_agent flows preserved).
+         If the env handle is STALE relative to this project
+         (handle file not found), the env is ignored with a WARNING
+         log line and bootstrap falls through to step 2.
       2. If the current project has an active run with EXACTLY ONE
          coordinator handle file, adopt that handle (cache only; no
          filesystem mutation).
@@ -240,14 +269,31 @@ def auto_bootstrap_if_needed(start: Path | None = None) -> str | None:
     subprocess stays alive and serves `whoami` (which surfaces
     IdentityError to the caller).
     """
-    # 1. Env-set: nothing to do.
-    env_handle = os.environ.get(identity.ENV_HANDLE_VAR)
-    if env_handle:
-        _log.debug("bootstrap: env handle already set; skipping")
-        return env_handle
-
     here = Path(start) if start is not None else Path.cwd()
     here = here.resolve()
+
+    # 1. Env-set + handle file resolvable: nothing to do. Otherwise
+    # (stale env from a different project), ignore env and fall
+    # through to discovery + fresh bootstrap.
+    env_handle = os.environ.get(identity.ENV_HANDLE_VAR)
+    if env_handle:
+        if _env_handle_file_exists(env_handle, here):
+            _log.debug("bootstrap: env handle resolves in this project; skipping")
+            return env_handle
+        _log.warning(
+            "bootstrap: ignoring stale %s=%s -- handle file not found in "
+            "this project's active run (cwd=%s). Falling through to "
+            "discovery / fresh bootstrap.",
+            identity.ENV_HANDLE_VAR,
+            env_handle,
+            here,
+        )
+        # Important: also clear the env var IN-PROCESS so downstream
+        # callers of identity.read_env_handle() don't pick up the
+        # stale value. Other subprocesses inherit the user's shell
+        # env independently; this only affects the current MCP
+        # subprocess.
+        os.environ.pop(identity.ENV_HANDLE_VAR, None)
 
     # 2. Existing project with a discoverable coordinator handle?
     try:
