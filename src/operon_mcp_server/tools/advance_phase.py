@@ -71,8 +71,12 @@ class AdvancePhaseError(RuntimeError):
     """Raised on validation or write failures; becomes a tool error."""
 
 
-def _require_coordinator() -> str:
-    """Return Coordinator agent_name; reject non-Coordinator with tool error."""
+def _require_coordinator() -> tuple[str, str]:
+    """Return (Coordinator agent_name, role); reject non-Coordinator.
+
+    Phase 13: role is returned alongside name so the caller_brief
+    renderer can scope the markdown lookup to the right tier.
+    """
     try:
         record = spawn_agent_tool._require_coordinator()
     except spawn_agent_tool.SpawnAgentError as exc:
@@ -82,7 +86,12 @@ def _require_coordinator() -> str:
         raise AdvancePhaseError(
             "Coordinator handle record is missing 'agent_name' field."
         )
-    return name
+    role = record.get("role")
+    if not isinstance(role, str) or not role:
+        raise AdvancePhaseError(
+            "Coordinator handle record is missing 'role' field."
+        )
+    return name, role
 
 
 def _build_elicit_closure():
@@ -162,7 +171,7 @@ def _notify_other_agents(
 
 
 async def _do_advance() -> dict[str, Any]:
-    coord_name = _require_coordinator()
+    coord_name, coord_role = _require_coordinator()
 
     state = workflow.read_phase_state()
     workflow_id = state.get("workflow_id")
@@ -242,6 +251,23 @@ async def _do_advance() -> dict[str, Any]:
     # Best-effort notification to non-Coordinator Agents per §11.1 step 4.
     notified = _notify_other_agents(coord_name, current_phase, next_phase)
 
+    # Phase 13 Finding 3: render the caller's role brief for the
+    # NEW phase so the Coordinator's LLM gets per-phase context.
+    brief = spawn_agent_tool.assemble_caller_brief(
+        workflow_id, coord_role, next_phase
+    )
+    if brief is None:
+        brief = spawn_agent_tool.absent_caller_brief(
+            workflow_id,
+            coord_role,
+            next_phase,
+            reason=(
+                f"No {coord_role}/{next_phase}.md or "
+                f"{coord_role}/identity.md in any tier for workflow "
+                f"{workflow_id!r}; caller will operate without a brief."
+            ),
+        )
+
     return {
         "advanced": True,
         "from": current_phase,
@@ -249,6 +275,7 @@ async def _do_advance() -> dict[str, Any]:
         "at": history_entry.get("at"),
         "outcomes": outcomes_payload,
         "notified": notified,
+        "caller_brief": brief,
     }
 
 

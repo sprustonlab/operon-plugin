@@ -125,6 +125,7 @@ def _copy_coordinator_handle_and_roster_row(
     new_run_dir: Path,
     handle: str,
     coord_record: dict[str, Any],
+    new_workflow_id: str,
 ) -> tuple[Path, Path]:
     """Carryover #2: propagate the Coordinator's identity into the new run.
 
@@ -138,21 +139,27 @@ def _copy_coordinator_handle_and_roster_row(
     workers spawned from the new run can immediately
     `message_agent("Coordinator", ...)`.
 
+    Phase 13 (Finding 1): the copied handle record's `workflow_id`
+    field is rewritten to `new_workflow_id` so `whoami` and
+    `get_phase` agree after the swap. The original record's other
+    fields (agent_name, role, session_id, spawned_at, spawned_by)
+    are preserved verbatim.
+
     Returns `(handle_path, roster_path)` for diagnostics. Safe to
     call before _active.json is swapped: writes go to the new
     run-dir's `_handles/` and `agents.json` directly via path
     composition that does NOT depend on `_active.json`.
     """
-    # Handle file: copy verbatim from the env-anchored record. The
-    # record may have been read from the OLD run-dir's _handles/,
-    # but its content (handle, agent_name, role, etc.) is the same
-    # identity the Coordinator has had since spawn -- we just need
-    # it to exist in the new run-dir's _handles/ subtree so that
-    # the post-swap path lookup resolves it.
+    # Handle file: copy from the env-anchored record but rewrite the
+    # workflow_id to the new workflow_id (Phase 13 Finding 1). The
+    # rest of the record (handle, agent_name, role, etc.) is the
+    # same identity the Coordinator has had since spawn.
     handles_dir = new_run_dir / paths.HANDLES_DIRNAME
     handles_dir.mkdir(parents=True, exist_ok=True)
     handle_path = handles_dir / f"{handle}.json"
-    handle_payload = json.dumps(coord_record, indent=2, ensure_ascii=False)
+    new_record = dict(coord_record)
+    new_record["workflow_id"] = new_workflow_id
+    handle_payload = json.dumps(new_record, indent=2, ensure_ascii=False)
     tmp = handle_path.with_name(
         f"{handle_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     )
@@ -179,7 +186,9 @@ def _copy_coordinator_handle_and_roster_row(
         "role": coord_record.get("role", "coordinator"),
         "handle": handle,
         "session_id": coord_record.get("session_id", ""),
-        "workflow_id": coord_record.get("workflow_id", ""),
+        # Phase 13 Finding 1: pin to new_workflow_id so the roster
+        # row stays consistent with the rewritten handle file.
+        "workflow_id": new_workflow_id,
         "status": "idle",
         "spawned_at": coord_record.get("spawned_at", now),
         "last_turn_at": now,
@@ -311,9 +320,13 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     (run_dir / "mailbox").mkdir(parents=True, exist_ok=True)
 
     # Carryover #2 (Phase 5): copy Coordinator handle + seed roster
-    # row BEFORE swapping `_active.json`.
+    # row BEFORE swapping `_active.json`. Phase 13 Finding 1: pass
+    # workflow_id so the copied handle has the post-swap workflow_id.
     _copy_coordinator_handle_and_roster_row(
-        new_run_dir=run_dir, handle=coord_handle, coord_record=coord_record,
+        new_run_dir=run_dir,
+        handle=coord_handle,
+        coord_record=coord_record,
+        new_workflow_id=workflow_id,
     )
 
     # Atomic swap of _active.json via the shared helper.
@@ -327,6 +340,27 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     except workflow.WorkflowError as exc:
         raise ActivateWorkflowError(str(exc)) from exc
 
+    # Phase 13 Finding 2: render the caller's role brief for the new
+    # workflow's first phase so the Coordinator's LLM gets the same
+    # per-phase context that spawned workers receive.
+    caller_role = coord_record.get("role", "coordinator")
+    if isinstance(caller_role, str) and caller_role:
+        brief = spawn_agent_tool.assemble_caller_brief(
+            workflow_id, caller_role, first_phase
+        )
+        if brief is None:
+            brief = spawn_agent_tool.absent_caller_brief(
+                workflow_id,
+                caller_role,
+                first_phase,
+                reason=(
+                    f"No {caller_role}/identity.md in any tier for workflow "
+                    f"{workflow_id!r}; caller will operate without a brief."
+                ),
+            )
+    else:
+        brief = None
+
     return {
         "activated": True,
         "run_name": run_name,
@@ -337,6 +371,7 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
         "manifest_path": str(decl.source_path),
         "killed_workers": killed_workers,
         "previous_run": current_run_dir.name if current_run_dir else None,
+        "caller_brief": brief,
     }
 
 

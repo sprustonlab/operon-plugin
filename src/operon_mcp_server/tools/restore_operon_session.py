@@ -87,7 +87,10 @@ def _require_coordinator() -> dict[str, Any]:
 
 
 def _upsert_coordinator_in_target(
-    target_run_dir: Path, handle: str, coord_record: dict[str, Any]
+    target_run_dir: Path,
+    handle: str,
+    coord_record: dict[str, Any],
+    target_workflow_id: str | None,
 ) -> None:
     """Ensure the Coordinator's handle file + roster row exist in the
     target run-dir BEFORE we swap `_active.json`.
@@ -98,13 +101,22 @@ def _upsert_coordinator_in_target(
     so the env-anchored identity round-trips through the new active
     run). Same logic applies to the agents.json row -- de-dupe by
     handle and update in-place.
+
+    Phase 13 Finding 1: if `target_workflow_id` is provided (read from
+    the target run-dir's phase_state.json), the upserted handle's
+    `workflow_id` is rewritten to that value so `whoami` and
+    `get_phase` agree after the swap. If None (target had no parseable
+    phase_state.json), preserve the original record's workflow_id.
     """
     handles_dir = target_run_dir / paths.HANDLES_DIRNAME
     handles_dir.mkdir(parents=True, exist_ok=True)
 
-    # Handle file (upsert).
+    # Handle file (upsert). Phase 13 Finding 1: rewrite workflow_id.
     handle_path = handles_dir / f"{handle}.json"
-    payload = json.dumps(coord_record, indent=2, ensure_ascii=False)
+    new_record = dict(coord_record)
+    if target_workflow_id:
+        new_record["workflow_id"] = target_workflow_id
+    payload = json.dumps(new_record, indent=2, ensure_ascii=False)
     tmp = handle_path.with_name(
         f"{handle_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     )
@@ -136,7 +148,15 @@ def _upsert_coordinator_in_target(
         "role": coord_record.get("role", "coordinator"),
         "handle": handle,
         "session_id": coord_record.get("session_id", ""),
-        "workflow_id": coord_record.get("workflow_id", ""),
+        # Phase 13 Finding 1: pin to target_workflow_id when available
+        # so the roster row stays consistent with the rewritten
+        # handle file. Fallback to the record's original workflow_id
+        # if target's phase_state.json was unreadable.
+        "workflow_id": (
+            target_workflow_id
+            if target_workflow_id
+            else coord_record.get("workflow_id", "")
+        ),
         "status": "idle",
         "spawned_at": coord_record.get("spawned_at", now),
         "last_turn_at": now,
@@ -277,10 +297,26 @@ async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
+    # Phase 13 Finding 1: pre-read target's phase_state.json to get
+    # workflow_id; rewrite the upserted handle's workflow_id so
+    # `whoami` and `get_phase` agree after the swap.
+    target_workflow_id: str | None = None
+    try:
+        ps_data = json.loads(target_phase_state.read_text(encoding="utf-8"))
+        if isinstance(ps_data, dict):
+            wid = ps_data.get("workflow_id")
+            if isinstance(wid, str) and wid:
+                target_workflow_id = wid
+    except (OSError, json.JSONDecodeError):
+        target_workflow_id = None
+
     # Upsert the Coordinator into the target run BEFORE swapping
     # `_active.json` so identity resolution survives the switch.
     _upsert_coordinator_in_target(
-        target_run_dir=target_dir, handle=coord_handle, coord_record=coord_record,
+        target_run_dir=target_dir,
+        handle=coord_handle,
+        coord_record=coord_record,
+        target_workflow_id=target_workflow_id,
     )
 
     # Atomic swap.
@@ -301,6 +337,7 @@ async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
             "previous_run": current_run_dir.name if current_run_dir else None,
             "killed_workers": killed_workers,
             "phase_state_read_error": str(exc),
+            "caller_brief": None,
         }
     if not isinstance(phase_state, dict):
         phase_state = {}
@@ -328,15 +365,44 @@ async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             pass
 
+    # Phase 13 Finding 2: render the caller's role brief for the
+    # target run's current phase.
+    caller_role = coord_record.get("role", "coordinator")
+    restored_workflow_id = phase_state.get("workflow_id")
+    restored_phase = phase_state.get("current_phase")
+    brief = None
+    if (
+        isinstance(caller_role, str)
+        and caller_role
+        and isinstance(restored_workflow_id, str)
+        and restored_workflow_id
+    ):
+        brief = spawn_agent_tool.assemble_caller_brief(
+            restored_workflow_id,
+            caller_role,
+            restored_phase if isinstance(restored_phase, str) else None,
+        )
+        if brief is None:
+            brief = spawn_agent_tool.absent_caller_brief(
+                restored_workflow_id,
+                caller_role,
+                restored_phase if isinstance(restored_phase, str) else None,
+                reason=(
+                    f"No {caller_role}/identity.md in any tier for workflow "
+                    f"{restored_workflow_id!r}; caller will operate without a brief."
+                ),
+            )
+
     return {
         "restored": True,
         "run_name": run_name,
         "previous_run": current_run_dir.name if current_run_dir else None,
-        "workflow_id": phase_state.get("workflow_id"),
-        "current_phase": phase_state.get("current_phase"),
+        "workflow_id": restored_workflow_id,
+        "current_phase": restored_phase,
         "agent_count": agent_count,
         "alive_agent_count": alive_count,
         "killed_workers": killed_workers,
+        "caller_brief": brief,
     }
 
 

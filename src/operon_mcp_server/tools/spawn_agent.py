@@ -308,6 +308,120 @@ def _assemble_system_prompt(
     return assembled, frontmatter
 
 
+# -- Public caller-brief helper (Phase 13) -------------------------------
+
+
+def assemble_caller_brief(
+    workflow_id: str,
+    role: str,
+    current_phase: str | None,
+) -> dict[str, Any] | None:
+    """Render `<role>/identity.md` + `<role>/<phase>.md` for the caller.
+
+    Phase 13 (SPEC_APPENDIX §F): activate_workflow + advance_phase +
+    restore_operon_session need to surface the caller's role brief
+    so the Coordinator's LLM gets the same per-phase context that
+    spawned workers receive via the assembled system prompt.
+
+    Reuses the 3-tier walk (`_workflow_role_tiers`,
+    `_first_existing_file`) and the frontmatter parser
+    (`_parse_identity_md`) that drive spawn_agent's system prompt
+    assembly -- no duplicated logic.
+
+    Returns the brief dict on success::
+
+        {
+          "role": "<role>",
+          "phase": "<phase>" or None,
+          "identity_md_path": "<str path>",
+          "phase_md_path": "<str path>" or None,
+          "content": "<identity body>\\n\\n---\\n\\n<phase body>",
+          "reason": None,
+        }
+
+    Returns None when the caller's role has no `identity.md` in any
+    tier for this workflow (e.g. activating `_smoke` from a
+    Coordinator that doesn't have `_smoke/coordinator/identity.md`).
+    Callers should surface a brief-less response with a noted reason
+    rather than treating the absence as an error.
+    """
+    tiers = _workflow_role_tiers(workflow_id, role)
+    identity_file = _first_existing_file(tiers, "identity.md")
+    if identity_file is None:
+        return None
+
+    try:
+        identity_text = identity_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        _log.warning(
+            "caller_brief: identity.md read failed for %s: %s",
+            identity_file,
+            exc,
+        )
+        return None
+    _, identity_body = _parse_identity_md(identity_text)
+
+    phase_file = None
+    phase_body = ""
+    if current_phase:
+        phase_file = _first_existing_file(tiers, f"{current_phase}.md")
+        if phase_file is not None:
+            try:
+                phase_text = phase_file.read_text(encoding="utf-8")
+                _, phase_body = _parse_identity_md(phase_text)
+            except OSError as exc:
+                _log.warning(
+                    "caller_brief: %s.md read failed for %s: %s",
+                    current_phase,
+                    phase_file,
+                    exc,
+                )
+                phase_file = None
+                phase_body = ""
+
+    parts: list[str] = [identity_body.rstrip()]
+    if phase_body:
+        parts.append(phase_body.rstrip())
+    content = "\n\n---\n\n".join(p for p in parts if p)
+
+    return {
+        "role": role,
+        "phase": current_phase,
+        "identity_md_path": str(identity_file),
+        "phase_md_path": str(phase_file) if phase_file is not None else None,
+        "content": content,
+    }
+
+
+def absent_caller_brief(
+    workflow_id: str,
+    role: str,
+    current_phase: str | None,
+    *,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Diagnostic stub for the common no-brief response shape.
+
+    Returned in place of `caller_brief: null` when the caller wants to
+    explain WHY there's no brief (e.g. "_smoke/coordinator/identity.md
+    not found"). Phase 13 uses this so the absence is observable in
+    the tool response without forcing every caller to inline the
+    reason string.
+    """
+    return {
+        "role": role,
+        "phase": current_phase,
+        "identity_md_path": None,
+        "phase_md_path": None,
+        "content": None,
+        "reason": reason
+        or (
+            f"No identity.md found for role={role!r} in workflow "
+            f"{workflow_id!r} (checked project, user, plugin tiers)."
+        ),
+    }
+
+
 # -- Coordinator identity check ------------------------------------------
 
 
