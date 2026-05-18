@@ -1,0 +1,128 @@
+# Project Team workflow manifest -- operon port of claudechic's
+# `project_team`. Phase ordering, advance checks, and workflow-embedded
+# rules mirror claudechic verbatim with the following surgical
+# adaptations (Phase 11 port):
+#
+#   - MCP tool prefix `mcp__chic__` -> `mcp__operon__` (rule triggers).
+#   - Template token `${CLAUDECHIC_ARTIFACT_DIR}` -> `${ARTIFACT_DIR}`
+#     (matches operon's convention; see checks/builtins.py docstring).
+#   - Coordinator-spec-edit rule's `.claudechic/runs` path fragment ->
+#     `.operon` (operon's run-dir convention).
+#   - The `hints:` block on the specification phase from claudechic is
+#     omitted -- claudechic's pipeline-hints system is explicitly out
+#     of scope for the operon port (see plan: "Don't try to port hints").
+#
+# Note: operon's workflow loader currently treats `${ARTIFACT_DIR}` as
+# a literal in advance-check paths (no substitution layer yet). The
+# manual-confirm and artifact-dir-ready-check entries are unaffected;
+# the file-exists-check entries become aspirational until operon grows
+# a substitution helper analogous to claudechic's `_substitute.py`.
+
+workflow_id: project_team
+main_role: coordinator
+
+phases:
+  - id: vision
+    file: vision
+    advance_checks:
+      - type: manual-confirm
+        prompt: "Vision approved by user?"
+  - id: setup
+    file: setup
+    advance_checks:
+      - type: artifact-dir-ready-check
+        on_failure:
+          message: "Artifact directory not set -- call `set_artifact_dir(...)` MCP tool before advancing."
+      - type: file-exists-check
+        path: "${ARTIFACT_DIR}/STATUS.md"
+      - type: file-exists-check
+        path: "${ARTIFACT_DIR}/userprompt.md"
+  - id: leadership
+    file: leadership
+  - id: specification
+    file: specification
+    advance_checks:
+      - type: file-exists-check
+        path: "${ARTIFACT_DIR}/specification/SPECIFICATION.md"
+      - type: manual-confirm
+        prompt: "Specification approved by user?"
+    # claudechic's manifest declares a `hints:` block here ("Synthesize
+    # all Leadership findings before presenting to user"); omitted in
+    # the operon port because the hints subsystem is not ported.
+  - id: implementation
+    file: implementation
+    advance_checks:
+      - type: manual-confirm
+        prompt: "All Leadership agents approve implementation?"
+  - id: testing-vision
+    file: testing_vision
+    advance_checks:
+      - type: file-exists-check
+        path: "${ARTIFACT_DIR}/userprompt_testing.md"
+      - type: manual-confirm
+        prompt: "Testing vision approved by user?"
+  - id: testing-specification
+    file: testing_specification
+    advance_checks:
+      - type: file-exists-check
+        path: "${ARTIFACT_DIR}/specification/TEST_SPECIFICATION.md"
+      - type: manual-confirm
+        prompt: "Test specification approved by user?"
+  - id: testing-implementation
+    file: testing_implementation
+    advance_checks:
+      - type: manual-confirm
+        prompt: "All tests passing and compliant with testing standard?"
+  - id: documentation
+    file: documentation
+    advance_checks:
+      - type: manual-confirm
+        prompt: "Documentation complete and reviewed?"
+  - id: signoff
+    file: signoff
+
+rules:
+  - id: no_direct_code_coordinator
+    trigger: PreToolUse/Write
+    enforcement: warn
+    detect:
+      field: file_path
+      pattern: ".+"
+    exclude_if_matches: "\\.(md|gitignore)$"
+    message: "Coordinator should delegate code writing to Implementer agents"
+    roles: [coordinator]
+
+  - id: no_direct_spec_edit_coordinator
+    trigger: [PreToolUse/Edit, PreToolUse/Write]
+    enforcement: warn
+    detect:
+      field: file_path
+      pattern: "(?i)(?:\\.project_team|\\.operon)/[^/]+/(?:.*/)?spec[^/]*\\.md$"
+    message: >-
+      Coordinator should delegate spec edits to a Leadership/Implementer agent
+      rather than editing artifact spec files directly.
+    roles: [coordinator]
+
+  - id: no_push_before_testing
+    trigger: PreToolUse/Bash
+    enforcement: deny
+    detect:
+      pattern: "git push"
+    message: "No pushing before testing phase"
+    exclude_phases: [testing-implementation, documentation, signoff]
+
+  - id: no_force_push
+    trigger: PreToolUse/Bash
+    enforcement: deny
+    detect:
+      pattern: "git push\\s.*(--force-with-lease|--force\\b|-f\\b)"
+    message: "Force push is never allowed"
+
+  - id: no_close_leadership
+    trigger: PreToolUse/mcp__operon__close_agent
+    enforcement: warn
+    message: >-
+      Do not close agents during active workflow phases. Agents carry context
+      that is lost on close. Wait until signoff phase.
+    roles: [coordinator]
+    exclude_phases: [signoff]
