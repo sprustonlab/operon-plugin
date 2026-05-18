@@ -1,11 +1,77 @@
 #!/usr/bin/env bash
-# operon-plugin MCP server entry shim.
+# operon-plugin MCP server entry shim (Carryover #4: portable).
 #
 # Invoked by Claude Code as the command in .mcp.json (resolved via
-# ${CLAUDE_PLUGIN_ROOT}/bin/operon-mcp-server). Hands control to the
-# Python entry point defined in pyproject.toml.
+# ${CLAUDE_PLUGIN_ROOT}/bin/operon-mcp-server). Resolves the Python
+# interpreter to use in this order:
 #
-# Cross-platform note: this shebang serves Linux/macOS. On Windows,
-# Claude Code launches the documented path directly; the Python
-# interpreter on PATH is responsible for executing the module.
-exec python -m operon_mcp_server.server "$@"
+#   1. `uv run --project <plugin-root>` if `uv` is on PATH. uv reads
+#      our pyproject.toml and resolves deps (mcp, watchdog, PyYAML)
+#      into an ephemeral environment. Zero user setup beyond
+#      installing uv. RECOMMENDED.
+#
+#   2. The first of `python3` or `python` on PATH whose site-packages
+#      already contain `mcp` and `watchdog` and `yaml`. Pre-flight
+#      import check catches the ModuleNotFoundError surface BEFORE
+#      Claude Code's MCP handshake fails silently inside the daemon.
+#
+#   3. Loud error to stderr with the exact `pip install` command the
+#      user needs to run. Better than the historical silent
+#      `ModuleNotFoundError: No module named 'operon_mcp_server'`.
+#
+# In all cases we prepend `${CLAUDE_PLUGIN_ROOT}/src` to PYTHONPATH so
+# any python that's importing operon_mcp_server can find the package
+# without `pip install -e .`. The user's daemon-PATH python only
+# needs the three RUNTIME deps available -- not the operon package
+# itself.
+#
+# This shebang serves Linux/macOS. The companion `.cmd` file at
+# `bin/operon-mcp-server.cmd` covers Windows.
+
+set -e
+
+# Resolve the plugin root from this script's directory. Use `cd` +
+# `pwd -P` for a real-path so symlinks (e.g. via marketplace install
+# cache) don't confuse PYTHONPATH composition.
+plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+
+# Make operon_mcp_server importable from the bundled src/ tree
+# regardless of which python ends up running us.
+export PYTHONPATH="${plugin_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+# Path 1: uv run, if installed.
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --project "${plugin_root}" python -m operon_mcp_server.server "$@"
+fi
+
+# Path 2: pre-flight-import check on python3 then python.
+for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1; then
+        if "$py" -c "import mcp, watchdog, yaml" >/dev/null 2>&1; then
+            exec "$py" -m operon_mcp_server.server "$@"
+        fi
+    fi
+done
+
+# Path 3: clear-error fallback. stderr is captured by Claude Code to
+# ~/.cache/claude-cli-nodejs/<cwd>/mcp-logs-plugin-operon-plugin-operon/
+# <ts>.jsonl so the user can find this message in the same place we
+# document OPERON_DEBUG output.
+cat >&2 <<'EOF'
+operon-plugin: cannot launch MCP server -- no working python found.
+
+Either install uv (recommended; auto-resolves deps from
+operon-plugin's pyproject.toml on next launch):
+  https://docs.astral.sh/uv/getting-started/installation/
+
+Or pip install the three runtime deps into the python that Claude
+Code finds on PATH (run `which python3` in the same shell you
+launched `claude` from to identify the right interpreter):
+
+  pip install 'mcp>=1.0' 'watchdog>=4.0' 'PyYAML>=6.0'
+
+If you already pip-installed the operon_mcp_server package (e.g.
+`pip install -e <repo>`), restart Claude Code so the daemon picks
+up the new site-packages.
+EOF
+exit 1

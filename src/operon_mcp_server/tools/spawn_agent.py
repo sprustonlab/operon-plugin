@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -703,25 +704,126 @@ def _spawn_subprocess(
     env = dict(os.environ)
     env[identity.ENV_HANDLE_VAR] = handle
     try:
-        # stdout/stderr -> DEVNULL: Popen pipe buffers cap at ~64KB on
-        # Linux. Without a drainer thread the spawned `claude --bg`
-        # blocks on its next write once the buffer fills, deadlocking
-        # the new session. Phase 4 may wire a real drainer if we ever
-        # need to capture stdout (e.g. parse the `backgrounded · <id>`
-        # confirmation line); for Phase 3 the pre-generated session_id
-        # makes stdout-parsing unnecessary, so discarding is safe.
+        # Carryover #4: we MUST capture stdout to read the
+        # `backgrounded · <8-char-id>` line so the caller can resolve
+        # the real session_id from `~/.claude/jobs/<short>/state.json`.
+        # `claude --bg` ignores `--session-id` and assigns its own,
+        # so our pre-generated UUID is decorative until that lookup
+        # runs.
+        #
+        # Risk: if we leave stdout PIPE'd without draining, the pipe
+        # buffer (~64 KiB on Linux) eventually fills and deadlocks.
+        # Mitigation: the caller (_do_spawn) reads exactly the first
+        # line and CLOSES stdout immediately. `claude --bg` prints
+        # the backgrounded line + a couple of help lines and then
+        # detaches; the spawned daemon doesn't continue writing to
+        # this pipe after detach.
         return subprocess.Popen(
             argv,
             cwd=str(project_path),
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
     except (OSError, FileNotFoundError) as exc:
         raise SpawnAgentError(
             f"Failed to launch `claude --bg`: {exc}. Is the `claude` binary on PATH?"
         ) from exc
+
+
+#: Regex matching the `backgrounded · <short>` line printed by
+#: `claude --bg` on stdout. Short id is 8 hex characters (`daemonShort`
+#: in the job state.json schema). The separator character is the
+#: UTF-8 middle dot U+00B7 (`\xc2\xb7`); we tolerate ASCII fallbacks
+#: (`.`, `-`) too in case Claude Code's output format drifts.
+_BG_SHORT_LINE_RE = re.compile(
+    rb"backgrounded\s+(?:\xc2\xb7|\xb7|\.|\-)\s*([0-9a-f]{8})"
+)
+
+
+def _read_bg_short_id(
+    proc: subprocess.Popen[bytes], *, timeout_s: float = 8.0
+) -> str | None:
+    """Read `proc.stdout` until the `backgrounded · <short>` line is found.
+
+    Returns the 8-char `daemonShort` id, or None if the line never
+    appears within `timeout_s` seconds. Closes stdout after reading
+    so the kernel pipe doesn't fill while the bg session keeps
+    running.
+    """
+    if proc.stdout is None:  # pragma: no cover (defensive)
+        return None
+    deadline = time.time() + timeout_s
+    short_id: str | None = None
+    try:
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            m = _BG_SHORT_LINE_RE.search(line)
+            if m:
+                short_id = m.group(1).decode("ascii")
+                break
+    except OSError:
+        return None
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    return short_id
+
+
+def _resolve_bg_session_id(short_id: str) -> str | None:
+    """Read `~/.claude/jobs/<short>/state.json` for the full sessionId.
+
+    Returns the canonical UUID session id Claude Code assigned to the
+    bg session, or None if the file isn't present or doesn't carry
+    the expected field. The Claude Code daemon writes this file at
+    bg-session bind time (empirically observable ~0-100ms after the
+    `backgrounded · <short>` print), so callers should be tolerant
+    of a brief poll loop.
+    """
+    job_state = Path.home() / ".claude" / "jobs" / short_id / "state.json"
+    for _ in range(40):  # ~4 seconds at 0.1s intervals
+        if job_state.is_file():
+            try:
+                data = json.loads(job_state.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.1)
+                continue
+            sid = data.get("sessionId") if isinstance(data, dict) else None
+            if isinstance(sid, str) and sid:
+                return sid
+        time.sleep(0.1)
+    return None
+
+
+def _rewrite_handle_session_id(handle: str, new_session_id: str) -> None:
+    """Atomically rewrite `_handles/<handle>.json` with the real session_id."""
+    try:
+        path = paths.handle_file(handle)
+    except paths.OperonPathError:
+        return
+    if not path.is_file():
+        return
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(record, dict):
+        return
+    record["session_id"] = new_session_id
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        tmp.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 # -- Tool entrypoint -----------------------------------------------------
@@ -849,7 +951,7 @@ def _do_spawn(args: dict[str, Any]) -> dict[str, Any]:
     # 10) Launch claude --bg. On failure, roll back the roster row and
     #     the handle file so the run state is consistent.
     try:
-        _spawn_subprocess(
+        proc = _spawn_subprocess(
             project_path=project_path_obj,
             session_id=session_id,
             handle=handle,
@@ -868,11 +970,47 @@ def _do_spawn(args: dict[str, Any]) -> dict[str, Any]:
             pass
         raise
 
-    # 11) Return success.
+    # 11) Carryover #4: capture the REAL session_id Claude Code's bg
+    #     daemon assigned (--session-id is ignored on --bg). Read the
+    #     `backgrounded · <short>` line from spawn stdout, then look
+    #     up `~/.claude/jobs/<short>/state.json` for the canonical
+    #     UUID. Rewrite both `agents.json` row and
+    #     `_handles/<handle>.json` to use the real id so
+    #     `close_agent`'s `claude stop <session_id>` and
+    #     `claude attach <session_id>` work as expected.
+    #
+    #     Best-effort: if the capture fails (e.g. claude binary's
+    #     output format drifts), keep the pre-generated id and log a
+    #     warning. The substrate still functions (mailbox transport
+    #     doesn't depend on session_id).
+    real_session_id: str | None = None
+    short_id = _read_bg_short_id(proc)
+    if short_id:
+        real_session_id = _resolve_bg_session_id(short_id)
+        if real_session_id and real_session_id != session_id:
+            # Update the roster row and handle file in place.
+            try:
+                roster.update_agent(name, {"session_id": real_session_id})
+            except roster.RosterError as exc:
+                _log.warning(
+                    "spawn_agent: roster.update_agent(%r) failed after "
+                    "bg session_id capture: %s", name, exc,
+                )
+            _rewrite_handle_session_id(handle, real_session_id)
+    if real_session_id is None:
+        _log.warning(
+            "spawn_agent: failed to capture real bg session_id for "
+            "%r (short_id=%s); leaving pre-generated id %s in place",
+            name, short_id, session_id,
+        )
+
+    # 12) Return success. `session_id` field reflects the real bg id
+    #     when capture succeeded, else the pre-generated fallback.
     return {
         "agent_name": name,
         "handle": handle,
-        "session_id": session_id,
+        "session_id": real_session_id or session_id,
+        "bg_short_id": short_id,
         "role": role,
         "workflow_id": workflow_id,
     }

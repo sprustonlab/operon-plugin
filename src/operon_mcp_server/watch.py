@@ -215,16 +215,21 @@ def _format_channel_content(envelope: dict[str, Any]) -> tuple[str, dict[str, st
 
 
 def _self_stop(session_id: str) -> None:
-    """Invoke `claude stop <session_id>` for graceful self-shutdown.
+    """Invoke `claude stop <daemonShort>` for graceful self-shutdown.
 
     Called when this Agent's own watch loop sees a `kind=close`
     envelope. Best-effort: failures are logged but do not crash the
     subprocess (the Coordinator's `close_agent` invocation also runs
     `claude stop` directly, so this is a redundant safety net).
+
+    Phase 5 carryover #4: `claude stop` takes the 8-char daemonShort
+    (first 8 chars of the session_id UUID), not the full UUID. See
+    `close_agent._do_close` for the same derivation.
     """
+    daemon_short = session_id.split("-", 1)[0]
     try:
         proc = subprocess.run(
-            ["claude", "stop", session_id],
+            ["claude", "stop", daemon_short],
             capture_output=True,
             text=True,
             timeout=15,
@@ -233,17 +238,17 @@ def _self_stop(session_id: str) -> None:
         if proc.returncode != 0:
             _log.warning(
                 "self `claude stop %s` exited rc=%d: stdout=%r stderr=%r",
-                session_id, proc.returncode,
+                daemon_short, proc.returncode,
                 proc.stdout[:200], proc.stderr[:200],
             )
         else:
-            _log.info("self `claude stop %s` succeeded", session_id)
+            _log.info("self `claude stop %s` succeeded", daemon_short)
     except FileNotFoundError:
         _log.error("self-stop failed: `claude` binary not on PATH")
     except subprocess.TimeoutExpired:
-        _log.error("self-stop timed out for session_id=%s", session_id)
+        _log.error("self-stop timed out for daemon_short=%s", daemon_short)
     except OSError as exc:
-        _log.error("self-stop OSError for session_id=%s: %s", session_id, exc)
+        _log.error("self-stop OSError for daemon_short=%s: %s", daemon_short, exc)
 
 
 async def _process_envelope(

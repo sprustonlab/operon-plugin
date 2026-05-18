@@ -1,20 +1,4 @@
 {
-  "_comment": "operon-plugin hooks. Phase 2 wires SessionStart to bind_handle per SPEC.md section 8 and section 6.5 step 6. The mcp_tool handler form invokes mcp__operon__bind_handle directly. Phase 2 fix: schema corrections per https://code.claude.com/docs/en/hooks -- (1) `server` field is REQUIRED for mcp_tool hooks (was missing, Claude Code's plugin validator rejects the file); (2) the arguments-object field is `input`, NOT `arguments`; (3) `${env:VAR}` interpolation is NOT supported in mcp_tool input, so the handle parameter is dropped from the hook -- bind_handle reads OPERON_AGENT_HANDLE from its own subprocess env via identity.read_env_handle() and validates against the hook-supplied session_id. The matcher 'startup|resume|clear' fires on all SessionStart sources; bind_handle is idempotent so resume/clear re-fires against the same handle succeed.",
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|clear",
-        "hooks": [
-          {
-            "type": "mcp_tool",
-            "server": "operon",
-            "tool": "mcp__operon__bind_handle",
-            "input": {
-              "session_id": "${session_id}"
-            }
-          }
-        ]
-      }
-    ]
-  }
+  "_comment": "operon-plugin hooks. Phase 5 carryover #3: the SessionStart bind_handle hook was REMOVED because per Anthropic's hooks reference, SessionStart fires BEFORE the MCP servers connect, so `type: mcp_tool` hooks on SessionStart are not callable -- Claude Code logs 'mcp_tool hooks are not available for the SessionStart hook event (no MCP client context)' and the hook no-ops. Identity binding is fully covered by env-anchored resolution: every MCP tool call resolves OPERON_AGENT_HANDLE -> _handles/<handle>.json on entry (see identity.py + spawn_agent._require_coordinator etc.). The `bind_handle` MCP tool is retained in the codebase (hidden from tools/list per SPEC §7.1) for future use if a post-MCP-connect lifecycle event becomes available, or for hand-driven validation, but is no longer wired to any hook event. This file now declares no hooks; future phases will add PreToolUse / Stop hooks here.",
+  "hooks": {}
 }

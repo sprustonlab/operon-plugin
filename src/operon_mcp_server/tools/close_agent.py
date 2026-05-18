@@ -146,14 +146,26 @@ def _do_close(args: dict[str, Any]) -> dict[str, Any]:
     except mailbox.MailboxError as exc:
         raise CloseAgentError(str(exc)) from exc
 
-    # 2) Invoke `claude stop <session_id>`. Best-effort: failures are
+    # 2) Invoke `claude stop <daemonShort>`. Best-effort: failures are
     #    captured into the result but do not roll back the envelope or
     #    skip the roster removal (the target's own watch loop will
     #    handle self-stop via the envelope).
-    stop_result: dict[str, Any] = {"invoked": True}
+    #
+    #    Carryover #4 (Phase 5 carryovers): `claude stop` takes the
+    #    8-char daemonShort, NOT the full session_id UUID. Empirical:
+    #    `claude stop <full-uuid>` errors "No job matching <uuid>".
+    #    The daemonShort is the first 8 chars of the session_id
+    #    (verified against `~/.claude/jobs/<short>/state.json`'s
+    #    `sessionId` field for multiple spawns), so we derive it
+    #    here rather than storing it separately in agents.json.
+    daemon_short = session_id.split("-", 1)[0]
+    stop_result: dict[str, Any] = {
+        "invoked": True,
+        "daemon_short": daemon_short,
+    }
     try:
         proc = subprocess.run(
-            ["claude", "stop", session_id],
+            ["claude", "stop", daemon_short],
             capture_output=True,
             text=True,
             timeout=15,

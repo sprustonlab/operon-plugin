@@ -17,13 +17,15 @@ Identity gate: Coordinator-only per SPEC §7.1.
 from __future__ import annotations
 
 import json
+import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import mcp.types as mcp_types
 
-from .. import paths, workflow
+from .. import identity, paths, workflow
 from . import spawn_agent as spawn_agent_tool
 
 #: MCP tool name. Coordinator-only per SPEC §7.1.
@@ -102,12 +104,98 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _require_coordinator() -> None:
-    """Reject non-Coordinator callers per SPEC §7.1."""
+def _require_coordinator() -> dict[str, Any]:
+    """Reject non-Coordinator callers per SPEC §7.1. Returns the
+    caller's handle record so the carryover #2 code can copy it into
+    the new run-dir."""
     try:
-        spawn_agent_tool._require_coordinator()
+        record = spawn_agent_tool._require_coordinator()
     except spawn_agent_tool.SpawnAgentError as exc:
         raise ActivateWorkflowError(str(exc)) from exc
+    return record
+
+
+def _copy_coordinator_handle_and_roster_row(
+    new_run_dir: Path,
+    handle: str,
+    coord_record: dict[str, Any],
+) -> tuple[Path, Path]:
+    """Carryover #2: propagate the Coordinator's identity into the new run.
+
+    `activate_workflow` rotates `_active.json` to point at a new
+    run-dir; without copying the Coordinator's handle file into that
+    new dir, the very next tool call from the SAME MCP subprocess
+    cannot resolve its role (because identity.read_handle_file()
+    routes through `paths.active_run_dir()`). We also seed
+    `<new-run-dir>/agents.json` with the Coordinator row using the
+    same uniform schema as worker rows (Phase 5 prep), so that
+    workers spawned from the new run can immediately
+    `message_agent("Coordinator", ...)`.
+
+    Returns `(handle_path, roster_path)` for diagnostics. Safe to
+    call before _active.json is swapped: writes go to the new
+    run-dir's `_handles/` and `agents.json` directly via path
+    composition that does NOT depend on `_active.json`.
+    """
+    # Handle file: copy verbatim from the env-anchored record. The
+    # record may have been read from the OLD run-dir's _handles/,
+    # but its content (handle, agent_name, role, etc.) is the same
+    # identity the Coordinator has had since spawn -- we just need
+    # it to exist in the new run-dir's _handles/ subtree so that
+    # the post-swap path lookup resolves it.
+    handles_dir = new_run_dir / paths.HANDLES_DIRNAME
+    handles_dir.mkdir(parents=True, exist_ok=True)
+    handle_path = handles_dir / f"{handle}.json"
+    handle_payload = json.dumps(coord_record, indent=2, ensure_ascii=False)
+    tmp = handle_path.with_name(
+        f"{handle_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    try:
+        tmp.write_text(handle_payload, encoding="utf-8")
+        os.replace(tmp, handle_path)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ActivateWorkflowError(
+            f"Failed to copy Coordinator handle into new run-dir: {exc}"
+        ) from exc
+
+    # Roster: seed with one Coordinator row (uniform schema; Phase 5
+    # prep). Other Agents from the prior run are NOT copied -- they
+    # belonged to a different operon-session and may not exist
+    # anymore. A fresh `activate_workflow` is effectively a new
+    # collaboration.
+    now = _now_iso()
+    coord_row = {
+        "name": coord_record.get("agent_name", "Coordinator"),
+        "role": coord_record.get("role", "coordinator"),
+        "handle": handle,
+        "session_id": coord_record.get("session_id", ""),
+        "workflow_id": coord_record.get("workflow_id", ""),
+        "status": "idle",
+        "spawned_at": coord_record.get("spawned_at", now),
+        "last_turn_at": now,
+    }
+    roster_path = new_run_dir / "agents.json"
+    roster_payload = json.dumps([coord_row], indent=2, ensure_ascii=False)
+    tmp = roster_path.with_name(
+        f"{roster_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    try:
+        tmp.write_text(roster_payload, encoding="utf-8")
+        os.replace(tmp, roster_path)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ActivateWorkflowError(
+            f"Failed to seed Coordinator row in new run roster: {exc}"
+        ) from exc
+
+    return handle_path, roster_path
 
 
 def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
@@ -119,7 +207,15 @@ def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
         raise ActivateWorkflowError("'run_name' must be a string")
     _validate_run_name(run_name)
 
-    _require_coordinator()
+    coord_record = _require_coordinator()
+    coord_handle = identity.read_env_handle()  # always present after _require_coordinator
+    if not coord_handle:
+        # Defensive: _require_coordinator already validated identity,
+        # so reaching this branch is a contract violation.
+        raise ActivateWorkflowError(
+            "Coordinator identity is missing OPERON_AGENT_HANDLE; "
+            "_require_coordinator should have caught this."
+        )
 
     # Resolve the manifest before creating any directories so a
     # missing-workflow failure does not leave a half-created run on
@@ -155,11 +251,13 @@ def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     (run_dir / paths.HANDLES_DIRNAME).mkdir(parents=True, exist_ok=True)
     (run_dir / "mailbox").mkdir(parents=True, exist_ok=True)
 
-    # Write empty agents.json (Coordinator row is NOT added here -- it
-    # is added by `bind_handle` on the Coordinator's first session
-    # start, OR by the smoke-setup helper for manual tests).
-    roster_path = run_dir / "agents.json"
-    roster_path.write_text("[]\n", encoding="utf-8")
+    # Carryover #2: copy the Coordinator's handle file + seed the new
+    # roster with a Coordinator row BEFORE swapping `_active.json`,
+    # so subsequent tool calls from the same MCP subprocess can
+    # resolve identity through the new run-dir.
+    _copy_coordinator_handle_and_roster_row(
+        new_run_dir=run_dir, handle=coord_handle, coord_record=coord_record,
+    )
 
     # Write `_active.json` pointing at the new run.
     active_path = operon_dir / paths.ACTIVE_POINTER_FILENAME
@@ -173,7 +271,6 @@ def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     )
     try:
         active_tmp.write_text(active_payload, encoding="utf-8")
-        import os
         os.replace(active_tmp, active_path)
     except OSError as exc:
         try:
