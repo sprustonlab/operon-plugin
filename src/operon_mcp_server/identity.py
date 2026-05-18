@@ -29,21 +29,61 @@ from . import paths
 #: Name of the env var that anchors per-subprocess identity (SPEC 6.5).
 ENV_HANDLE_VAR = "OPERON_AGENT_HANDLE"
 
+#: Phase 14: process-local fallback for callers that have no env handle
+#: set. Populated by `bootstrap.auto_bootstrap_if_needed` at MCP server
+#: startup so the subprocess can identify itself as the project's
+#: default Coordinator without the user having to export the env var.
+#: NOT visible across subprocesses (workers spawned via `spawn_agent`
+#: get their handle via env, not via this cache).
+_CACHED_HANDLE: str | None = None
+
 
 class IdentityError(RuntimeError):
     """Raised when identity cannot be resolved for the calling subprocess."""
 
 
-def read_env_handle() -> str | None:
-    """Return the handle from `OPERON_AGENT_HANDLE`, or None if unset.
+def _set_cached_handle(handle: str | None) -> None:
+    """Set the process-local handle cache (Phase 14).
 
-    An empty-string env value is treated as unset (returns None) so that
-    callers do not need to distinguish "missing" from "blank".
+    Called by `bootstrap.auto_bootstrap_if_needed`. Subsequent
+    `read_env_handle()` calls fall through to this value when the env
+    var is unset. Passing `None` clears the cache (used in tests).
+    """
+    global _CACHED_HANDLE
+    _CACHED_HANDLE = handle
+
+
+def get_cached_handle() -> str | None:
+    """Return the current process-local handle cache value (Phase 14).
+
+    Exposed for diagnostics + tests. Production code uses
+    `read_env_handle()` which already consults the cache as a
+    fallback.
+    """
+    return _CACHED_HANDLE
+
+
+def read_env_handle() -> str | None:
+    """Return the handle for this MCP subprocess.
+
+    Resolution order (Phase 14):
+
+      1. `OPERON_AGENT_HANDLE` env var. Takes precedence: workers
+         spawned via `spawn_agent` always have this set, and the
+         user may have manually bound a fixture handle.
+      2. Process-local cache populated by
+         `bootstrap.auto_bootstrap_if_needed` at MCP server startup.
+         This is how the auto-bootstrap Coordinator identity threads
+         through to the rest of the codebase without rewriting every
+         caller.
+
+    Returns None when neither source has a non-empty handle. Empty
+    string env values are treated as unset.
     """
     value = os.environ.get(ENV_HANDLE_VAR)
-    if not value:
-        return None
-    return value
+    if value:
+        return value
+    return _CACHED_HANDLE
 
 
 def read_handle_file(handle: str, start: Path | None = None) -> dict[str, Any] | None:
@@ -91,9 +131,7 @@ def _read_current_phase(start: Path | None = None) -> str | None:
     try:
         data = json.loads(file_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise IdentityError(
-            f"Failed to read phase state '{file_path}': {exc}"
-        ) from exc
+        raise IdentityError(f"Failed to read phase state '{file_path}': {exc}") from exc
     if not isinstance(data, dict):
         raise IdentityError(
             f"Phase state file '{file_path}' must contain a JSON object."

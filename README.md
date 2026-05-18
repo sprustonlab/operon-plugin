@@ -130,17 +130,29 @@ installs are snapshot-cached.
 
 ## Quick start
 
-The plugin ships a throwaway `_smoke` workflow for verifying the
-install. After Claude Code picks up the plugin, in a session inside
-any project:
+Auto-bootstrap (Phase 14): launching `claude` in any project
+auto-creates a default Coordinator identity on first MCP start --
+no `OPERON_AGENT_HANDLE` env export, no setup script, nothing to
+remember. From a fresh project:
 
-```text
-/_smoke
+```bash
+cd <your-project>
+claude --plugin-dir /path/to/operon-plugin/plugins/operon-plugin
 ```
 
-This activates the smoke workflow (creates `.operon/<run-name>/`,
-writes the Coordinator handle, advances to phase `vision`). From
-there you can:
+The MCP server detects the missing `.operon/_active.json`, writes a
+new `<project>/.operon/default/` with a fresh Coordinator handle,
+and threads that identity through the rest of the session. The
+default run name is overrideable via `OPERON_DEFAULT_RUN_NAME`.
+
+Once in the session, jump straight to a real workflow:
+
+```text
+mcp__operon__activate_workflow(workflow_id="project_team", run_name="my_first_run")
+```
+
+(Or invoke the corresponding skill: `/project_team my_first_run`.)
+From there you can:
 
 - `/agent w1 .` -- spawn a worker named `w1` in the current cwd.
 - `message_agent("w1", "hi", requires_answer=true)` -- send the
@@ -150,8 +162,21 @@ there you can:
   phase.
 - `/restore` -- pick a different operon-run to switch to.
 
+The bundled `_smoke` workflow is still available for verifying the
+install end-to-end without committing to a real project structure;
+activate it via `activate_workflow(workflow_id="_smoke", ...)`.
+
 If any of these fail with `ModuleNotFoundError` or hang at MCP
 handshake, the daemon python is missing deps (see Option B above).
+
+### Manual fixture (advanced)
+
+For testing-with-specific-fixtures workflows where you want a
+pre-built operon-session at a known path with a stable handle UUID,
+`scripts/smoke_fixture_setup.py` writes a minimal Coordinator
+bootstrap under `/tmp/test-operon/`. This is the path used by the
+in-process e2e + bg verification scripts; ordinary users never need
+to run it.
 
 ## MCP tools
 

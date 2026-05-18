@@ -36,7 +36,7 @@ import mcp.types as mcp_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from . import identity, watch
+from . import bootstrap, identity, watch
 from .tools import acknowledge_warning as acknowledge_warning_tool
 from .tools import activate_workflow as activate_workflow_tool
 from .tools import advance_phase as advance_phase_tool
@@ -323,6 +323,22 @@ async def _run() -> None:
         identity.ENV_HANDLE_VAR,
         os.environ.get(identity.ENV_HANDLE_VAR),
     )
+
+    # Phase 14: auto-bootstrap a default Coordinator identity if no env
+    # handle is set and the project has no existing operon-session.
+    # No-op when OPERON_AGENT_HANDLE is already exported (spawn_agent
+    # workers + manually-bound fixtures preserve existing behavior).
+    # Failures are logged and non-fatal; whoami will surface the
+    # missing identity to the LLM on first call.
+    try:
+        bootstrap_handle = bootstrap.auto_bootstrap_if_needed()
+        _log.debug(
+            "bootstrap resolved: handle=%r (cached=%r)",
+            bootstrap_handle,
+            identity.get_cached_handle(),
+        )
+    except Exception as exc:
+        _log.warning("bootstrap raised unexpectedly: %s", exc)
 
     server = _build_server()
     # Use the SDK helper: it auto-derives `capabilities.tools` from the

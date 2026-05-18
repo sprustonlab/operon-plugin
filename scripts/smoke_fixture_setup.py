@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Phase 4 smoke-check setup helper.
+"""Hand-rolled smoke-fixture bootstrap helper.
+
+Phase 14 note: this script is OPTIONAL for normal use. The MCP server
+auto-bootstraps a default Coordinator identity on first launch (see
+`src/operon_mcp_server/bootstrap.py`), so users who just want
+`/project_team my_run` to work no longer need to run this. Keep this
+script around for testing-with-specific-fixtures workflows where you
+want a pre-built operon-session under a known path with a stable
+handle UUID. The script was previously named `smoke_phase4_setup.py`.
 
 Bootstraps a clean operon-run under `/tmp/test-operon/` so the user
 (Boaz) can exercise Phase 4 inter-agent messaging without hand-rolling
