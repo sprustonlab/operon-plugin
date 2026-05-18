@@ -54,15 +54,30 @@ claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-pl
 ```
 
 To diagnose watch-loop / identity-binding issues, also export
-`OPERON_DEBUG=1` before launching Claude Code. Each MCP subprocess
-will then emit DEBUG-level logs to its stderr. Claude Code routes the
-MCP subprocess's stderr to `~/.claude/debug/<session-id>.txt`
-(per the channels-reference docs), so spawned workers' logs land
-there.
+`OPERON_DEBUG=1` before launching Claude Code. The Coordinator's
+MCP subprocess (and every worker it spawns, via the env propagation
+in `spawn_agent._spawn_subprocess`) will then emit DEBUG-level logs
+to its stderr. Claude Code captures each MCP subprocess's stderr to
+`~/.cache/claude-cli-nodejs/<cwd-mangled>/mcp-logs-plugin-operon-plugin-operon/<timestamp>.jsonl`
+(each line wrapped as `{"error": "Server stderr: ..."}`). Tail that
+file to watch real-time worker boot:
 
 ```bash
 OPERON_DEBUG=1 claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-plugin/
+# In a separate shell, after spawning a worker:
+tail -f ~/.cache/claude-cli-nodejs/$(pwd | sed 's|/|-|g')/mcp-logs-plugin-operon-plugin-operon/*.jsonl
 ```
+
+To enable the LLM-visible channel push (so the worker's session
+actually sees the `<channel>` tag in its conversation context), add
+`--dangerously-load-development-channels plugin:operon-plugin@operon-plugin-marketplace`
+to the Coordinator's `claude` launch. The flag requires interactive
+confirmation; spawned `claude --bg` workers cannot pass it (no TTY).
+Without the flag, the mailbox filesystem transport still works
+end-to-end (envelopes move from `inbox/` to `inbox/processed/`,
+audit trail unaffected) but Claude Code logs "Channel notifications
+skipped: channels feature is not currently available" for each push
+and the LLM never sees the message tag.
 
 ### 3. Run the 5-step smoke check inside the Coordinator session
 

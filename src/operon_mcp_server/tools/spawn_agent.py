@@ -420,6 +420,23 @@ def _preflight(role: str, workflow_id: str) -> None:
 # -- subprocess launch ---------------------------------------------------
 
 
+#: Env var Claude Code sets in each plugin's MCP subprocess to expose
+#: the plugin's install root (see `plugins/operon-plugin/.mcp.json`
+#: `"command": "${CLAUDE_PLUGIN_ROOT}/bin/operon-mcp-server"`). We
+#: re-emit it as the spawned `claude --bg`'s `--plugin-dir` argument
+#: so the bg session loads the operon plugin too; without this the
+#: spawned worker session has no operon plugin, no MCP server, and
+#: no mailbox watch loop (Phase 4 fix v2 root cause).
+ENV_PLUGIN_ROOT_VAR = "CLAUDE_PLUGIN_ROOT"
+
+#: Env var that toggles verbose stderr logging in the MCP server. We
+#: forward its value (if set in the Coordinator's env) into the
+#: spawned worker's `--settings.env` so that `OPERON_DEBUG=1 claude
+#: --plugin-dir ...` from the user's shell reaches every spawned
+#: worker's MCP subprocess. Without this, only the Coordinator sees
+#: debug output and worker boot is invisible.
+ENV_DEBUG_VAR = "OPERON_DEBUG"
+
 def _spawn_subprocess(
     *,
     project_path: Path,
@@ -435,15 +452,52 @@ def _spawn_subprocess(
     the Coordinator's current environment with the new agent's handle
     overridden, satisfying SPEC section 6.5 step 3 (the new MCP
     subprocess inherits the env at startup).
+
+    Plugin propagation: `claude --bg` does NOT inherit the parent
+    session's plugin context, so we explicitly re-emit `--plugin-dir
+    $CLAUDE_PLUGIN_ROOT` on the argv. Without it, the spawned bg
+    session boots WITHOUT the operon plugin and therefore without an
+    operon MCP server -- empirically confirmed by manual `claude --bg`
+    probes (Phase 4 fix v2).
+
+    Channel surfacing: the watch loop emits `claude/channel`
+    notifications regardless, but Claude Code may drop them with the
+    message "Channel notifications skipped: channels feature is not
+    currently available" if the user has not opted in via
+    `--dangerously-load-development-channels plugin:operon-plugin@
+    operon-plugin-marketplace` on their main interactive session.
+    That flag requires interactive confirmation and so cannot be
+    re-emitted from a `claude --bg` invocation (the bg session has no
+    TTY to confirm against; passing the flag here would silently kill
+    the spawn). Mailbox filesystem transport works either way --
+    envelopes move from `inbox/` to `inbox/processed/` and the audit
+    trail is unaffected -- the channels gating only affects whether
+    the LLM in the worker's session sees the inbound message tag.
+
+    Settings env: includes `OPERON_AGENT_HANDLE` (always) and
+    `OPERON_DEBUG` (if set in the Coordinator's env) so verbose
+    logging flows into worker MCP subprocesses without a per-spawn
+    toggle.
     """
-    settings = json.dumps(
-        {"env": {identity.ENV_HANDLE_VAR: handle}},
-        ensure_ascii=False,
-    )
+    settings_env: dict[str, str] = {identity.ENV_HANDLE_VAR: handle}
+    coord_debug = os.environ.get(ENV_DEBUG_VAR)
+    if coord_debug:
+        settings_env[ENV_DEBUG_VAR] = coord_debug
+    settings = json.dumps({"env": settings_env}, ensure_ascii=False)
     agents_json = json.dumps(agents_payload, ensure_ascii=False)
-    argv = [
+
+    plugin_root = os.environ.get(ENV_PLUGIN_ROOT_VAR, "").strip()
+
+    argv: list[str] = [
         "claude",
         "--bg",
+        # NOTE: `--session-id` is documented but `claude --bg` warns
+        # "ignoring --session-id (use --resume <id> to continue an
+        # existing session)" and generates a fresh session id. Kept
+        # here for forward-compat with future bg-respects-id behavior;
+        # the pre-generated session id is also written into
+        # `_handles/<handle>.json` for `bind_handle` validation
+        # idempotence per SPEC §6.5 step 1.
         "--session-id",
         session_id,
         "--settings",
@@ -452,8 +506,11 @@ def _spawn_subprocess(
         agents_json,
         "--agent",
         role,
-        initial_prompt,
     ]
+    if plugin_root:
+        argv.extend(["--plugin-dir", plugin_root])
+    argv.append(initial_prompt)
+
     env = dict(os.environ)
     env[identity.ENV_HANDLE_VAR] = handle
     try:
