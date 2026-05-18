@@ -221,15 +221,25 @@ def _try_log_failclosed(
     role: str | None,
     current_phase: str | None,
     message: str,
+    outcome: str = "blocked",
 ) -> None:
-    """Best-effort audit-row write for a fail-closed deny. Suppresses
-    all errors so a broken audit-log path doesn't block the deny
-    itself. The deny still fires regardless."""
+    """Best-effort audit-row write for a fail-closed event.
+
+    `outcome` defaults to "blocked" (the deny path). The override-
+    consumed branch passes `outcome="overridden"` so the audit row
+    correctly reflects that the LLM was allowed to proceed. Phase 7
+    bug fix: this was previously hardcoded to "blocked", which caused
+    the failclosed override path to emit allow on the wire but record
+    a blocked audit row -- exactly the symptom Boaz hit.
+
+    All errors are suppressed so a broken audit-log path doesn't
+    block the deny itself.
+    """
     try:
         rules.append_log_event(
             rules.build_log_event(
                 event_type="rule_fired_log",
-                outcome="blocked",
+                outcome=outcome,
                 rule_id=rule_id,
                 agent=agent_name,
                 role=role,
@@ -389,6 +399,13 @@ def main() -> None:
                             f"overridden_failclosed: {message} "
                             f"(token reason: {token.reason})"
                         ),
+                        # Phase 7 bug fix: was previously omitted
+                        # which defaulted to "blocked" (the cause of
+                        # Boaz's audit-trail discrepancy). Override
+                        # was honored on the wire (allow emitted,
+                        # token consumed) but the audit row said
+                        # blocked. Now correctly tagged overridden.
+                        outcome="overridden",
                     )
                     _emit(_allow_output())
                     return
