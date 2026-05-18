@@ -28,24 +28,48 @@ drifting from reality.
 
 ## Install for development
 
-Requires Python >= 3.10.
+Requires Python >= 3.10 and these runtime deps in whichever python is
+first on the daemon's PATH:
+
+- `mcp>=1.0` -- MCP SDK
+- `watchdog>=4.0` -- filesystem mailbox watch loop
+- `PyYAML>=6.0` -- workflow manifest parser
 
 ```bash
 # from this repo root
-pip install -e .   # installs operon_mcp_server in editable mode + its deps (mcp, watchdog)
+pip install -e .   # installs operon_mcp_server + the three runtime deps above
 claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-plugin/
 ```
 
 In a separate Claude Code session, run `/plugin list`; `operon-plugin`
 should appear as registered. Use `/reload-plugins` after edits.
 
-## Install from marketplace (post-publish, placeholder)
+If the spawned worker MCP subprocess fails with
+`ModuleNotFoundError: No module named 'operon_mcp_server'` or
+`No module named 'yaml'`, the `python` on Claude Code's daemon PATH
+does not have the operon package and/or its deps installed in its
+site-packages. Either `pip install -e .` into that python, or set
+`PYTHONPATH=<repo>/src` and `pip install mcp watchdog PyYAML` into
+the daemon-PATH python (Carryover #4 documents this in detail).
+
+## Install from marketplace
 
 Once published to `SprustonLab/operon-plugin` on GitHub:
 
 ```bash
 claude plugin marketplace add SprustonLab/operon-plugin
 claude plugin install operon-plugin@operon-plugin-marketplace
+```
+
+NOTE: `claude plugin install` copies the plugin files into
+`~/.claude/plugins/cache/...` but does NOT pip-install the
+`operon_mcp_server` Python package. After installing the plugin,
+you still need to ensure the daemon-PATH python has the runtime deps:
+
+```bash
+pip install 'mcp>=1.0' 'watchdog>=4.0' 'PyYAML>=6.0'
+# AND either pip install operon-plugin's package into the same python,
+# or set PYTHONPATH so `python -m operon_mcp_server.server` resolves.
 ```
 
 ## Specification
