@@ -437,6 +437,78 @@ ENV_PLUGIN_ROOT_VAR = "CLAUDE_PLUGIN_ROOT"
 #: debug output and worker boot is invisible.
 ENV_DEBUG_VAR = "OPERON_DEBUG"
 
+#: Env var that opts into propagating `--dangerously-load-development-
+#: channels=<channel-id>` onto spawned `claude --bg` argv so the worker
+#: session registers our `claude/channel` push instead of silently
+#: dropping it with "Channel notifications skipped: server ... not in
+#: --channels list for this session". Default off because the flag is
+#: only safe under one of two preconditions:
+#: (a) the user has applied Boaz's local binary patch to Claude Code
+#:     2.1.143 that bypasses the DevChannelsDialog TTY-confirm gate
+#:     (the gate would otherwise silently kill bg sessions), OR
+#: (b) operon-plugin is on Anthropic's approved-channel allowlist (not
+#:     true at the time of writing).
+#: Without (a) or (b), passing the flag risks silent spawn failure.
+#: Boaz turns this on for his patched setup; distribution stays default
+#: off until upstream channels-API support is widely available.
+ENV_BG_CHANNELS_VAR = "OPERON_BG_CHANNELS"
+
+
+def _resolve_channel_identifier() -> str | None:
+    """Construct `plugin:<plugin-name>@<marketplace-name>` from on-disk JSON.
+
+    Reads `${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json` for the
+    plugin name and `${CLAUDE_PLUGIN_ROOT}/../../.claude-plugin/
+    marketplace.json` for the marketplace name. Avoids hardcoding the
+    "operon-plugin" / "operon-plugin-marketplace" string pair in code
+    so future renames or third-party redistribution do not require a
+    code change.
+
+    Returns the channel identifier string on success, or `None` if the
+    files are missing / malformed / lack the required keys. Callers
+    treat None as "feature unavailable" and proceed without the
+    --dangerously-load-development-channels flag.
+    """
+    plugin_root_str = os.environ.get(ENV_PLUGIN_ROOT_VAR, "").strip()
+    if not plugin_root_str:
+        return None
+    plugin_root = Path(plugin_root_str)
+
+    plugin_json = plugin_root / ".claude-plugin" / "plugin.json"
+    # `<plugin_root>/../..` walks up `plugins/<plugin>/` to the repo
+    # root, where the marketplace manifest lives.
+    marketplace_json = plugin_root.parent.parent / ".claude-plugin" / "marketplace.json"
+
+    try:
+        plugin_data = json.loads(plugin_json.read_text(encoding="utf-8"))
+        marketplace_data = json.loads(marketplace_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(plugin_data, dict) or not isinstance(marketplace_data, dict):
+        return None
+
+    plugin_name = plugin_data.get("name")
+    marketplace_name = marketplace_data.get("name")
+    if not (isinstance(plugin_name, str) and plugin_name):
+        return None
+    if not (isinstance(marketplace_name, str) and marketplace_name):
+        return None
+
+    return f"plugin:{plugin_name}@{marketplace_name}"
+
+
+def _bg_channels_enabled() -> bool:
+    """Return True iff the Coordinator's env opts into bg-channels flag.
+
+    Recognized truthy values for `OPERON_BG_CHANNELS`: `1`, `true`,
+    `yes`, `on` (case-insensitive). Anything else (including the
+    var being unset) is treated as off.
+    """
+    flag = os.environ.get(ENV_BG_CHANNELS_VAR, "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
 def _spawn_subprocess(
     *,
     project_path: Path,
@@ -461,18 +533,48 @@ def _spawn_subprocess(
     probes (Phase 4 fix v2).
 
     Channel surfacing: the watch loop emits `claude/channel`
-    notifications regardless, but Claude Code may drop them with the
-    message "Channel notifications skipped: channels feature is not
-    currently available" if the user has not opted in via
-    `--dangerously-load-development-channels plugin:operon-plugin@
-    operon-plugin-marketplace` on their main interactive session.
-    That flag requires interactive confirmation and so cannot be
-    re-emitted from a `claude --bg` invocation (the bg session has no
-    TTY to confirm against; passing the flag here would silently kill
-    the spawn). Mailbox filesystem transport works either way --
-    envelopes move from `inbox/` to `inbox/processed/` and the audit
-    trail is unaffected -- the channels gating only affects whether
-    the LLM in the worker's session sees the inbound message tag.
+    notifications regardless, but Claude Code drops them with the
+    message "Channel notifications skipped: server <id> not in
+    --channels list for this session" unless the spawned bg session
+    has the channel registered. To allow the channel to register we
+    pass `--dangerously-load-development-channels=plugin:<plugin>@
+    <marketplace>` on the spawn argv (gated by `OPERON_BG_CHANNELS=1`
+    so unpatched/unprivileged users default off).
+
+    UPSTREAM CAVEATS observed during Carryover #5 testing on Claude
+    Code 2.1.143 with Boaz's `DevChannelsDialog`-bypass binary patch:
+
+    - The dev-channels flag's TTY-confirm dialog was the FIRST gate
+      and was silently killing bg sessions; Boaz's binary patch
+      bypasses that dialog so the spawn now survives. Confirmed.
+    - But there appears to be a SECOND gate further into the bg
+      session's channels-registration path that the dialog patch
+      does NOT bypass. Empirical observation: even with the flag on
+      argv, bg-spawned worker MCP logs report either "plugin ... is
+      not on the approved channels allowlist (use --dangerously-load-
+      development-channels for local dev)" (recursive instruction,
+      flag IS already present) or "you asked for X but the installed
+      operon-plugin plugin is from inline" (marketplace-identifier
+      mismatch when --plugin-dir is also passed).
+    - Mailbox filesystem transport works either way -- envelopes
+      move `inbox/` -> `processed/`, audit trail unaffected -- the
+      gate only blocks the LLM-visible `<channel>` tag.
+    - The plumbing is therefore forward-compatible: when upstream
+      patches the second gate (or a marketplace-installed operon
+      reaches the approved allowlist), this code path will start
+      registering channels correctly with NO code change required.
+
+    The channel identifier `plugin:<plugin>@<marketplace>` is read
+    from on-disk manifests (`.claude-plugin/plugin.json` +
+    `.claude-plugin/marketplace.json`) via
+    `_resolve_channel_identifier()` so renames or third-party
+    redistribution do not require a code change.
+
+    Equal-sign syntax (`--flag=value`) is used instead of
+    space-separated (`--flag value`) because empirically the
+    space-separated form interacts badly with positional-argument
+    parsing in some Claude Code versions (the prompt argument was
+    observed consuming the channel-list value).
 
     Settings env: includes `OPERON_AGENT_HANDLE` (always) and
     `OPERON_DEBUG` (if set in the Coordinator's env) so verbose
@@ -509,6 +611,17 @@ def _spawn_subprocess(
     ]
     if plugin_root:
         argv.extend(["--plugin-dir", plugin_root])
+    # Carryover #5: opt-in dev-channels flag. Gated on
+    # `OPERON_BG_CHANNELS=1` because the upstream TTY-confirm gate
+    # silently kills bg sessions without the binary patch. `=` syntax
+    # avoids the prompt-eats-the-channel-list parsing issue observed
+    # with the space-separated form.
+    if _bg_channels_enabled():
+        channel_id = _resolve_channel_identifier()
+        if channel_id:
+            argv.append(
+                f"--dangerously-load-development-channels={channel_id}"
+            )
     argv.append(initial_prompt)
 
     env = dict(os.environ)
