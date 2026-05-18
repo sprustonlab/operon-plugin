@@ -81,6 +81,30 @@ respawn -- unlike the prior `--dangerously-load-development-channels`
 flag, whose interactive-confirmation state did not persist past
 respawn.
 
+> **Note on misleading toast banner (Claude Code 2.1.143).** When
+> you launch with `--channels=plugin:operon-plugin@inline`, the
+> startup banner displays two cosmetic toast lines:
+>
+> ```
+> plugin:operon-plugin@inline * plugin not installed
+> plugin:operon-plugin@inline * not on the approved channels allowlist
+> ```
+>
+> These are **misleading**. They are emitted by a UI banner
+> validator that runs alongside, but is independent of, the actual
+> channel-gate decision. The functional gate (covered by Boaz's
+> binary patches) DOES pass, and channels ARE registered. Verify by
+> tailing the operon MCP log immediately after launch:
+>
+> ```bash
+> tail -f ~/.cache/claude-cli-nodejs/$(pwd | sed 's|/|-|g')/mcp-logs-plugin-operon-plugin-operon/*.jsonl | grep -E "Channel notifications (registered|skipped)"
+> ```
+>
+> If you see `"Channel notifications registered"`, the gate
+> passed and channel push works normally. If you see
+> `"Channel notifications skipped: <reason>"`, that's the real
+> failure mode -- capture the reason and report it.
+
 Without the flag, the mailbox filesystem transport still works
 end-to-end (envelopes move from `inbox/` to `inbox/processed/`,
 audit trail unaffected) but Claude Code logs "Channel notifications
