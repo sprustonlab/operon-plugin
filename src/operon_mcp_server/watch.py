@@ -252,6 +252,7 @@ async def _process_envelope(
     self_session_id: str | None,
 ) -> None:
     """Read, claim, dispatch one envelope. Idempotent on race."""
+    _log.debug("process envelope: path=%s", path)
     # 1) Claim atomically. If another reader won the race, bail.
     try:
         claimed = mailbox.consume_envelope(path)
@@ -261,6 +262,7 @@ async def _process_envelope(
     if claimed is None:
         _log.debug("envelope %s already claimed", path)
         return
+    _log.debug("claimed envelope: %s -> %s", path, claimed)
 
     # 2) Read the claimed file.
     try:
@@ -271,7 +273,12 @@ async def _process_envelope(
 
     # 3) Push channel notification.
     content, meta = _format_channel_content(envelope)
+    _log.debug(
+        "pushing channel notification: kind=%s sender=%s content_len=%d",
+        envelope.get("kind"), envelope.get("sender"), len(content),
+    )
     await _channel_push(write_stream, content=content, meta=meta)
+    _log.debug("channel push sent for %s", claimed.name)
 
     # 4) Side effects per kind.
     kind = envelope.get("kind")
@@ -319,12 +326,22 @@ def _drain_existing(
 # -- identity binding ---------------------------------------------------
 
 
+#: Maximum total wait when polling for identity at startup. Identity
+#: is set by `spawn_agent` BEFORE the MCP subprocess launches, so it
+#: should resolve on the first poll; the retry budget is paranoia for
+#: rare cases where `_handles/<handle>.json` lands a beat late.
+_IDENTITY_MAX_WAIT_S = 10.0
+
+#: Interval between identity-resolution polls during the startup wait.
+_IDENTITY_POLL_INTERVAL_S = 0.5
+
+
 def resolve_self() -> tuple[str | None, str | None]:
     """Resolve (agent_name, session_id) for this subprocess.
 
-    Returns (None, None) if identity is not yet bound. Callers must
-    treat this as "not ready yet" and retry on the next list_tools
-    fire.
+    Returns (None, None) if identity is not yet bound. Callers should
+    treat this as "not ready yet" and retry shortly -- the bootstrap
+    loop polls at `_IDENTITY_POLL_INTERVAL_S` intervals.
     """
     handle = identity.read_env_handle()
     if handle is None:
@@ -419,34 +436,44 @@ async def run_watch_loop(
         _log.info("watch loop stopped for agent=%r", agent_name)
 
 
-async def start_watch_loop_if_ready(
+async def bootstrap_and_run(
     write_stream: MemoryObjectSendStream[SessionMessage],
-    task_group: anyio.abc.TaskGroup,
-    state: dict[str, Any],
-) -> bool:
-    """Start the watch loop if identity is bound; idempotent.
+) -> None:
+    """Resolve identity (with bounded retry) then run the watch loop.
 
-    `state` is a mutable dict the caller threads across `list_tools`
-    invocations to remember whether the loop has already been started.
-    Returns True if the loop has been started (now or previously);
-    False if identity is still unresolved.
+    Eager-start architecture (Phase 4 fix): scheduled by `server._run()`
+    on the long-lived task group, parallel to `server.run()`. The
+    bootstrap polls `resolve_self()` until identity is bound -- because
+    `claude --bg` sessions may never invoke `tools/list` on their own,
+    the previous lazy-start-on-tools/list path would hang indefinitely
+    for any worker whose initial prompt did not require a tool call.
 
-    Phase 4 architecture: `_run()` creates a long-lived task group and
-    the server's `list_tools` callback invokes this helper on every
-    fire. On the first fire where identity resolves, the loop starts.
-    Subsequent fires are no-ops.
+    Identity is bound by `spawn_agent` BEFORE the subprocess launches
+    (handle file is written first, then `Popen` with the env override),
+    so the first poll should succeed for any agent spawned via
+    `spawn_agent`. The retry budget covers manual seedings and rare
+    filesystem propagation delays.
+
+    If identity does not resolve within `_IDENTITY_MAX_WAIT_S`, the
+    bootstrap logs and exits -- the subprocess can still serve
+    `whoami` for diagnostics, but the mailbox watch loop never starts.
     """
-    if state.get("started"):
-        return True
-    name, session_id = resolve_self()
-    if name is None:
-        return False
-    state["started"] = True
-    state["agent_name"] = name
-    state["session_id"] = session_id
-    task_group.start_soon(run_watch_loop, name, write_stream, session_id)
-    _log.info(
-        "watch loop scheduled for agent=%r (session_id=%s)",
-        name, session_id,
+    _log.info("watch bootstrap: polling for identity")
+    elapsed = 0.0
+    while elapsed < _IDENTITY_MAX_WAIT_S:
+        name, session_id = resolve_self()
+        if name is not None:
+            _log.info(
+                "watch bootstrap: identity resolved agent=%r session_id=%s "
+                "after %.1fs",
+                name, session_id, elapsed,
+            )
+            await run_watch_loop(name, write_stream, session_id)
+            return
+        await anyio.sleep(_IDENTITY_POLL_INTERVAL_S)
+        elapsed += _IDENTITY_POLL_INTERVAL_S
+    _log.warning(
+        "watch bootstrap: identity not bound within %.1fs; watch loop "
+        "will not start for this subprocess (whoami still serves)",
+        _IDENTITY_MAX_WAIT_S,
     )
-    return True

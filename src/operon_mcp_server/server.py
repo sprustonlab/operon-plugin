@@ -27,6 +27,8 @@ started lazily on the first `tools/list` fire that resolves identity.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from typing import Any
 
 import anyio
@@ -68,6 +70,38 @@ SERVER_VERSION = "0.0.1"
 #: construction to the SDK helper which auto-derives `tools` from the
 #: registered `@server.list_tools()` handler.
 EXPERIMENTAL_CAPABILITIES: dict[str, dict[str, Any]] = {"claude/channel": {}}
+
+#: Env var that, when set to a truthy value, enables verbose DEBUG-level
+#: logging to stderr. Defaults to off: in production the subprocess is
+#: spawned with `stderr=DEVNULL` by `spawn_agent` (see SPEC §6.5) and
+#: we don't want chatter even if a terminal is wired in. Toggle on for
+#: manual diagnosis of identity binding / watch-loop startup issues.
+ENV_DEBUG_FLAG = "OPERON_DEBUG"
+
+
+def _maybe_configure_stderr_logging() -> None:
+    """Wire DEBUG-level stderr logging if `OPERON_DEBUG=1` is set.
+
+    Safe to call multiple times -- `logging.basicConfig` is a no-op
+    after the first call. Format includes timestamp + logger name so
+    the per-subprocess origin of each line is unambiguous when
+    multiple Agents log into the same shell session via the
+    `claude attach` viewer. Claude Code routes the MCP subprocess's
+    stderr to `~/.claude/debug/<session-id>.txt` (per channels-reference
+    docs), so OPERON_DEBUG output lands there for spawned workers.
+    """
+    flag = os.environ.get(ENV_DEBUG_FLAG, "").strip().lower()
+    if flag in {"", "0", "false", "no"}:
+        return
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.DEBUG,
+        format=(
+            "[%(asctime)s] %(name)s %(levelname)s "
+            "(pid=%(process)d): %(message)s"
+        ),
+    )
+
 
 #: Coordinator role identifier (mirrors `tools.spawn_agent.COORDINATOR_ROLE`).
 COORDINATOR_ROLE = "coordinator"
@@ -175,18 +209,13 @@ def _filter_tools_for_role(role: str | None) -> list[mcp_types.Tool]:
     return visible
 
 
-def _build_server(
-    watch_state: dict[str, Any],
-    write_stream_holder: dict[str, Any],
-    task_group_holder: dict[str, Any],
-) -> Server:
+def _build_server() -> Server:
     """Create the MCP `Server` instance with tool handlers attached.
 
-    `watch_state`, `write_stream_holder`, and `task_group_holder` are
-    threaded through so the `list_tools` callback can lazily start the
-    background watch loop on first identity resolution. The holders
-    are populated by `_run()` after the stdio streams and task group
-    exist.
+    The watch loop is no longer started from inside `list_tools`
+    (eager-start architecture; see SPEC §6.6 and the Phase 4 fix).
+    `_run()` schedules `watch.bootstrap_and_run` directly on the
+    long-lived task group at startup.
     """
     server: Server = Server(SERVER_NAME, version=SERVER_VERSION)
 
@@ -197,25 +226,14 @@ def _build_server(
         # bound mid-session (e.g. SessionStart hook fires after first
         # ping) picks up the new visibility on the next request.
         role = _resolve_caller_role()
-        # Opportunistic: start the watch loop on the first list_tools
-        # fire where identity is resolvable. Per SPEC §6.6 the watch
-        # loop is per-subprocess and only meaningful once we know which
-        # mailbox is ours.
-        write_stream = write_stream_holder.get("stream")
-        task_group = task_group_holder.get("tg")
-        if write_stream is not None and task_group is not None:
-            try:
-                await watch.start_watch_loop_if_ready(
-                    write_stream, task_group, watch_state,
-                )
-            except Exception as exc:  # pragma: no cover (defensive)
-                _log.exception("Failed to start watch loop: %s", exc)
+        _log.debug("tools/list: resolved caller role=%r", role)
         return _filter_tools_for_role(role)
 
     @server.call_tool()
     async def _call_tool(
         name: str, arguments: dict[str, Any] | None
     ) -> list[mcp_types.TextContent]:
+        _log.debug("tools/call: name=%r", name)
         handler = _TOOL_HANDLERS.get(name)
         if handler is None:
             raise ValueError(f"Unknown tool: {name!r}")
@@ -227,17 +245,27 @@ def _build_server(
 async def _run() -> None:
     """Run the stdio MCP server until the peer disconnects.
 
-    Phase 4: also runs a background filesystem-watch loop (`watch.py`)
-    concurrently with the MCP protocol loop via `anyio.create_task_group`.
-    The watch loop is started lazily on first `list_tools` so identity
-    is resolvable (the SessionStart hook may bind it after `initialize`
-    but before `tools/list`).
-    """
-    watch_state: dict[str, Any] = {"started": False}
-    write_stream_holder: dict[str, Any] = {}
-    task_group_holder: dict[str, Any] = {}
+    Phase 4 (eager-start fix): runs the background filesystem-watch
+    loop (`watch.bootstrap_and_run`) concurrently with the MCP
+    protocol loop. The watch loop is scheduled IMMEDIATELY at startup
+    -- not lazily on first `tools/list` -- because `claude --bg`
+    sessions may never invoke `tools/list` on their own (a worker
+    whose initial prompt is "wait for messages" does no tool calls
+    and would never trigger lazy start).
 
-    server = _build_server(watch_state, write_stream_holder, task_group_holder)
+    The bootstrap waits for `OPERON_AGENT_HANDLE` to resolve to a
+    valid `_handles/<handle>.json` record before scheduling the
+    watcher itself.
+    """
+    _maybe_configure_stderr_logging()
+    _log.info("operon MCP server boot: pid=%d cwd=%s", os.getpid(), os.getcwd())
+    _log.debug(
+        "boot env: %s=%r",
+        identity.ENV_HANDLE_VAR,
+        os.environ.get(identity.ENV_HANDLE_VAR),
+    )
+
+    server = _build_server()
     # Use the SDK helper: it auto-derives `capabilities.tools` from the
     # registered `@server.list_tools()` handler and nests our
     # `claude/channel` extension under `experimental` per MCP spec. The
@@ -247,16 +275,16 @@ async def _run() -> None:
         experimental_capabilities=EXPERIMENTAL_CAPABILITIES,
     )
     async with stdio_server() as (read_stream, write_stream):
-        write_stream_holder["stream"] = write_stream
+        _log.info("stdio transport open; scheduling watch bootstrap")
         async with anyio.create_task_group() as tg:
-            task_group_holder["tg"] = tg
-            # The server.run() coroutine is the MCP protocol loop; the
-            # watch loop is start_soon-scheduled lazily from
-            # _list_tools. When server.run() returns (peer disconnect),
-            # cancel the task group so the watch loop unwinds too.
+            # Eager schedule: the watch bootstrap polls for identity
+            # and then runs the watch loop. Independent of any
+            # tools/list traffic.
+            tg.start_soon(watch.bootstrap_and_run, write_stream)
             try:
                 await server.run(read_stream, write_stream, init_options)
             finally:
+                _log.info("server.run() returned; cancelling task group")
                 tg.cancel_scope.cancel()
 
 

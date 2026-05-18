@@ -53,6 +53,17 @@ subprocess's `os.environ` per SPEC §6.5):
 claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-plugin/
 ```
 
+To diagnose watch-loop / identity-binding issues, also export
+`OPERON_DEBUG=1` before launching Claude Code. Each MCP subprocess
+will then emit DEBUG-level logs to its stderr. Claude Code routes the
+MCP subprocess's stderr to `~/.claude/debug/<session-id>.txt`
+(per the channels-reference docs), so spawned workers' logs land
+there.
+
+```bash
+OPERON_DEBUG=1 claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-plugin/
+```
+
 ### 3. Run the 5-step smoke check inside the Coordinator session
 
 Issue these tool calls in order. Each step's success condition is
