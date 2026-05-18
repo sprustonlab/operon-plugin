@@ -164,14 +164,31 @@ def _deny_output(message: str) -> dict[str, Any]:
     }
 
 
-def _ask_output(message: str) -> dict[str, Any]:
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "ask",
-            "permissionDecisionReason": message or "Warned by operon-plugin rule.",
-        }
-    }
+def _deny_with_ack_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
+    """Phase 7: warn-tier rules emit DENY with a hint to call
+    acknowledge_warning. Never emits `ask` -- Claude Code's native
+    permission prompt is bypassable by permission mode and out of
+    our control; we want a closed-loop signal to the LLM."""
+    msg = (
+        f"{rule_message.strip()}\n\n"
+        f"Call mcp__operon__acknowledge_warning("
+        f"rule_id=\"{rule_id}\", reason=\"<explain why>\") "
+        f"if this is intentional, then retry the tool."
+    )
+    return _deny_output(msg)
+
+
+def _deny_with_override_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
+    """Phase 7: deny-tier rules emit DENY with a hint to call
+    request_override. The override is a user-gated escape hatch
+    (elicitation/create dialog); the LLM cannot self-grant."""
+    msg = (
+        f"{rule_message.strip()}\n\n"
+        f"Call mcp__operon__request_override("
+        f"rule_id=\"{rule_id}\", reason=\"<explain why>\") "
+        f"to request user approval, then retry the tool."
+    )
+    return _deny_output(msg)
 
 
 def _failclosed_deny_check(
@@ -345,6 +362,36 @@ def main() -> None:
 
     if failclosed is not None:
         rule_id, message = failclosed
+        # Phase 7: a Coordinator-approved override token (one-shot)
+        # bypasses fail-closed deny. Audit row tagged
+        # `overridden_failclosed` so the lineage is clear in the
+        # JSONL.
+        handle = identity.read_env_handle()
+        if handle:
+            try:
+                token = rules.find_active_token(
+                    kind="override", rule_id=rule_id, agent_handle=handle,
+                )
+            except Exception as exc:
+                _log.warning("failclosed token lookup error: %s", exc)
+                token = None
+            if token is not None:
+                consumed = rules.consume_token(token)
+                if consumed:
+                    _try_log_failclosed(
+                        rule_id=rule_id,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        agent_name=agent_name,
+                        role=role,
+                        current_phase=current_phase,
+                        message=(
+                            f"overridden_failclosed: {message} "
+                            f"(token reason: {token.reason})"
+                        ),
+                    )
+                    _emit(_allow_output())
+                    return
         _try_log_failclosed(
             rule_id=rule_id,
             tool_name=tool_name,
@@ -354,7 +401,7 @@ def main() -> None:
             current_phase=current_phase,
             message=message,
         )
-        _emit(_deny_output(message))
+        _emit(_deny_with_override_hint(rule_id, message))
         return  # unreachable; SystemExit above
 
     # ---- FULL RULES ENGINE -----------------------------------------
@@ -407,13 +454,61 @@ def main() -> None:
         return
 
     if decision.action == "deny":
+        # Phase 7: check for an active one-shot override token. If
+        # present, consume it (delete the file) and convert deny to
+        # allow with `outcome=overridden` audit.
+        handle = identity.read_env_handle()
+        if handle and decision.rule_id:
+            try:
+                token = rules.find_active_token(
+                    kind="override", rule_id=decision.rule_id,
+                    agent_handle=handle,
+                )
+            except Exception as exc:
+                _log.warning("override token lookup error: %s", exc)
+                token = None
+            if token is not None and rules.consume_token(token):
+                _log_row("overridden", "deny")
+                _emit(_allow_output())
+                return
         _log_row("blocked", "deny")
-        _emit(_deny_output(decision.message))
+        _emit(
+            _deny_with_override_hint(
+                decision.rule_id or "<unknown>", decision.message
+            )
+        )
         return
 
     if decision.action == "warn":
+        # Phase 7: check for an active ack token (60s TTL). If
+        # present, convert warn-deny to allow with `outcome=acked`.
+        # Ack tokens are NOT one-shot; they remain valid for their
+        # TTL so multiple retries within the same turn don't need
+        # repeat acks.
+        handle = identity.read_env_handle()
+        if handle and decision.rule_id:
+            try:
+                token = rules.find_active_token(
+                    kind="ack", rule_id=decision.rule_id,
+                    agent_handle=handle,
+                )
+            except Exception as exc:
+                _log.warning("ack token lookup error: %s", exc)
+                token = None
+            if token is not None:
+                _log_row("acked", "warn")
+                _emit(_allow_output())
+                return
         _log_row("blocked", "warn")
-        _emit(_ask_output(decision.message))
+        # Phase 7: warn rules emit DENY (not ask) with a hint to call
+        # acknowledge_warning. Claude Code's native `ask` is bypassable
+        # by permission mode; deny+ack-hint keeps the loop closed
+        # to the LLM, not the user.
+        _emit(
+            _deny_with_ack_hint(
+                decision.rule_id or "<unknown>", decision.message
+            )
+        )
         return
 
     # action == "allow" (no rule matched)

@@ -583,3 +583,253 @@ def command_hash(rule_id: str, tool_name: str, tool_input: dict[str, Any]) -> st
         f"{rule_id}:{tool_name}:{cmd}".encode("utf-8")
     ).hexdigest()
     return digest
+
+
+# ===========================================================================
+# Phase 7: ack + override token files
+# ===========================================================================
+#
+# Tokens authorize the LLM to bypass a rule on its next retry. Two kinds:
+#
+#   - ACK tokens (warn rules): written by `acknowledge_warning`. Per-handle,
+#     per-rule, with a TTL (default 60s) so a stale ack from a prior turn
+#     doesn't accidentally unblock a future warn fire.
+#   - OVERRIDE tokens (deny rules): written by `request_override` after the
+#     user accepts the elicitation. One-shot -- consumed on first use; the
+#     hook deletes the file after honoring it.
+#
+# Path layout under the active run-dir:
+#
+#   acks/<agent_handle>/<rule_id>-<uuid4>.json
+#   overrides/<agent_handle>/<rule_id>-<uuid4>.json
+#
+# Per-handle subdirs keep one Agent's tokens from accidentally matching
+# another's. Filename includes the rule_id so the hook's lookup is a cheap
+# `glob(rule_id-*.json)`.
+#
+# Token JSON shape (frozen `Token` dataclass below; same shape for both
+# kinds, distinguished by directory):
+#
+#   {
+#     "rule_id": "<id>",
+#     "agent_handle": "<uuid>",
+#     "kind": "ack" | "override",
+#     "reason": "<llm-supplied explanation>",
+#     "issued_at": "<iso8601>",
+#     "expires_at": "<iso8601>" or null,
+#     "one_shot": false | true
+#   }
+#
+# Lifecycle:
+#   ack tokens: issued with TTL; valid until expires_at; deleted lazily on
+#     read after expiration.
+#   override tokens: issued one-shot (no TTL by default); consumed by the
+#     hook on first match (file unlinked atomically).
+
+ACKS_DIRNAME = "acks"
+OVERRIDES_DIRNAME = "overrides"
+
+#: Default TTL for ack tokens. Long enough for the LLM to call
+#: acknowledge_warning + retry the gated tool call within the same turn;
+#: short enough that a stale ack doesn't bypass a warn fire in a later
+#: turn.
+ACK_TOKEN_TTL_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class Token:
+    """Materialized token from disk. Read-only; mutation goes through
+    the writer / consumer helpers below."""
+
+    rule_id: str
+    agent_handle: str
+    kind: str  # "ack" or "override"
+    reason: str
+    issued_at: str
+    expires_at: str | None
+    one_shot: bool
+    path: Path  # source file, for consumption
+
+
+def _acks_dir(agent_handle: str, start: Path | None = None) -> Path:
+    return paths.active_run_dir(start) / ACKS_DIRNAME / agent_handle
+
+
+def _overrides_dir(agent_handle: str, start: Path | None = None) -> Path:
+    return paths.active_run_dir(start) / OVERRIDES_DIRNAME / agent_handle
+
+
+def _parse_iso(ts: str | None):
+    """Parse an ISO-8601 timestamp from token JSON. Returns None on any
+    parse error -- callers treat None as 'no expiry'."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _token_is_expired(token: Token, now=None) -> bool:
+    if token.expires_at is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    exp = _parse_iso(token.expires_at)
+    if exp is None:
+        return False
+    return now >= exp
+
+
+def _read_token(path: Path) -> Token | None:
+    """Read a token JSON file. Returns None on missing / unparseable."""
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    rid = data.get("rule_id")
+    handle = data.get("agent_handle")
+    kind = data.get("kind")
+    if not all(isinstance(x, str) and x for x in (rid, handle, kind)):
+        return None
+    return Token(
+        rule_id=rid,
+        agent_handle=handle,
+        kind=kind,
+        reason=str(data.get("reason", "")),
+        issued_at=str(data.get("issued_at", "")),
+        expires_at=data.get("expires_at"),
+        one_shot=bool(data.get("one_shot", False)),
+        path=path,
+    )
+
+
+def find_active_token(
+    *,
+    kind: str,
+    rule_id: str,
+    agent_handle: str,
+    start: Path | None = None,
+) -> Token | None:
+    """Find the first non-expired token of `kind` for `(rule_id,
+    agent_handle)`. Lazily deletes expired tokens encountered during
+    the scan.
+
+    `kind` must be "ack" or "override". Returns None when no matching
+    valid token exists.
+    """
+    if kind == "ack":
+        dir_fn = _acks_dir
+    elif kind == "override":
+        dir_fn = _overrides_dir
+    else:
+        raise ValueError(f"unknown token kind: {kind!r}")
+    try:
+        tokens_dir = dir_fn(agent_handle, start)
+    except paths.OperonPathError:
+        return None
+    if not tokens_dir.is_dir():
+        return None
+    for path in sorted(tokens_dir.glob(f"{rule_id}-*.json")):
+        token = _read_token(path)
+        if token is None:
+            continue
+        if token.kind != kind:
+            continue
+        if token.rule_id != rule_id:
+            continue
+        if _token_is_expired(token):
+            # Lazy GC of expired tokens. Best-effort; ignore failures.
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        return token
+    return None
+
+
+def consume_token(token: Token) -> bool:
+    """Delete a one-shot token's file. No-op for TTL-only tokens.
+
+    Returns True iff the file was unlinked (or didn't exist). False
+    on unexpected OSError -- caller treats False as "consumption
+    failed; do not honor" to be safe.
+    """
+    if not token.one_shot:
+        return True
+    try:
+        token.path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        _log.warning("token consume failed for %s: %s", token.path, exc)
+        return False
+
+
+def write_token(
+    *,
+    kind: str,
+    rule_id: str,
+    agent_handle: str,
+    reason: str,
+    ttl_seconds: int | None = None,
+    one_shot: bool = False,
+    start: Path | None = None,
+) -> Path:
+    """Write a new token to disk. Atomic via temp + os.replace.
+
+    Returns the final path. Raises `RulesError` on filesystem
+    failure. Caller is responsible for any preceding validation
+    (rule_id existence, enforcement level, caller identity).
+    """
+    if kind not in {"ack", "override"}:
+        raise ValueError(f"unknown token kind: {kind!r}")
+    if not rule_id or not agent_handle:
+        raise ValueError("rule_id and agent_handle must be non-empty")
+
+    now = datetime.now(timezone.utc)
+    issued_at = now.isoformat(timespec="seconds")
+    expires_at: str | None = None
+    if ttl_seconds is not None:
+        from datetime import timedelta
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(
+            timespec="seconds"
+        )
+
+    if kind == "ack":
+        tokens_dir = _acks_dir(agent_handle, start)
+    else:
+        tokens_dir = _overrides_dir(agent_handle, start)
+    tokens_dir.mkdir(parents=True, exist_ok=True)
+
+    import uuid as _uuid
+    token_id = _uuid.uuid4().hex
+    target = tokens_dir / f"{rule_id}-{token_id}.json"
+    payload = {
+        "rule_id": rule_id,
+        "agent_handle": agent_handle,
+        "kind": kind,
+        "reason": reason,
+        "issued_at": issued_at,
+        "expires_at": expires_at,
+        "one_shot": one_shot,
+    }
+    data = json.dumps(payload, indent=2, ensure_ascii=False)
+    tmp = target.with_name(
+        f"{target.name}.tmp.{os.getpid()}.{_uuid.uuid4().hex}"
+    )
+    try:
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise RulesError(f"failed to write {kind} token: {exc}") from exc
+    return target
