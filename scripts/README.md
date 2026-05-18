@@ -70,14 +70,22 @@ tail -f ~/.cache/claude-cli-nodejs/$(pwd | sed 's|/|-|g')/mcp-logs-plugin-operon
 
 To enable the LLM-visible channel push (so the worker's session
 actually sees the `<channel>` tag in its conversation context), add
-`--dangerously-load-development-channels plugin:operon-plugin@operon-plugin-marketplace`
-to the Coordinator's `claude` launch. The flag requires interactive
-confirmation; spawned `claude --bg` workers cannot pass it (no TTY).
+`--channels=plugin:operon-plugin@inline` to the Coordinator's
+`claude` launch. The marketplace-installed case picks up the right
+tag automatically via `channel_tag.channel_tag_for_self`, which
+reads `~/.claude/settings.json` `enabledPlugins`; dev-loaded users
+who launch with `--plugin-dir` use `@inline`. The production
+`--channels=` flag is parsed unconditionally on every supervisor
+restart, so it survives Claude Code's `/agents`-view attach-
+respawn -- unlike the prior `--dangerously-load-development-channels`
+flag, whose interactive-confirmation state did not persist past
+respawn.
+
 Without the flag, the mailbox filesystem transport still works
 end-to-end (envelopes move from `inbox/` to `inbox/processed/`,
 audit trail unaffected) but Claude Code logs "Channel notifications
-skipped: channels feature is not currently available" for each push
-and the LLM never sees the message tag.
+skipped: server <id> not in --channels list for this session" for
+each push and the LLM never sees the message tag.
 
 ### 3. Run the 5-step smoke check inside the Coordinator session
 
