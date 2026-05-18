@@ -48,8 +48,10 @@ from .tools import get_agent_info as get_agent_info_tool
 from .tools import get_applicable_rules as get_applicable_rules_tool
 from .tools import get_phase as get_phase_tool
 from .tools import interrupt_agent as interrupt_agent_tool
+from .tools import list_operon_sessions as list_operon_sessions_tool
 from .tools import message_agent as message_agent_tool
 from .tools import request_override as request_override_tool
+from .tools import restore_operon_session as restore_operon_session_tool
 from .tools import set_artifact_dir as set_artifact_dir_tool
 from .tools import spawn_agent as spawn_agent_tool
 from .tools import whoami as whoami_tool
@@ -144,6 +146,9 @@ _TOOL_VISIBILITY: dict[str, str] = {
     evaluate_tool.TOOL_NAME: _VISIBILITY_HIDDEN,
     request_override_tool.TOOL_NAME: _VISIBILITY_ALL,
     acknowledge_warning_tool.TOOL_NAME: _VISIBILITY_ALL,
+    # Phase 6.5: operon-session management.
+    list_operon_sessions_tool.TOOL_NAME: _VISIBILITY_ALL,
+    restore_operon_session_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
 }
 
 #: Routing table: tool name -> handler coroutine. Includes HIDDEN tools
@@ -168,6 +173,9 @@ _TOOL_HANDLERS = {
     evaluate_tool.TOOL_NAME: evaluate_tool.call,
     request_override_tool.TOOL_NAME: request_override_tool.call,
     acknowledge_warning_tool.TOOL_NAME: acknowledge_warning_tool.call,
+    # Phase 6.5: operon-session management.
+    list_operon_sessions_tool.TOOL_NAME: list_operon_sessions_tool.call,
+    restore_operon_session_tool.TOOL_NAME: restore_operon_session_tool.call,
 }
 
 #: Tool descriptors keyed by name (used by the role-scoped filter to
@@ -193,6 +201,9 @@ _TOOL_DESCRIPTORS: dict[str, mcp_types.Tool] = {
     # `_TOOL_HANDLERS` routing still dispatches it for the hook call.
     request_override_tool.TOOL_NAME: request_override_tool.tool_descriptor(),
     acknowledge_warning_tool.TOOL_NAME: acknowledge_warning_tool.tool_descriptor(),
+    # Phase 6.5 tools.
+    list_operon_sessions_tool.TOOL_NAME: list_operon_sessions_tool.tool_descriptor(),
+    restore_operon_session_tool.TOOL_NAME: restore_operon_session_tool.tool_descriptor(),
 }
 
 _log = logging.getLogger(__name__)

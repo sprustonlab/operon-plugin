@@ -1,4 +1,4 @@
-"""`activate_workflow` MCP tool (Coordinator-only).
+r"""`activate_workflow` MCP tool (Coordinator-only).
 
 Per SPEC §7 `activate_workflow` row + §11 + §17. Creates a new
 operon-run directory under `<project>/.operon/<run_name>/` and
@@ -12,6 +12,12 @@ run_name validation (SPEC §7):
 - Reject collision with an existing run directory
 
 Identity gate: Coordinator-only per SPEC §7.1.
+
+Phase 6.5 (destructive): if the CURRENT active run has alive worker
+bg sessions, this tool first issues an `elicitation/create`
+confirmation listing those workers and only proceeds on accept.
+User decline returns `{activated: false, reason: "user_declined"}`
+without mutating any on-disk state.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ from typing import Any
 
 import mcp.types as mcp_types
 
-from .. import identity, paths, workflow
+from .. import elicit, identity, paths, workflow
 from . import spawn_agent as spawn_agent_tool
 
 #: MCP tool name. Coordinator-only per SPEC §7.1.
@@ -198,7 +204,24 @@ def _copy_coordinator_handle_and_roster_row(
     return handle_path, roster_path
 
 
-def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
+async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
+    """Destructive activate (Phase 6.5).
+
+    Flow:
+      1. Validate inputs + Coordinator role.
+      2. Load workflow manifest (early so a missing workflow doesn't
+         leave half-created state on disk).
+      3. If there is a CURRENT active run with alive worker bg
+         sessions, issue an elicitation/create confirmation listing
+         the workers that will be killed. User decline -> early
+         return, no mutation.
+      4. Kill the alive workers via `claude stop <daemonShort>`.
+      5. Create the new run-dir subtree, copy the Coordinator handle
+         + seed the Coordinator roster row.
+      6. Atomically swap `_active.json` to point at the new run.
+      7. Write the initial phase_state.json.
+      8. Return success with `killed_workers` list for audit.
+    """
     workflow_id = args.get("workflow_id")
     run_name = args.get("run_name")
     if not (isinstance(workflow_id, str) and workflow_id):
@@ -208,18 +231,13 @@ def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     _validate_run_name(run_name)
 
     coord_record = _require_coordinator()
-    coord_handle = identity.read_env_handle()  # always present after _require_coordinator
+    coord_handle = identity.read_env_handle()
     if not coord_handle:
-        # Defensive: _require_coordinator already validated identity,
-        # so reaching this branch is a contract violation.
         raise ActivateWorkflowError(
             "Coordinator identity is missing OPERON_AGENT_HANDLE; "
             "_require_coordinator should have caught this."
         )
 
-    # Resolve the manifest before creating any directories so a
-    # missing-workflow failure does not leave a half-created run on
-    # disk.
     try:
         decl = workflow.load_workflow(workflow_id)
     except workflow.WorkflowError as exc:
@@ -232,12 +250,10 @@ def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         operon_dir = paths.operon_dir()
-    except paths.OperonPathError as exc:
-        # No .operon ancestor: we're being asked to activate the very
-        # first run. Create `.operon/` under the process cwd.
+    except paths.OperonPathError:
+        # No .operon ancestor: bootstrap first run under cwd.
         operon_dir = Path.cwd() / paths.OPERON_DIRNAME
         operon_dir.mkdir(parents=True, exist_ok=True)
-        _ = exc  # silence linter
 
     run_dir = operon_dir / run_name
     if run_dir.exists():
@@ -246,61 +262,86 @@ def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
             f"Choose a different run_name."
         )
 
-    # Bootstrap the run-dir subtree.
+    # --- Destructive prelude: alive-worker inspection + confirm ----
+    # Find the current active run (if any) and enumerate its alive
+    # workers. Coordinator's own bg session is NOT in this list (the
+    # alive_agents_in_run helper excludes role=coordinator).
+    killed_workers: list[dict[str, Any]] = []
+    current_run_dir: Path | None = None
+    alive_workers: list[dict[str, Any]] = []
+    try:
+        current_run_dir = paths.active_run_dir()
+    except paths.OperonPathError:
+        current_run_dir = None
+    if current_run_dir is not None:
+        alive_workers = workflow.alive_agents_in_run(current_run_dir)
+
+    if alive_workers:
+        names = [w.get("name", "<unknown>") for w in alive_workers]
+        msg = (
+            f"Activate workflow '{workflow_id}' as run '{run_name}'?\n\n"
+            f"This will CLOSE these workers from current run "
+            f"'{current_run_dir.name if current_run_dir else '?'}':\n"
+            + "\n".join(f"  - {n}" for n in names)
+        )
+        approved = await elicit.confirm(msg)
+        if not approved:
+            return {
+                "activated": False,
+                "reason": "user_declined",
+                "would_have_killed": names,
+                "current_run": current_run_dir.name if current_run_dir else None,
+            }
+        # User approved -- kill the alive workers BEFORE creating the
+        # new run-dir, so a kill failure aborts cleanly.
+        for w in alive_workers:
+            short = w.get("_daemon_short", "")
+            stop_result = workflow.kill_bg_session(short)
+            killed_workers.append(
+                {
+                    "name": w.get("name"),
+                    "session_id": w.get("session_id"),
+                    "stop": stop_result,
+                }
+            )
+
+    # --- Idempotent creation of the new run -----------------------
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / paths.HANDLES_DIRNAME).mkdir(parents=True, exist_ok=True)
     (run_dir / "mailbox").mkdir(parents=True, exist_ok=True)
 
-    # Carryover #2: copy the Coordinator's handle file + seed the new
-    # roster with a Coordinator row BEFORE swapping `_active.json`,
-    # so subsequent tool calls from the same MCP subprocess can
-    # resolve identity through the new run-dir.
+    # Carryover #2 (Phase 5): copy Coordinator handle + seed roster
+    # row BEFORE swapping `_active.json`.
     _copy_coordinator_handle_and_roster_row(
         new_run_dir=run_dir, handle=coord_handle, coord_record=coord_record,
     )
 
-    # Write `_active.json` pointing at the new run.
-    active_path = operon_dir / paths.ACTIVE_POINTER_FILENAME
-    active_payload = json.dumps(
-        {"active_run_name": run_name, "set_at": _now_iso()},
-        indent=2,
-        ensure_ascii=False,
-    )
-    active_tmp = active_path.with_name(
-        f"{active_path.name}.tmp.{run_name}.{_now_iso().replace(':', '')}"
-    )
+    # Atomic swap of _active.json via the shared helper.
     try:
-        active_tmp.write_text(active_payload, encoding="utf-8")
-        os.replace(active_tmp, active_path)
-    except OSError as exc:
-        try:
-            active_tmp.unlink()
-        except OSError:
-            pass
-        raise ActivateWorkflowError(
-            f"Failed to write _active.json: {exc}"
-        ) from exc
+        workflow.write_active_pointer(operon_dir, run_name)
+    except workflow.WorkflowError as exc:
+        raise ActivateWorkflowError(str(exc)) from exc
 
-    # Write the initial phase_state.json AFTER _active.json so any
-    # subsequent path lookup (which reads _active) finds a coherent
-    # run.
     try:
         workflow.write_initial_phase_state(workflow_id, first_phase)
     except workflow.WorkflowError as exc:
         raise ActivateWorkflowError(str(exc)) from exc
 
     return {
+        "activated": True,
         "run_name": run_name,
         "workflow_id": workflow_id,
         "current_phase": first_phase,
         "run_dir": str(run_dir),
         "tier": decl.tier,
         "manifest_path": str(decl.source_path),
+        "killed_workers": killed_workers,
+        "previous_run": current_run_dir.name if current_run_dir else None,
     }
 
 
 async def call(arguments: dict[str, Any] | None) -> list[mcp_types.TextContent]:
     """MCP `call_tool` handler for `activate_workflow`."""
     args = arguments or {}
-    result = _do_activate(args)
+    result = await _do_activate(args)
     return [mcp_types.TextContent(type="text", text=json.dumps(result))]

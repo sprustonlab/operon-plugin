@@ -549,3 +549,142 @@ def resolve_triggered_by() -> str | None:
         return None
     name = record.get("agent_name")
     return name if isinstance(name, str) and name else None
+
+
+# -- destructive-flow helpers (Phase 6.5) -------------------------------
+
+
+def list_run_dirs(start: Path | None = None) -> list[Path]:
+    """Return all `<project>/.operon/<run-name>/` directories.
+
+    Excludes the `_active.json` pointer and any non-directory entries.
+    Used by `list_operon_sessions` to enumerate every run that has on-
+    disk state, whether active or dormant.
+    """
+    try:
+        op_dir = paths.operon_dir(start)
+    except paths.OperonPathError:
+        return []
+    if not op_dir.is_dir():
+        return []
+    return sorted(
+        p for p in op_dir.iterdir()
+        if p.is_dir() and not p.name.startswith(".")
+    )
+
+
+def is_bg_session_alive(daemon_short: str) -> bool:
+    """Return True iff `~/.claude/jobs/<short>/state.json` reports the
+    session is in a non-terminal state.
+
+    Terminal states observed empirically on Claude Code 2.1.143:
+    `"stopped"`, `"complete"`, `"failed"`, `"cancelled"`. Note that
+    `"done"` is NOT terminal -- a "done" session has finished its
+    initial prompt but is still tracked by the daemon and can be
+    resumed; for destructive-close purposes we treat it as alive
+    (the bg pty-host is still up and `claude stop` still applies).
+
+    Known lag: when `claude stop` is invoked, the bg processes
+    terminate immediately (`ps` confirms) but `state.json.state` can
+    take 5-10 seconds to update to "stopped". Callers that need
+    real-time post-kill confirmation should poll `ps` instead. For
+    the destructive-close pre-flight check (which fires BEFORE the
+    kill), state.json lag is irrelevant.
+
+    Missing or unreadable state.json => not alive (the daemon prunes
+    state.json for sessions it has fully released).
+    """
+    if not daemon_short:
+        return False
+    job_state = Path.home() / ".claude" / "jobs" / daemon_short / "state.json"
+    if not job_state.is_file():
+        return False
+    try:
+        data = json.loads(job_state.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    state = data.get("state")
+    if not isinstance(state, str):
+        return False
+    return state not in {"stopped", "complete", "failed", "cancelled"}
+
+
+def alive_agents_in_run(run_dir: Path) -> list[dict[str, Any]]:
+    """Return agent rows from `<run-dir>/agents.json` whose bg session
+    is alive per `is_bg_session_alive`.
+
+    Coordinator-role rows are EXCLUDED because they represent the
+    foreground session that the user is talking to right now -- killing
+    that would brick the user's session. Only worker-style rows are
+    considered for destructive close.
+    """
+    roster_path = run_dir / "agents.json"
+    if not roster_path.is_file():
+        return []
+    try:
+        rows = json.loads(roster_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    alive: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("role") == "coordinator":
+            continue
+        sid = r.get("session_id", "")
+        if not isinstance(sid, str) or not sid:
+            continue
+        short = sid.split("-", 1)[0]
+        if is_bg_session_alive(short):
+            row = dict(r)
+            row["_daemon_short"] = short
+            alive.append(row)
+    return alive
+
+
+def kill_bg_session(daemon_short: str, timeout_s: float = 15.0) -> dict[str, Any]:
+    """Invoke `claude stop <daemon_short>`. Returns a result dict for
+    inclusion in tool responses; never raises.
+
+    Phase 5 carryover #4 established that `claude stop` takes the
+    8-char daemonShort, not the full session_id UUID.
+    """
+    import subprocess
+    res: dict[str, Any] = {"daemon_short": daemon_short}
+    try:
+        proc = subprocess.run(
+            ["claude", "stop", daemon_short],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+        res["returncode"] = proc.returncode
+        if proc.stdout:
+            res["stdout"] = proc.stdout.strip()[:200]
+        if proc.stderr:
+            res["stderr"] = proc.stderr.strip()[:200]
+    except FileNotFoundError:
+        res["error"] = "claude binary not on PATH"
+    except subprocess.TimeoutExpired:
+        res["error"] = f"claude stop timed out after {timeout_s}s"
+    except OSError as exc:
+        res["error"] = f"claude stop failed: {exc}"
+    return res
+
+
+def write_active_pointer(
+    operon_dir: Path, run_name: str
+) -> Path:
+    """Atomically rewrite `<.operon>/_active.json` to point at `run_name`.
+
+    Shared by both `activate_workflow` (new-run creation) and
+    `restore_operon_session` (operon-session switch) per SPEC §17 row
+    on `_active.json`. Single-writer attribution: whichever tool is
+    running here.
+    """
+    active_path = operon_dir / paths.ACTIVE_POINTER_FILENAME
+    payload = {"active_run_name": run_name, "set_at": _now_iso()}
+    return _atomic_write_json(active_path, payload)
+
