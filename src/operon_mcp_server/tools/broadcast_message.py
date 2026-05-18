@@ -99,6 +99,24 @@ def _append_result_row(row: dict[str, Any]) -> None:
     path = _broadcast_results_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(row, ensure_ascii=False) + "\n"
+    if len(line.encode("utf-8")) >= 4096:
+        # SPEC §6.6 contract: rows must stay <4 KiB so PIPE_BUF
+        # line-atomicity holds. Per-row payloads are normally <300 B,
+        # but a runaway error string in `detail` could exceed that.
+        # Truncate then drop to a placeholder if still oversized.
+        truncated = dict(row)
+        for k in ("detail", "error", "message"):
+            if k in truncated and isinstance(truncated[k], str):
+                truncated[k] = truncated[k][:512] + "..."
+        line = json.dumps(truncated, ensure_ascii=False) + "\n"
+        if len(line.encode("utf-8")) >= 4096:
+            placeholder = {
+                "timestamp": truncated.get("timestamp"),
+                "target": truncated.get("target"),
+                "outcome": "row_dropped",
+                "detail": "<row dropped: exceeded 4 KiB after truncation>",
+            }
+            line = json.dumps(placeholder, ensure_ascii=False) + "\n"
     # Open with O_APPEND so concurrent writers (in principle there is
     # only one Coordinator broadcasting, but other Agents may also call
     # broadcast in their own roles) are kernel-serialized.

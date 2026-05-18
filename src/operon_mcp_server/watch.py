@@ -250,6 +250,8 @@ def _self_stop(session_id: str) -> None:
             ["claude", "stop", daemon_short],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )

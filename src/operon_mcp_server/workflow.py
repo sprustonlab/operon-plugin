@@ -658,7 +658,9 @@ def kill_bg_session(daemon_short: str, timeout_s: float = 15.0) -> dict[str, Any
     try:
         proc = subprocess.run(
             ["claude", "stop", daemon_short],
-            capture_output=True, text=True, timeout=timeout_s, check=False,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=timeout_s, check=False,
         )
         res["returncode"] = proc.returncode
         if proc.stdout:

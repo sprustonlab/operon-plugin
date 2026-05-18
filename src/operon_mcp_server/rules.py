@@ -491,13 +491,28 @@ def append_log_event(row: dict[str, Any], start: Path | None = None) -> None:
     line = json.dumps(row, ensure_ascii=False) + "\n"
     if len(line.encode("utf-8")) >= 4096:
         # SPEC §6.6 contract: rows must stay <4 KiB so PIPE_BUF
-        # line-atomicity holds. Truncate the `message` field rather
+        # line-atomicity holds. Truncate the known-fat fields rather
         # than dropping the row entirely.
         truncated = dict(row)
         for k in ("message", "tool_input_summary"):
             if k in truncated and isinstance(truncated[k], str):
                 truncated[k] = truncated[k][:512] + "..."
         line = json.dumps(truncated, ensure_ascii=False) + "\n"
+        if len(line.encode("utf-8")) >= 4096:
+            # Defense-in-depth: a pathologically large field (rule_id
+            # blob, oversized tool_input, etc.) survived the first
+            # pass. Fall back to a minimal placeholder row so we
+            # still get an audit signal under PIPE_BUF.
+            placeholder = {
+                "timestamp": truncated.get("timestamp"),
+                "type": truncated.get("type"),
+                "outcome": truncated.get("outcome"),
+                "rule_id": truncated.get("rule_id"),
+                "agent": truncated.get("agent"),
+                "tool_name": truncated.get("tool_name"),
+                "message": "<row dropped: exceeded 4 KiB after truncation>",
+            }
+            line = json.dumps(placeholder, ensure_ascii=False) + "\n"
     fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         os.write(fd, line.encode("utf-8"))

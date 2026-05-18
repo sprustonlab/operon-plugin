@@ -337,9 +337,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=1.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "watchdog", specifier = ">=4.0" },
+    { name = "mcp", specifier = ">=1.0,<2" },
+    { name = "pyyaml", specifier = ">=6.0,<7" },
+    { name = "watchdog", specifier = ">=4.0,<7" },
 ]
 
 [[package]]
