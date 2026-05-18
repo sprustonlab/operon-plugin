@@ -406,6 +406,12 @@ def _drain_existing(
 #: rare cases where `_handles/<handle>.json` lands a beat late.
 _IDENTITY_MAX_WAIT_S = 10.0
 
+#: Phase 14 fix 3: backoff between rebind attempts when the active run
+#: is unresolvable (e.g. mid-rotation: `_active.json` written but the
+#: new run-dir not yet created, or `.operon/` torn down). Bounded so a
+#: transient state doesn't burn CPU in a tight retry loop.
+_REBIND_BACKOFF_S = 0.5
+
 #: Interval between identity-resolution polls during the startup wait.
 _IDENTITY_POLL_INTERVAL_S = 0.5
 
@@ -437,27 +443,25 @@ def resolve_self() -> tuple[str | None, str | None]:
 # -- public entry points ------------------------------------------------
 
 
-async def run_watch_loop(
+async def _run_watch_session(
     agent_name: str,
+    inbox: Path,
+    control: Path,
     write_stream: MemoryObjectSendStream[SessionMessage],
     self_session_id: str | None,
-) -> None:
-    """Run the watch loop for `agent_name` until cancellation.
+) -> bool:
+    """Run one watch-session bound to (inbox, control). Phase 14 fix 3.
 
-    Sets up `watchdog.Observer` over `mailbox/<self>/inbox/` and
-    `mailbox/<self>/control/`, drains pre-existing envelopes, then
-    processes events until the parent task group is cancelled (which
-    happens when the MCP transport closes).
+    Returns True when the active-run pointer rotated underneath us
+    (caller should re-resolve paths and start a new session). Returns
+    False when the parent task group is being cancelled (re-raise
+    happened during await).
+
+    Watchdog observer is created + torn down within this function so
+    each rebind cycle gets a clean observer thread bound to fresh
+    paths. Pre-existing envelopes at the new inbox are picked up by
+    `_drain_existing` at the start of the next session.
     """
-    try:
-        inbox = mailbox.inbox_dir(agent_name)
-        control = mailbox.control_dir(agent_name)
-    except paths.OperonPathError as exc:
-        _log.warning("watch loop not started for %r: %s", agent_name, exc)
-        return
-
-    # Ensure target directories exist; watchdog.Observer.schedule()
-    # raises if the path is missing.
     inbox.mkdir(parents=True, exist_ok=True)
     control.mkdir(parents=True, exist_ok=True)
     mailbox.processed_dir(inbox).mkdir(parents=True, exist_ok=True)
@@ -470,22 +474,44 @@ async def run_watch_loop(
     observer.schedule(handler, str(control), recursive=False)
     observer.start()
     _log.info(
-        "watch loop started for agent=%r inbox=%s control=%s",
+        "watch session started for agent=%r inbox=%s control=%s",
         agent_name,
         inbox,
         control,
     )
 
     # Sweep existing files into the queue once before processing the
-    # live stream.
+    # live stream. Catches envelopes that landed BEFORE this session
+    # started (the common case after a run-switch).
     _drain_existing([inbox, control], fs_queue)
 
+    rebind_needed = False
     try:
         while True:
+            # Phase 14 fix 3: cheap re-resolve check. If `_active.json`
+            # was swapped (activate_workflow / restore_operon_session
+            # mutate it on a different code path), the resolved inbox
+            # path differs from the one our observer is bound to. Tear
+            # down + return so the outer loop rebinds.
+            try:
+                current_inbox = mailbox.inbox_dir(agent_name)
+            except paths.OperonPathError:
+                current_inbox = inbox  # treat as unchanged
+            if current_inbox != inbox:
+                _log.info(
+                    "watch session: active run rotated (%s -> %s); rebinding",
+                    inbox,
+                    current_inbox,
+                )
+                rebind_needed = True
+                return True
+
             try:
                 # Run the blocking get in a worker thread so cancellation
                 # at the await boundary is honored. The 0.5s timeout
-                # bounds the worker thread's lifetime per iteration.
+                # bounds the worker thread's lifetime per iteration and
+                # is also the granularity of the active-run rebind
+                # check above.
                 path = await anyio.to_thread.run_sync(
                     partial(fs_queue.get, True, _POLL_TIMEOUT_S),
                     abandon_on_cancel=True,
@@ -505,14 +531,60 @@ async def run_watch_loop(
             except Exception as exc:  # pragma: no cover (defensive)
                 _log.exception("watch loop: error processing %s: %s", path, exc)
     finally:
-        # Stop watchdog on cancellation. join() may briefly block; the
-        # 2s ceiling is a hard upper bound on shutdown latency.
+        # Stop watchdog on cancellation OR rebind. join() may briefly
+        # block; the 2s ceiling is a hard upper bound on shutdown
+        # latency.
         try:
             observer.stop()
             observer.join(timeout=2.0)
         except Exception:  # pragma: no cover (defensive)
             pass
-        _log.info("watch loop stopped for agent=%r", agent_name)
+        _log.info(
+            "watch session stopped for agent=%r (rebind=%s)",
+            agent_name,
+            rebind_needed,
+        )
+    return False
+
+
+async def run_watch_loop(
+    agent_name: str,
+    write_stream: MemoryObjectSendStream[SessionMessage],
+    self_session_id: str | None,
+) -> None:
+    """Run the watch loop for `agent_name` until cancellation.
+
+    Wraps `_run_watch_session` in an outer rebind-on-active-run-rotate
+    loop (Phase 14 fix 3). When `_active.json` is swapped underneath
+    us by `activate_workflow` or `restore_operon_session`, the inner
+    session detects the path change at its next 0.5s poll boundary,
+    returns True, and this outer loop re-resolves paths + restarts.
+
+    On `OperonPathError` (active run unresolvable mid-rotation, or
+    `.operon/` torn down), the outer loop logs + retries after
+    `_REBIND_BACKOFF_S` so a transient state doesn't tight-loop.
+    """
+    while True:
+        try:
+            inbox = mailbox.inbox_dir(agent_name)
+            control = mailbox.control_dir(agent_name)
+        except paths.OperonPathError as exc:
+            _log.warning(
+                "watch loop: active run unresolvable (%s); retry in %.1fs",
+                exc,
+                _REBIND_BACKOFF_S,
+            )
+            await anyio.sleep(_REBIND_BACKOFF_S)
+            continue
+
+        rebind = await _run_watch_session(
+            agent_name, inbox, control, write_stream, self_session_id
+        )
+        if not rebind:
+            # Session returned without rebind signal -> task group is
+            # being cancelled / transport closed. Exit the outer loop.
+            return
+        # Loop body falls through to re-resolve inbox + control.
 
 
 async def bootstrap_and_run(
