@@ -559,33 +559,29 @@ ENV_DEBUG_VAR = "OPERON_DEBUG"
 #: under one of:
 #: (a) the user has applied Boaz's local binary patches to Claude Code
 #:     2.1.143 that bypass the dev-channels TTY-confirm dialog (patch
-#:     #1) AND the production-channels allowlist check (patch #2), OR
+#:     #1) AND make the bg dev-channels parser accept the flag at all
+#:     (patch #3), OR
 #: (b) operon-plugin is on Anthropic's approved-channel allowlist (not
 #:     true at the time of writing).
 #:
-#: When (a) or (b) holds, this gate also switches the spawn argv to use
-#: the production `--channels=<id>` flag (which DOES populate the
-#: per-session channels list in bg) instead of the dev-only
-#: `--dangerously-load-development-channels=<id>` flag (which only
-#: populates via the dialog path and is bg-skipped). Empirical binary
-#: analysis on 2.1.143: `--channels` calls into R8H at session startup
-#: (offset 230964687) regardless of TTY presence; the dev flag does
-#: not.
+#: When set, the spawn argv unconditionally adds
+#: `--dangerously-load-development-channels=plugin:<plugin>@<marketplace>`
+#: regardless of whether the plugin is marketplace-installed.
+#:
+#: HISTORICAL NOTE: prior versions (commit c038230) selected
+#: `--channels=<id>` for marketplace-installed plugins on the theory
+#: that the production flag's R8H call site would populate the
+#: per-session channel list. Empirically that path does NOT work in
+#: bg sessions even with patches #1+#2+#3 -- workers' MCP log still
+#: shows "Channel notifications skipped: server <id> not in --channels
+#: list for this session". The dev flag + patches #1+#3 is the only
+#: empirically-verified bg-channels path; we use it unconditionally.
 #:
 #: When the gate is off (default), distribution stays on the
 #: known-working substrate: --plugin-dir loads the operon plugin,
 #: filesystem mailbox transport works, but LLM-visible channel pushes
 #: are dropped at session boundary.
 ENV_BG_CHANNELS_VAR = "OPERON_BG_CHANNELS"
-
-#: Path to Claude Code's user-level settings file. We read it to
-#: discriminate "plugin installed via `claude plugin install`" from
-#: "plugin dev-loaded via `--plugin-dir`". The two states require
-#: different bg argv: installed plugins resolve their channel against
-#: the marketplace name in the entry, dev-loaded plugins resolve
-#: against the sentinel marketplace `inline` and fail the channels
-#: allowlist gate even with patches #1 + #2.
-USER_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 
 def _resolve_channel_identifier() -> str | None:
@@ -643,36 +639,6 @@ def _bg_channels_enabled() -> bool:
     return flag in {"1", "true", "yes", "on"}
 
 
-def _plugin_is_marketplace_installed(channel_id: str) -> bool:
-    """Return True iff the plugin appears in `~/.claude/settings.json`
-    `enabledPlugins` (i.e., the user ran `claude plugin install`).
-
-    The channel id has shape `plugin:<plugin>@<marketplace>`; the
-    settings.json `enabledPlugins` map keys have shape
-    `<plugin>@<marketplace>` (no `plugin:` prefix). We strip the
-    prefix and check membership.
-
-    Returns False on missing/unreadable settings.json, on absent
-    `enabledPlugins` key, or on a present entry that is not truthy.
-    Caller treats False as "dev mode" (keep --plugin-dir, do not
-    advertise channels via the production flag).
-    """
-    if not channel_id.startswith("plugin:"):
-        return False
-    bare_id = channel_id[len("plugin:") :]
-
-    try:
-        data = json.loads(USER_SETTINGS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    enabled = data.get("enabledPlugins")
-    if not isinstance(enabled, dict):
-        return False
-    return bool(enabled.get(bare_id))
-
-
 def _spawn_subprocess(
     *,
     project_path: Path,
@@ -696,41 +662,36 @@ def _spawn_subprocess(
     operon MCP server -- empirically confirmed by manual `claude --bg`
     probes (Phase 4 fix v2).
 
-    Channel surfacing (Carryover #5 v2): the watch loop emits
+    Channel surfacing (Carryover #5 v3): the watch loop emits
     `claude/channel` notifications regardless, but Claude Code drops
     them with "Channel notifications skipped: server <id> not in
     --channels list for this session" unless the spawned bg session
-    has the channel registered. To allow registration we pass a
-    channels flag on the spawn argv, gated by `OPERON_BG_CHANNELS=1`.
+    has the channel registered. To allow registration we pass
+    `--dangerously-load-development-channels=plugin:<plugin>@<marketplace>`
+    on the spawn argv, gated by `OPERON_BG_CHANNELS=1`.
 
-    Two distinct flag variants and when each applies, from binary
-    analysis of Claude Code 2.1.143:
+    Why ALWAYS the dev flag, not the production --channels= flag:
 
-    - `--channels=<id>`: production flag. Populates the per-session
-      channel list via R8H at session startup (offset 230964687),
-      including in bg sessions (no TTY-confirm dialog). Gated by an
-      "is on approved allowlist" check that Boaz's binary patch #2
-      (qrH `!_.dev` -> `false` at 225785037 / 225785496) removes.
-      Used here when the plugin is marketplace-installed.
+    Empirically (Boaz's machine, Claude Code 2.1.143 with binary
+    patches #1+#2+#3 applied), the production `--channels=<id>` flag
+    does NOT populate the per-session channel list for bg sessions
+    even though static binary analysis suggested it should (R8H call
+    site at offset 230964687). The exact bg-specific stripping path
+    was not traced; observation is the per-session Pj table is empty
+    in workers spawned with `--channels=`, and Check #5 ("not in
+    --channels list for this session") fires.
 
-    - `--dangerously-load-development-channels=<id>`: dev flag. Only
-      populates the channel list via the DevChannelsDialog code path,
-      which is bg-skipped even with Boaz's patch #1 on the dialog
-      gate (the dialog patch lets the flag PARSE in bg but does not
-      route into R8H). Used here as a best-effort fallback when the
-      plugin is dev-loaded (`--plugin-dir`); channels still do not
-      register in that case but no harm in passing it.
+    The dev flag + patches #1 (dialog gate bypass) + #3 (bg
+    dev-channels parser) is the only empirically-verified
+    bg-channels path. Prior commit c038230 attempted a marketplace-
+    vs-dev split that used `--channels=` for marketplace-installed
+    plugins; that branch was removed in phase 14 fix 2 because it
+    didn't actually work.
 
-    Marketplace-vs-dev detection: we probe
-    `~/.claude/settings.json` `enabledPlugins` via
-    `_plugin_is_marketplace_installed()`. If our entry is there,
-    the bg session will resolve the plugin from the marketplace
-    install (no `--plugin-dir` needed); we DROP `--plugin-dir` from
-    argv to avoid the "you asked for X but the installed operon-
-    plugin plugin is from inline" mismatch error (empirically seen
-    when `--plugin-dir` and `--channels` are combined). If our entry
-    is missing, we keep `--plugin-dir` for dev-loading and use the
-    dev flag as best-effort.
+    `--plugin-dir` is preserved on the argv regardless (the bg
+    session needs to find the plugin source whether marketplace-
+    installed or not -- the dev flag does not subsume plugin
+    discovery).
 
     Mailbox filesystem transport works in all configurations --
     envelopes move `inbox/` -> `processed/`, audit trail unaffected.
@@ -782,34 +743,20 @@ def _spawn_subprocess(
         "--agent",
         role,
     ]
-    # Carryover #5 v2: select --plugin-dir vs --channels based on
-    # whether the plugin is marketplace-installed. Default path keeps
-    # --plugin-dir; opt-in path with marketplace install drops
-    # --plugin-dir and uses the production --channels flag (which
-    # actually registers channels in bg under Boaz's patches #1+#2).
-    use_channels_flag = False
-    channel_id: str | None = None
+    # Carryover #5 v3: always keep --plugin-dir so the bg session
+    # finds the plugin (marketplace or dev-loaded, same flag), and
+    # if OPERON_BG_CHANNELS is enabled, attach the
+    # `--dangerously-load-development-channels=` flag with the
+    # resolved channel id. This is the only empirically-verified bg-
+    # channels path (see _spawn_subprocess docstring). The prior
+    # marketplace-vs-dev split that used `--channels=` for
+    # marketplace-installed plugins was removed in phase 14 fix 2;
+    # that branch's path did NOT actually register channels in bg.
+    if plugin_root:
+        argv.extend(["--plugin-dir", plugin_root])
     if _bg_channels_enabled():
         channel_id = _resolve_channel_identifier()
-        if channel_id and _plugin_is_marketplace_installed(channel_id):
-            use_channels_flag = True
-
-    if use_channels_flag:
-        # Marketplace-installed: bg session resolves the plugin from
-        # ~/.claude/settings.json enabledPlugins. Passing --plugin-dir
-        # would override that with an "inline" source, which then fails
-        # the channels-allowlist check with a marketplace-mismatch
-        # error. So drop --plugin-dir on this branch.
-        argv.append(f"--channels={channel_id}")
-    else:
-        # Dev mode (or channels gate off): keep --plugin-dir so the
-        # bg session loads the plugin from the dev directory. If the
-        # channels gate IS on but the plugin isn't marketplace-
-        # installed, pass the dev flag as a best-effort no-op (it
-        # parses cleanly but doesn't route into channel registration).
-        if plugin_root:
-            argv.extend(["--plugin-dir", plugin_root])
-        if _bg_channels_enabled() and channel_id:
+        if channel_id:
             argv.append(
                 f"--dangerously-load-development-channels={channel_id}"
             )
