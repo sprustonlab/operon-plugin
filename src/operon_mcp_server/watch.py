@@ -59,7 +59,7 @@ from mcp.shared.message import SessionMessage
 from watchdog.events import FileCreatedEvent, FileMovedEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from . import identity, mailbox, paths
+from . import identity, locks, mailbox, paths
 
 _log = logging.getLogger(__name__)
 
@@ -281,6 +281,18 @@ async def _process_envelope(
 ) -> None:
     """Read, claim, dispatch one envelope. Idempotent on race."""
     _log.debug("process envelope: path=%s", path)
+    # Phase 14 fix 6: newest-MCP-wins gate. When Claude Code spawns a
+    # fresh process for `/agents` backgrounding or idle-timeout
+    # resume, the old MCP subprocess keeps running and races us on
+    # the same mailbox. Yield to the newer subprocess so its channel
+    # push lands in the active session's jsonl. The check is fs-
+    # event-driven (one lockfile read per envelope; no polling).
+    if self_agent_name and not locks.we_hold_lock(self_agent_name):
+        _log.debug(
+            "yielding envelope %s -- another MCP subprocess holds the lock",
+            path,
+        )
+        return
     # 1) Claim atomically. If another reader won the race, bail.
     try:
         claimed = mailbox.consume_envelope(path)
@@ -576,6 +588,16 @@ async def run_watch_loop(
             )
             await anyio.sleep(_REBIND_BACKOFF_S)
             continue
+
+        # Phase 14 fix 6: (re-)acquire the per-agent lock for this
+        # run-dir. Idempotent on repeat calls in the same subprocess
+        # (e.g. after a run-switch rebind). If a newer subprocess has
+        # already written the lockfile, our acquire defers and our
+        # watch session no-ops via the `_process_envelope` gate.
+        try:
+            locks.acquire_lock(agent_name, transport_session_id=self_session_id)
+        except Exception as exc:  # pragma: no cover (defensive)
+            _log.warning("watch loop: acquire_lock raised: %s", exc)
 
         rebind = await _run_watch_session(
             agent_name, inbox, control, write_stream, self_session_id

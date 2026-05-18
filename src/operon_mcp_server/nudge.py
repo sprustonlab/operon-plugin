@@ -521,7 +521,26 @@ def _on_timer_fire(agent_name: str, correlation_id: str, generation: int) -> Non
     captured generation, fires the due check (which writes nudge +
     reschedules). If generation has advanced (a reply or new message
     superseded), no-op + audit `nudge_skipped_stale`.
+
+    Phase 14 fix 6: bail silently if another MCP subprocess holds the
+    per-agent lock. This subprocess is backgrounded (e.g. by Claude
+    Code's `/agents` view); writing pending state from here would
+    violate SPEC §6.6 single-writer because the new (winner)
+    subprocess also writes that file.
     """
+    # Local import to avoid circular at module load. `locks` imports
+    # only `paths`, which `nudge` already imports, so this is cheap.
+    from . import locks as _locks
+
+    if not _locks.we_hold_lock(agent_name):
+        _log.debug(
+            "nudge timer fire skipped: another MCP subprocess holds the "
+            "lock for agent=%r correlation_id=%r",
+            agent_name,
+            correlation_id,
+        )
+        return
+
     try:
         entries = read_pending_state(agent_name)
         entry = next(
