@@ -24,3 +24,33 @@ phases:
       - type: artifact-dir-ready-check
         on_failure:
           message: "Artifact directory not set -- call set_artifact_dir(...) first."
+
+# Workflow-embedded rules (Phase 6). These ADD to the 3-tier
+# rules.yaml; they share no id namespace with plugin/user/project
+# rules (workflow-tier rules cannot override 3-tier ids and vice
+# versa).
+
+rules:
+  # Phase-scoped rule: only fires when the worker is in the `vision`
+  # phase. Used by Phase 6 self-verify to confirm role+phase
+  # projection works.
+  - id: smoke_vision_no_curl
+    trigger: PreToolUse/Bash
+    enforcement: deny
+    detect:
+      pattern: "^curl\\s"
+    message: "_smoke: curl is not permitted during vision phase."
+    roles: ["worker"]
+    phases: ["vision"]
+
+  # Role-scoped rule: workers should not Write outside the artifact
+  # dir. Permissive enforcement (warn) since the actual file-path
+  # rules would need workflow.artifact_dir resolution.
+  - id: smoke_worker_write_warn
+    trigger: PreToolUse/Write
+    enforcement: warn
+    detect:
+      pattern: ".+"
+      field: file_path
+    message: "_smoke: worker Write -- confirm path is under artifact_dir."
+    roles: ["worker"]

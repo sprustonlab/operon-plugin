@@ -26,7 +26,7 @@ from typing import Any
 
 import mcp.types as mcp_types
 
-from .. import identity, workflow
+from .. import identity, rules, workflow
 
 #: MCP tool name. Visible to All per SPEC §7.1.
 TOOL_NAME = "get_applicable_rules"
@@ -99,25 +99,48 @@ def _resolve_caller() -> tuple[str, str]:
 def _render_constraints_markdown(
     *, workflow_id: str, current_phase: str, role: str,
     advance_checks: list[dict[str, Any]],
+    applicable_rules: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Render the advance-checks list as a `## Constraints` markdown block."""
+    """Render the advance-checks + applicable Rules as a `## Constraints` block."""
     lines: list[str] = [
         f"## Constraints (workflow={workflow_id}, phase={current_phase}, role={role})",
         "",
     ]
-    if not advance_checks:
+    # Advance checks
+    if advance_checks:
+        lines.append("### Advance checks for this phase (AND semantics)")
+        lines.append("")
+        for i, ck in enumerate(advance_checks, 1):
+            t = ck.get("check_type", "<unknown>")
+            params_desc = ck.get("params_description", "")
+            if params_desc:
+                lines.append(f"{i}. `{t}` -- {params_desc}")
+            else:
+                lines.append(f"{i}. `{t}`")
+        lines.append("")
+    else:
         lines.append("(no advance checks declared for this phase)")
-        return "\n".join(lines)
-    lines.append("Advance checks for this phase (AND semantics):")
-    lines.append("")
-    for i, ck in enumerate(advance_checks, 1):
-        t = ck.get("check_type", "<unknown>")
-        params_desc = ck.get("params_description", "")
-        if params_desc:
-            lines.append(f"{i}. `{t}` -- {params_desc}")
-        else:
-            lines.append(f"{i}. `{t}`")
-    return "\n".join(lines)
+        lines.append("")
+    # Applicable Rules (Phase 6)
+    if applicable_rules:
+        lines.append("### Active guardrail Rules for (role, phase)")
+        lines.append("")
+        for r in applicable_rules:
+            rid = r.get("id", "<unknown>")
+            tier = r.get("tier", "?")
+            enf = r.get("enforcement", "?")
+            pat = r.get("detect_pattern") or "*any*"
+            triggers = "/".join(r.get("trigger") or ["?"])
+            msg = (r.get("message") or "").strip()
+            lines.append(
+                f"- `{rid}` [{tier}/{enf}] on `{triggers}` (detect: `{pat}`)"
+            )
+            if msg:
+                lines.append(f"  -- {msg}")
+        lines.append("")
+    elif applicable_rules is not None:
+        lines.append("(no guardrail Rules apply to this (role, phase))")
+    return "\n".join(lines).rstrip()
 
 
 def _do_get(args: dict[str, Any]) -> dict[str, Any]:
@@ -189,21 +212,76 @@ def _do_get(args: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    # Phase 6: project the merged guardrail Rule list against the
+    # caller's (role, phase). Workflow-embedded rules layer on top of
+    # the 3-tier rules.yaml (plugin > user > project).
+    workflow_manifest_dict: dict[str, Any] | None = None
+    try:
+        import yaml as _yaml
+        wf_data = _yaml.safe_load(decl.source_path.read_text(encoding="utf-8"))
+        if isinstance(wf_data, dict):
+            workflow_manifest_dict = wf_data
+    except Exception:
+        workflow_manifest_dict = None
+
+    try:
+        all_rules = rules.load_merged_rules(
+            workflow_manifest=workflow_manifest_dict,
+            workflow_source=decl.source_path,
+        )
+    except rules.RulesError as exc:
+        all_rules = []
+        rules_error = str(exc)
+    else:
+        rules_error = ""
+
+    applicable_rules: list[dict[str, Any]] = []
+    for r in all_rules:
+        # Apply the same role+phase filters that `_evaluate` uses, so
+        # the LLM sees exactly the rules that could fire for it.
+        if rules._role_filter_skips(r, role):
+            continue
+        if rules._phase_filter_skips(r, current_phase):
+            continue
+        applicable_rules.append(
+            {
+                "id": r.id,
+                "tier": r.tier,
+                "trigger": list(r.trigger),
+                "enforcement": r.enforcement,
+                "detect_pattern": (
+                    r.detect_pattern.pattern if r.detect_pattern else None
+                ),
+                "detect_field": r.detect_field,
+                "exclude_pattern": (
+                    r.exclude_pattern.pattern if r.exclude_pattern else None
+                ),
+                "message": r.message,
+                "roles": list(r.roles),
+                "phases": list(r.phases),
+            }
+        )
+
     markdown = _render_constraints_markdown(
         workflow_id=workflow_id,
         current_phase=current_phase,
         role=role,
         advance_checks=advance_checks_payload,
+        applicable_rules=applicable_rules,
     )
 
-    return {
+    payload: dict[str, Any] = {
         "caller": name,
         "role": role,
         "workflow_id": workflow_id,
         "current_phase": current_phase,
         "advance_checks": advance_checks_payload,
+        "applicable_rules": applicable_rules,
         "markdown": markdown,
     }
+    if rules_error:
+        payload["rules_load_error"] = rules_error
+    return payload
 
 
 async def call(arguments: dict[str, Any] | None) -> list[mcp_types.TextContent]:

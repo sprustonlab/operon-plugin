@@ -1,1 +1,60 @@
-[]
+# operon-plugin global guardrail Rules (SPEC §12 plugin tier).
+#
+# These rules apply across all workflows. Higher tiers (user-tier
+# ~/.operon/rules.yaml, project-tier <project>/.operon/rules.yaml)
+# can override individual rule ids; workflow-embedded `rules:` blocks
+# are additive.
+#
+# Schema (per claudechic convention; mirrored in
+# operon_mcp_server.rules.Rule):
+#   id: <str>                   required, unique
+#   trigger: <str or list>      e.g. "PreToolUse/Bash"
+#   enforcement: deny|warn|log  required
+#   detect:
+#     pattern: <regex>          applied to tool_input[detect_field]
+#     field: <str>              default "command"
+#   exclude_if_matches: <regex> short-circuit when matched
+#   message: <str>              human-readable; surfaced to LLM via
+#                               permissionDecisionReason
+#   roles: [<str>, ...]         only these roles (default: all)
+#   exclude_roles: [<str>, ...] never these roles
+#   phases: [<str>, ...]        only these phases (default: all)
+#   exclude_phases: [<str>, ...]never these phases
+
+# 1) Catastrophic-rm hard block. Mirrors claudechic global rule
+#    `no_rm_rf`. Deny tier; Phase 7 will allow request_override.
+- id: no_rm_rf
+  trigger: PreToolUse/Bash
+  enforcement: deny
+  detect:
+    pattern: "rm\\s+-rf\\s+/"
+  message: "Dangerous: rm -rf on absolute path. Request override if intentional."
+
+# 2) Force-push warning. Force-pushing rewrites history and can
+#    destroy peer work. Warn tier (acknowledge_warning required in
+#    Phase 7; for Phase 6 the warn surfaces as `permissionDecision:
+#    "ask"`).
+- id: warn_force_push
+  trigger: PreToolUse/Bash
+  enforcement: warn
+  detect:
+    pattern: "git\\s+push\\s+(--force\\b|-f\\b)"
+  message: "Force-push detected. Confirm you intend to rewrite remote history."
+
+# 3) Sudo acknowledgment. Mirrors claudechic's `warn_sudo`. Any
+#    `sudo ...` invocation requires acknowledgment.
+- id: warn_sudo
+  trigger: PreToolUse/Bash
+  enforcement: warn
+  detect:
+    pattern: "^sudo\\s"
+  message: "Using sudo -- acknowledge if intentional."
+
+# 4) Git audit trail. All git operations are logged silently (no
+#    block, no prompt). Mirrors claudechic's `log_git_operations`.
+- id: log_git_operations
+  trigger: PreToolUse/Bash
+  enforcement: log
+  detect:
+    pattern: "^git\\s"
+  message: "Git operation logged for audit trail."

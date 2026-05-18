@@ -1,4 +1,20 @@
 {
-  "_comment": "operon-plugin hooks. Phase 5 carryover #3: the SessionStart bind_handle hook was REMOVED because per Anthropic's hooks reference, SessionStart fires BEFORE the MCP servers connect, so `type: mcp_tool` hooks on SessionStart are not callable -- Claude Code logs 'mcp_tool hooks are not available for the SessionStart hook event (no MCP client context)' and the hook no-ops. Identity binding is fully covered by env-anchored resolution: every MCP tool call resolves OPERON_AGENT_HANDLE -> _handles/<handle>.json on entry (see identity.py + spawn_agent._require_coordinator etc.). The `bind_handle` MCP tool is retained in the codebase (hidden from tools/list per SPEC §7.1) for future use if a post-MCP-connect lifecycle event becomes available, or for hand-driven validation, but is no longer wired to any hook event. This file now declares no hooks; future phases will add PreToolUse / Stop hooks here.",
-  "hooks": {}
+  "_comment": "operon-plugin hooks. Phase 6: PreToolUse hook dispatches every tool call to mcp__operon__evaluate, which evaluates the merged guardrail Rule list (plugin -> user -> project -> workflow-embedded) against the calling Agent's (role, current_phase) projection. Decision -> hook response: deny rule -> permissionDecision=deny+reason; warn rule -> permissionDecision=ask+reason; log rule -> permissionDecision=allow (audit row written server-side); no match -> permissionDecision=allow. Hook input passes `tool_name` and the whole `tool_input` object so evaluate can run pattern detection on tool_input[detect_field] (default `command`). SessionStart bind_handle hook was removed in Phase 5 carryover #3 (mcp_tool hooks are not callable on SessionStart -- MCP context not yet up); identity is env-anchored on every tool call instead. Future phases will add Stop -> arm_nudge_timer (Phase 8) and WorktreeCreate (Phase 10).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "operon",
+            "tool": "mcp__operon__evaluate",
+            "input": {
+              "tool_name": "${tool_name}",
+              "tool_input": "${tool_input}"
+            }
+          }
+        ]
+      }
+    ]
+  }
 }
