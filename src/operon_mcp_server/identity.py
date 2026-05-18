@@ -56,6 +56,15 @@ _CACHED_HANDLE: str | None = None
 #: mutation attempt.
 _FROZEN_HANDLE: str | None = None
 
+#: Phase 14 fix 5: one-shot drift WARNING tracking. `read_env_handle`
+#: detects env/cache values that differ from the frozen value
+#: post-freeze and emits a WARNING. To avoid log spam (tool calls
+#: can read identity dozens of times per turn), each unique
+#: (source, value) pair is logged at most once. Production never
+#: clears this set; tests can reset module state via the existing
+#: `_set_cached_handle(None)` plus reassigning `_FROZEN_HANDLE = None`.
+_DRIFT_SEEN: set[tuple[str, str]] = set()
+
 
 class IdentityError(RuntimeError):
     """Raised when identity cannot be resolved for the calling subprocess."""
@@ -175,6 +184,38 @@ def read_env_handle() -> str | None:
     """
     env_value = os.environ.get(ENV_HANDLE_VAR)
     if _FROZEN_HANDLE is not None:
+        # Phase 14 fix 5: drift detection. If env or cache has been
+        # mutated post-freeze to a value different from the frozen
+        # one, log WARNING once per (source, value) pair. The frozen
+        # value still wins on return, but the WARNING captures the
+        # mutation so we can trace it.
+        if env_value and env_value != _FROZEN_HANDLE:
+            _seen_key = ("env", env_value)
+            if _seen_key not in _DRIFT_SEEN:
+                _DRIFT_SEEN.add(_seen_key)
+                _log.warning(
+                    "identity drift detected: env %s=%r differs from frozen "
+                    "%r. Frozen value will be used for resolution. This is "
+                    "the second-line surface for the identity-swap bug: "
+                    "something mutated os.environ post-freeze. Trace the "
+                    "MCP log for the surrounding tool call to identify "
+                    "the mutation source.",
+                    ENV_HANDLE_VAR,
+                    env_value,
+                    _FROZEN_HANDLE,
+                )
+        if _CACHED_HANDLE and _CACHED_HANDLE != _FROZEN_HANDLE:
+            _seen_key = ("cache", _CACHED_HANDLE)
+            if _seen_key not in _DRIFT_SEEN:
+                _DRIFT_SEEN.add(_seen_key)
+                _log.warning(
+                    "identity drift detected: cache=%r differs from frozen "
+                    "%r. Frozen value will be used for resolution. The "
+                    "stack-info WARNING from _set_cached_handle should "
+                    "have fired earlier with the mutation site.",
+                    _CACHED_HANDLE,
+                    _FROZEN_HANDLE,
+                )
         _log.debug(
             "read_env_handle: env=%r cache=%r frozen=%r -> frozen wins",
             env_value,
