@@ -32,16 +32,27 @@ from .. import identity, paths
 #: `mcp__operon__bind_handle` by Claude Code.
 TOOL_NAME = "bind_handle"
 
-#: JSON schema for the tool's `inputSchema`. Both fields required.
+#: JSON schema for the tool's `inputSchema`. `session_id` is required;
+#: `handle` is optional. Phase 2 fix: Claude Code's mcp_tool hook input
+#: does NOT support `${env:VAR}` placeholders, so the SessionStart
+#: hook cannot pass the handle as an argument. Instead, when the
+#: caller omits `handle`, this tool reads it from
+#: `OPERON_AGENT_HANDLE` env directly (which is the authoritative
+#: source per SPEC.md section 6.5 anyway). When the caller DOES pass
+#: `handle` (e.g. from a non-hook invocation that has the value), the
+#: tool still validates env_handle == supplied_handle for defense in
+#: depth.
 INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "handle": {
             "type": "string",
             "description": (
-                "Opaque per-subprocess handle from the OPERON_AGENT_HANDLE "
-                "environment variable. Must match the env value of the "
-                "calling subprocess."
+                "Optional. Opaque per-subprocess handle. If supplied, "
+                "the tool validates env_handle == supplied_handle. If "
+                "omitted (the standard hook path, since mcp_tool input "
+                "does not support env-var placeholders), the tool "
+                "reads OPERON_AGENT_HANDLE from its own subprocess env."
             ),
         },
         "session_id": {
@@ -52,7 +63,7 @@ INPUT_SCHEMA: dict[str, Any] = {
             ),
         },
     },
-    "required": ["handle", "session_id"],
+    "required": ["session_id"],
     "additionalProperties": False,
 }
 
@@ -79,10 +90,15 @@ class BindHandleError(RuntimeError):
     """Raised when binding validation fails. Converted to a tool error."""
 
 
-def _validate(handle: str, session_id: str) -> dict[str, Any]:
-    """Core validation logic (separate from MCP plumbing for clarity)."""
-    if not isinstance(handle, str) or not handle:
-        raise BindHandleError("'handle' must be a non-empty string")
+def _validate(handle: str | None, session_id: str) -> dict[str, Any]:
+    """Core validation logic (separate from MCP plumbing for clarity).
+
+    `handle` may be None (the standard hook path; see INPUT_SCHEMA).
+    When None, the env value is the sole source of truth. When
+    supplied, the tool validates env_handle == handle for defense in
+    depth -- a mismatch signals the SessionStart hook is firing in the
+    wrong subprocess and is treated as a hard error.
+    """
     if not isinstance(session_id, str) or not session_id:
         raise BindHandleError("'session_id' must be a non-empty string")
 
@@ -92,13 +108,20 @@ def _validate(handle: str, session_id: str) -> dict[str, Any]:
             f"Environment variable '{identity.ENV_HANDLE_VAR}' is not set; "
             "bind_handle was invoked outside an operon-spawned subprocess."
         )
-    if env_handle != handle:
-        raise BindHandleError(
-            "Handle mismatch: env "
-            f"'{identity.ENV_HANDLE_VAR}'='{env_handle}' but tool was "
-            f"called with handle='{handle}'. SessionStart hook is firing "
-            "in the wrong subprocess."
-        )
+
+    if handle is None:
+        # Standard SessionStart-hook path: env is authoritative.
+        handle = env_handle
+    else:
+        if not isinstance(handle, str) or not handle:
+            raise BindHandleError("'handle', if supplied, must be a non-empty string")
+        if env_handle != handle:
+            raise BindHandleError(
+                "Handle mismatch: env "
+                f"'{identity.ENV_HANDLE_VAR}'='{env_handle}' but tool was "
+                f"called with handle='{handle}'. SessionStart hook is firing "
+                "in the wrong subprocess."
+            )
 
     try:
         record = identity.read_handle_file(handle)
@@ -149,8 +172,11 @@ async def call(arguments: dict[str, Any] | None) -> list[mcp_types.TextContent]:
     import json
 
     args = arguments or {}
+    # `handle` is optional: None signals "use env_handle as source of
+    # truth" (the standard SessionStart-hook path; mcp_tool input does
+    # not support ${env:VAR} interpolation).
     result = _validate(
-        handle=args.get("handle", ""),
+        handle=args.get("handle"),
         session_id=args.get("session_id", ""),
     )
     return [mcp_types.TextContent(type="text", text=json.dumps(result))]
