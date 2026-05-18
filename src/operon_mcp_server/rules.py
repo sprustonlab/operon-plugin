@@ -579,9 +579,7 @@ def command_hash(rule_id: str, tool_name: str, tool_input: dict[str, Any]) -> st
     filenames so the requesting and consuming sides agree.
     """
     cmd = _extract_command(tool_input)
-    digest = hashlib.sha256(
-        f"{rule_id}:{tool_name}:{cmd}".encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256(f"{rule_id}:{tool_name}:{cmd}".encode("utf-8")).hexdigest()
     return digest
 
 
@@ -752,6 +750,50 @@ def find_active_token(
     return None
 
 
+def list_active_tokens(
+    *,
+    agent_handle: str,
+    start: Path | None = None,
+) -> tuple[list[Token], list[Token]]:
+    """Enumerate all non-expired tokens for `agent_handle`.
+
+    Returns `(acks, overrides)`. Lazily deletes expired ack tokens
+    encountered during the scan (same GC pattern as
+    `find_active_token`). Override tokens have no TTL and are
+    consumed on first match by the hook; this helper does not
+    consume them, only lists.
+
+    Used by Phase 9 `/rules` introspection (`get_applicable_rules`).
+    """
+    acks: list[Token] = []
+    overrides: list[Token] = []
+    for kind, dir_fn, bucket in (
+        ("ack", _acks_dir, acks),
+        ("override", _overrides_dir, overrides),
+    ):
+        try:
+            tokens_dir = dir_fn(agent_handle, start)
+        except paths.OperonPathError:
+            continue
+        if not tokens_dir.is_dir():
+            continue
+        for path in sorted(tokens_dir.glob("*.json")):
+            token = _read_token(path)
+            if token is None:
+                continue
+            if token.kind != kind:
+                continue
+            if _token_is_expired(token):
+                # Lazy GC; same policy as find_active_token.
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            bucket.append(token)
+    return acks, overrides
+
+
 def consume_token(token: Token) -> bool:
     """Delete a one-shot token's file. No-op for TTL-only tokens.
 
@@ -797,6 +839,7 @@ def write_token(
     expires_at: str | None = None
     if ttl_seconds is not None:
         from datetime import timedelta
+
         expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(
             timespec="seconds"
         )
@@ -808,6 +851,7 @@ def write_token(
     tokens_dir.mkdir(parents=True, exist_ok=True)
 
     import uuid as _uuid
+
     token_id = _uuid.uuid4().hex
     target = tokens_dir / f"{rule_id}-{token_id}.json"
     payload = {
@@ -820,9 +864,7 @@ def write_token(
         "one_shot": one_shot,
     }
     data = json.dumps(payload, indent=2, ensure_ascii=False)
-    tmp = target.with_name(
-        f"{target.name}.tmp.{os.getpid()}.{_uuid.uuid4().hex}"
-    )
+    tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}.{_uuid.uuid4().hex}")
     try:
         tmp.write_text(data, encoding="utf-8")
         os.replace(tmp, target)

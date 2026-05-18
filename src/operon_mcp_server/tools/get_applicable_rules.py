@@ -22,6 +22,7 @@ is supported; the cross-Agent gate is documented but not yet wired
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import mcp.types as mcp_types
@@ -71,8 +72,8 @@ def tool_descriptor() -> mcp_types.Tool:
     )
 
 
-def _resolve_caller() -> tuple[str, str]:
-    """Return (agent_name, role) from env-anchored handle.
+def _resolve_caller() -> tuple[str, str, str]:
+    """Return (agent_name, role, handle) from env-anchored handle.
 
     Raises `ValueError` if identity is not bound.
     """
@@ -93,13 +94,17 @@ def _resolve_caller() -> tuple[str, str]:
         raise ValueError("Handle record missing 'agent_name'.")
     if not isinstance(role, str) or not role:
         raise ValueError("Handle record missing 'role'.")
-    return name, role
+    return name, role, handle
 
 
 def _render_constraints_markdown(
-    *, workflow_id: str, current_phase: str, role: str,
+    *,
+    workflow_id: str,
+    current_phase: str,
+    role: str,
     advance_checks: list[dict[str, Any]],
     applicable_rules: list[dict[str, Any]] | None = None,
+    active_tokens: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
     """Render the advance-checks + applicable Rules as a `## Constraints` block."""
     lines: list[str] = [
@@ -132,21 +137,48 @@ def _render_constraints_markdown(
             pat = r.get("detect_pattern") or "*any*"
             triggers = "/".join(r.get("trigger") or ["?"])
             msg = (r.get("message") or "").strip()
-            lines.append(
-                f"- `{rid}` [{tier}/{enf}] on `{triggers}` (detect: `{pat}`)"
-            )
+            lines.append(f"- `{rid}` [{tier}/{enf}] on `{triggers}` (detect: `{pat}`)")
             if msg:
                 lines.append(f"  -- {msg}")
         lines.append("")
     elif applicable_rules is not None:
         lines.append("(no guardrail Rules apply to this (role, phase))")
+        lines.append("")
+    # Phase 9: active escape tokens held by the caller
+    if active_tokens is not None:
+        acks = active_tokens.get("acks") or []
+        overrides = active_tokens.get("overrides") or []
+        lines.append("### Active escape tokens")
+        lines.append("")
+        if not acks and not overrides:
+            lines.append("No active acks or overrides.")
+        else:
+            if acks:
+                lines.append("**Acks (TTL):**")
+                for t in acks:
+                    rid = t.get("rule_id", "<unknown>")
+                    rem = t.get("seconds_remaining")
+                    rem_s = f"{rem}s remaining" if rem is not None else "no TTL"
+                    reason = (t.get("reason") or "").strip()
+                    suffix = f" -- {reason}" if reason else ""
+                    lines.append(f"- `{rid}` ({rem_s}){suffix}")
+                lines.append("")
+            if overrides:
+                lines.append("**Overrides (one-shot):**")
+                for t in overrides:
+                    rid = t.get("rule_id", "<unknown>")
+                    one = " one-shot" if t.get("one_shot") else ""
+                    reason = (t.get("reason") or "").strip()
+                    suffix = f" -- {reason}" if reason else ""
+                    lines.append(f"- `{rid}`{one}{suffix}")
+                lines.append("")
     return "\n".join(lines).rstrip()
 
 
 def _do_get(args: dict[str, Any]) -> dict[str, Any]:
     requested_name = args.get("agent_name")
 
-    name, role = _resolve_caller()
+    name, role, handle = _resolve_caller()
 
     if requested_name is not None and requested_name != name:
         return {
@@ -218,6 +250,7 @@ def _do_get(args: dict[str, Any]) -> dict[str, Any]:
     workflow_manifest_dict: dict[str, Any] | None = None
     try:
         import yaml as _yaml
+
         wf_data = _yaml.safe_load(decl.source_path.read_text(encoding="utf-8"))
         if isinstance(wf_data, dict):
             workflow_manifest_dict = wf_data
@@ -262,12 +295,61 @@ def _do_get(args: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    # Phase 9: active escape tokens (acks + overrides) held by the caller.
+    # Lazy-GCs expired ack tokens during the scan (same policy as the hook).
+    try:
+        ack_tokens, override_tokens = rules.list_active_tokens(
+            agent_handle=handle,
+        )
+    except rules.RulesError:
+        ack_tokens, override_tokens = [], []
+
+    now = datetime.now(timezone.utc)
+
+    def _seconds_remaining(expires_at: str | None) -> int | None:
+        if not expires_at:
+            return None
+        try:
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        delta = (exp - now).total_seconds()
+        return max(0, int(delta))
+
+    acks_payload = [
+        {
+            "rule_id": t.rule_id,
+            "issued_at": t.issued_at,
+            "expires_at": t.expires_at,
+            "seconds_remaining": _seconds_remaining(t.expires_at),
+            "one_shot": t.one_shot,
+            "reason": t.reason,
+        }
+        for t in ack_tokens
+    ]
+    overrides_payload = [
+        {
+            "rule_id": t.rule_id,
+            "issued_at": t.issued_at,
+            "expires_at": t.expires_at,
+            "seconds_remaining": _seconds_remaining(t.expires_at),
+            "one_shot": t.one_shot,
+            "reason": t.reason,
+        }
+        for t in override_tokens
+    ]
+    active_tokens_payload: dict[str, list[dict[str, Any]]] = {
+        "acks": acks_payload,
+        "overrides": overrides_payload,
+    }
+
     markdown = _render_constraints_markdown(
         workflow_id=workflow_id,
         current_phase=current_phase,
         role=role,
         advance_checks=advance_checks_payload,
         applicable_rules=applicable_rules,
+        active_tokens=active_tokens_payload,
     )
 
     payload: dict[str, Any] = {
@@ -277,6 +359,7 @@ def _do_get(args: dict[str, Any]) -> dict[str, Any]:
         "current_phase": current_phase,
         "advance_checks": advance_checks_payload,
         "applicable_rules": applicable_rules,
+        "active_tokens": active_tokens_payload,
         "markdown": markdown,
     }
     if rules_error:
