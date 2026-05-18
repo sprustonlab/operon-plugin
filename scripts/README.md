@@ -1,0 +1,177 @@
+# scripts/
+
+Auxiliary scripts for developing and smoke-testing operon-plugin.
+These are NOT shipped inside the plugin package -- they are developer
+tooling that lives in the repo for convenience.
+
+## Phase 4 smoke check
+
+Verifies inter-agent messaging end-to-end:
+mailbox envelope I/O, the `watchdog`-driven filesystem-watch loop,
+and the `notifications/claude/channel` push into each Agent's own
+session (RESEARCH §J.3 -- channel push is one-way to its OWN session
+only; cross-session reach is filesystem mailbox plus per-subprocess
+watch loop).
+
+### 1. Bootstrap the scratch project
+
+Run the setup helper. It wipes `/tmp/test-operon/` and writes the
+four Coordinator bootstrap files atomically via `os.replace`:
+
+```bash
+python /groups/spruston/home/moharb/operon-plugin/scripts/smoke_phase4_setup.py
+```
+
+The script prints the `export OPERON_AGENT_HANDLE=...` and `cd ...`
+lines on stdout. Copy/paste them into your shell:
+
+```bash
+export OPERON_AGENT_HANDLE=<uuid printed by the script>
+cd /tmp/test-operon
+```
+
+The bootstrap creates:
+
+- `.operon/_active.json` -- points at `msg-test-1`
+- `.operon/msg-test-1/phase_state.json` -- `current_phase: vision`,
+  `workflow_id: _smoke`
+- `.operon/msg-test-1/_handles/<coord_handle>.json` -- Coordinator
+  identity record
+- `.operon/msg-test-1/agents.json` -- empty roster
+
+It deliberately does NOT create `mailbox/<agent>/inbox/`,
+`mailbox/<agent>/control/`, `mailbox/<agent>/acks/`, or `overrides/`.
+Those are created lazily by `mailbox.write_envelope()` on first use,
+which is the production code path the smoke check should exercise.
+
+### 2. Launch the Coordinator's Claude Code session
+
+From the same shell (so `OPERON_AGENT_HANDLE` propagates into the MCP
+subprocess's `os.environ` per SPEC §6.5):
+
+```bash
+claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-plugin/
+```
+
+### 3. Run the 5-step smoke check inside the Coordinator session
+
+Issue these tool calls in order. Each step's success condition is
+listed under it.
+
+**Step 1 -- `whoami`**
+
+```
+mcp__operon__whoami()
+```
+
+Expected: returns `{"name": "Coordinator", "role": "coordinator",
+"workflow_id": "_smoke", "current_phase": "vision", "cwd":
+"/tmp/test-operon", "session_id": "manual-test-session"}`.
+
+**Step 2 -- spawn worker-A**
+
+```
+mcp__operon__spawn_agent(
+  name="worker-A",
+  path="/tmp/test-operon",
+  prompt="You are worker-A. Wait for messages.",
+  type="worker"
+)
+```
+
+Expected: success payload with a fresh `handle` and `session_id`.
+After the call, `cat /tmp/test-operon/.operon/msg-test-1/agents.json`
+shows one row for `worker-A`.
+
+**Step 3 -- spawn worker-B**
+
+```
+mcp__operon__spawn_agent(
+  name="worker-B",
+  path="/tmp/test-operon",
+  prompt="You are worker-B. Wait for messages.",
+  type="worker"
+)
+```
+
+Expected: `agents.json` now contains two rows (worker-A and
+worker-B), each with a distinct `handle` and `session_id`.
+
+**Step 4 -- message worker-A**
+
+```
+mcp__operon__message_agent(
+  name="worker-A",
+  message="ping",
+  requires_answer=false
+)
+```
+
+Expected: returns `{"correlation_id": "<id>", "delivered_to":
+"worker-A", "envelope_path": "..."}`. Within ~1 second the envelope
+file moves out of
+`/tmp/test-operon/.operon/msg-test-1/mailbox/worker-A/inbox/` and
+into the sibling `inbox/processed/` directory -- this is the target's
+own watch loop claiming the envelope and pushing it into worker-A's
+session.
+
+**Step 5 -- broadcast to both workers**
+
+```
+mcp__operon__broadcast_message(
+  names=["worker-A", "worker-B", "Coordinator"],
+  message="hello all",
+  requires_answer=false
+)
+```
+
+Expected: returns `{"sender": "Coordinator", "delivered": [{worker-A
+...}, {worker-B ...}], "failed": [], "skipped_self": true,
+"broadcast_results_path": "..."}`. The Coordinator's own name is
+silently filtered out per SPEC §7 `broadcast_message`. Two new audit
+rows appear in
+`/tmp/test-operon/.operon/msg-test-1/broadcast_results.jsonl`.
+
+### 4. What to look for on disk
+
+The shell-side confirmations are the canonical evidence that
+cross-session channel push worked. Run these after step 5:
+
+```bash
+# Roster: two worker rows.
+cat /tmp/test-operon/.operon/msg-test-1/agents.json
+
+# Each worker has its envelopes already moved to processed/, meaning
+# its own MCP subprocess saw the envelope and pushed it via channel.
+ls /tmp/test-operon/.operon/msg-test-1/mailbox/worker-A/inbox/processed/
+ls /tmp/test-operon/.operon/msg-test-1/mailbox/worker-B/inbox/processed/
+
+# inbox/ itself is empty (or contains only the processed/ subdir).
+ls /tmp/test-operon/.operon/msg-test-1/mailbox/worker-A/inbox/
+ls /tmp/test-operon/.operon/msg-test-1/mailbox/worker-B/inbox/
+
+# Audit log for the broadcast.
+cat /tmp/test-operon/.operon/msg-test-1/broadcast_results.jsonl
+```
+
+Success criteria:
+
+- `agents.json` contains exactly two rows (worker-A, worker-B).
+- `worker-A/inbox/processed/` contains 2 envelopes (the
+  `message_agent` and the broadcast).
+- `worker-B/inbox/processed/` contains 1 envelope (the broadcast).
+- `worker-A/inbox/` and `worker-B/inbox/` are empty (apart from the
+  `processed/` subdir).
+- `broadcast_results.jsonl` has 2 lines, both with `"outcome":
+  "delivered"`.
+
+If an envelope stays in `inbox/` instead of moving to `processed/`,
+the target's watch loop is not running (likely identity binding
+failed -- check `mcp__operon__whoami` from inside the worker session
+to diagnose).
+
+To eyeball the channel push from inside a worker's session, run
+`claude agents` from `/tmp/test-operon/` to list session ids, then
+`claude attach <worker-A session id>` to see the worker's transcript;
+the `<channel source="operon" sender="Coordinator" kind=
+"deliver_message" ...>ping</channel>` event should appear there.
