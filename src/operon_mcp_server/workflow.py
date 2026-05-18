@@ -420,6 +420,30 @@ class AdvanceOutcome:
     history_entry: dict[str, Any] | None = None
 
 
+def _expand_artifact_dir(value: Any, artifact_dir: str | None) -> Any:
+    """Substitute `${ARTIFACT_DIR}` / `${CLAUDECHIC_ARTIFACT_DIR}` in
+    string params with the value from state.json (`set_artifact_dir`).
+
+    Recurses into lists. Strings with no placeholder pass through
+    unchanged. If `artifact_dir` is None, placeholders are left as-is
+    -- the artifact-dir-ready-check should have failed earlier in the
+    advance order, so we never reach a substituted file-exists-check
+    with no artifact_dir bound.
+
+    Phase 11: ported claudechic workflows use `${CLAUDECHIC_ARTIFACT_DIR}`
+    in file-exists-check paths. Accept both spellings for portability.
+    """
+    if artifact_dir is None:
+        return value
+    if isinstance(value, str):
+        return value.replace("${ARTIFACT_DIR}", artifact_dir).replace(
+            "${CLAUDECHIC_ARTIFACT_DIR}", artifact_dir
+        )
+    if isinstance(value, list):
+        return [_expand_artifact_dir(v, artifact_dir) for v in value]
+    return value
+
+
 def _inject_seam_params(
     decls: tuple[CheckDecl, ...],
     *,
@@ -433,12 +457,34 @@ def _inject_seam_params(
     `cwd` for command-output-check. `state_path` is the `state.json`
     target for `artifact-dir-ready-check`. `elicit` is the closure
     that issues `elicitation/create` for `manual-confirm`.
+
+    Also substitutes `${ARTIFACT_DIR}` / `${CLAUDECHIC_ARTIFACT_DIR}`
+    in `path`/`paths` params from the current run's state.json so
+    workflows can pin advance checks to artifact-dir-relative paths.
     """
+    # Best-effort read of state.json for ${ARTIFACT_DIR} expansion.
+    # If state.json is missing or artifact_dir unset, placeholders are
+    # left literal -- artifact-dir-ready-check earlier in the chain
+    # should have failed first.
+    state_data = None
+    try:
+        state_data = read_state(state_path.parent)
+    except Exception:
+        state_data = None
+    artifact_dir = None
+    if isinstance(state_data, dict):
+        ad = state_data.get("artifact_dir")
+        if isinstance(ad, str) and ad:
+            artifact_dir = ad
+
     checks: list[Check] = []
     for decl in decls:
         params = dict(decl.params)
         if decl.type in {"file-exists-check", "file-content-check"}:
             params.setdefault("base_dir", str(workflow_root))
+            for k in ("path", "paths"):
+                if k in params:
+                    params[k] = _expand_artifact_dir(params[k], artifact_dir)
         if decl.type == "command-output-check":
             params.setdefault("cwd", str(workflow_root))
         if decl.type == "manual-confirm":

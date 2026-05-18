@@ -12,11 +12,9 @@
 #     omitted -- claudechic's pipeline-hints system is explicitly out
 #     of scope for the operon port (see plan: "Don't try to port hints").
 #
-# Note: operon's workflow loader currently treats `${ARTIFACT_DIR}` as
-# a literal in advance-check paths (no substitution layer yet). The
-# manual-confirm and artifact-dir-ready-check entries are unaffected;
-# the file-exists-check entries become aspirational until operon grows
-# a substitution helper analogous to claudechic's `_substitute.py`.
+# `${ARTIFACT_DIR}` in advance-check paths is substituted from the
+# active run's `state.json` (set via `set_artifact_dir` MCP tool) at
+# advance-check evaluation time. See `workflow._inject_seam_params`.
 
 workflow_id: project_team
 main_role: coordinator
