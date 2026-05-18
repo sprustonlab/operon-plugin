@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# PreToolUse hook wrapper (Phase 6 fix).
+#
+# Resolves a python interpreter that can `import operon_mcp_server.rules`
+# and invokes `pretooluse.py` with stdin/stdout/stderr passed through.
+# Mirrors the three-path resolution from `bin/operon-mcp-server`:
+#
+#   1. `uv run --project <plugin-root>` if uv is on PATH.
+#   2. `python3` or `python` with a pre-flight `import mcp, watchdog, yaml`
+#      check.
+#   3. Loud error to stderr with the exact `pip install` command (which
+#      Claude Code surfaces in the transcript as the hook-error preview).
+#
+# Always prepends `${CLAUDE_PLUGIN_ROOT}/src` to PYTHONPATH so the
+# operon_mcp_server package is importable without `pip install -e .`.
+
+set -e
+
+plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+script="${plugin_root}/hooks/pretooluse.py"
+
+export PYTHONPATH="${plugin_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --project "${plugin_root}" python "${script}" "$@"
+fi
+
+for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1; then
+        if "$py" -c "import mcp, watchdog, yaml" >/dev/null 2>&1; then
+            exec "$py" "${script}" "$@"
+        fi
+    fi
+done
+
+cat >&2 <<'EOF'
+operon-plugin pretooluse hook: no python with required deps.
+Either install uv (https://docs.astral.sh/uv/) or pip install:
+  pip install 'mcp>=1.0' 'watchdog>=4.0' 'PyYAML>=6.0'
+EOF
+# Emit allow so Claude Code doesn't false-block legitimate tools
+# when the hook environment is broken. This matches the bin/operon-
+# mcp-server fallback policy: loud error + fail-open. The Phase 6
+# Followup investigation found Claude Code's mcp_tool hooks also
+# fail-open by design.
+printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
+exit 0
