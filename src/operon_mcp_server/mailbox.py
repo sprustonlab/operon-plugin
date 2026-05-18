@@ -64,8 +64,28 @@ SCHEMA_VERSION = 1
 KIND_DELIVER_MESSAGE = "deliver_message"
 KIND_INTERRUPT = "interrupt"
 KIND_CLOSE = "close"
+#: Phase 8 (nudge mechanism). `nudge` is a deliver-like envelope that
+#: lands in the target's inbox and surfaces a reminder about an
+#: unreplied requires_answer=true message. The watch loop routes it
+#: through the same channel-push path as `deliver_message`.
+KIND_NUDGE = "nudge"
+#: `nudge_check` is a control-envelope signal from a separate process
+#: (the Stop hook) into the agent's own MCP subprocess, asking it to
+#: re-evaluate the pending-reply state and fire any past-due nudges.
+#: This is how the cross-process Stop hook coordinates with the
+#: single-writer MCP-event-loop nudge state without violating the
+#: SPEC §6.6 single-writer rule for `_pending_reply_to.json`.
+KIND_NUDGE_CHECK = "nudge_check"
 
-_ALLOWED_KINDS = frozenset({KIND_DELIVER_MESSAGE, KIND_INTERRUPT, KIND_CLOSE})
+_ALLOWED_KINDS = frozenset(
+    {
+        KIND_DELIVER_MESSAGE,
+        KIND_INTERRUPT,
+        KIND_CLOSE,
+        KIND_NUDGE,
+        KIND_NUDGE_CHECK,
+    }
+)
 
 #: Subdirectory name where consumed envelopes are moved (SPEC 6.6).
 PROCESSED_DIRNAME = "processed"
@@ -202,9 +222,7 @@ def _atomic_write_json(target_path: Path, payload: dict[str, Any]) -> Path:
             tmp.unlink()
         except OSError:
             pass
-        raise MailboxError(
-            f"Failed to write envelope '{target_path}': {exc}"
-        ) from exc
+        raise MailboxError(f"Failed to write envelope '{target_path}': {exc}") from exc
     return target_path
 
 
@@ -240,9 +258,14 @@ def write_envelope(
     if not isinstance(correlation_id, str) or not correlation_id:
         raise MailboxError("envelope.correlation_id must be a non-empty string")
 
-    if kind == KIND_DELIVER_MESSAGE:
+    if kind in (KIND_DELIVER_MESSAGE, KIND_NUDGE):
+        # Nudge envelopes route through the same inbox path as
+        # deliver_message so the target's watch loop drains them via
+        # the existing channel-push pipeline. The watch loop inspects
+        # `kind` to surface a nudge-specific message body.
         directory = inbox_dir(target_agent, start)
-    else:  # interrupt or close
+    else:
+        # interrupt, close, or nudge_check -> control directory.
         directory = control_dir(target_agent, start)
     target_path = directory / f"{correlation_id}.json"
     return _atomic_write_json(target_path, envelope)
@@ -278,9 +301,7 @@ def read_envelope(path: Path) -> dict[str, Any]:
         )
     for key in ("sender", "target", "correlation_id"):
         if not isinstance(data.get(key), str) or not data[key]:
-            raise MailboxError(
-                f"Envelope '{path}' missing or empty field {key!r}."
-            )
+            raise MailboxError(f"Envelope '{path}' missing or empty field {key!r}.")
     return data
 
 

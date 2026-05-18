@@ -1,5 +1,5 @@
 {
-  "_comment": "operon-plugin hooks. Phase 6 fix: PreToolUse now uses `type: command` (not `type: mcp_tool`). The mcp_tool wiring caused a chicken-and-egg under real Claude Code: every tool call -- INCLUDING calls to operon's own MCP tools -- fires PreToolUse, which dispatched via MCP, which itself required MCP-tool routing, surfacing as 'MCP server operon not connected' errors during the connection race. Hookify's reference plugin (Anthropic's example) uses type=command for the same reason. The `pretooluse-wrapper` script resolves a python interpreter and invokes `pretooluse.py`, which reuses the same `operon_mcp_server.rules` module and `guardrail_log.jsonl` audit writer that the hidden `evaluate` MCP tool uses. The hidden `evaluate` MCP tool stays in the server's registry for in-process testing and non-hook use cases. Matcher: limited to Bash|Edit|Write|MultiEdit|NotebookEdit -- the side-effectful tool surface. Read-only tools and operon's own MCP tools are NOT gated (the hook would recurse on the latter). Per the channels-reference docs, `${CLAUDE_PLUGIN_ROOT}` interpolates to the plugin install root.",
+  "_comment": "operon-plugin hooks. Phase 6 fix: PreToolUse uses `type: command` (not `type: mcp_tool`) to avoid the chicken-and-egg where every tool call recurses through MCP. The pretooluse-wrapper script resolves a python and invokes pretooluse.py, which reuses operon_mcp_server.rules + guardrail_log.jsonl. Hidden `evaluate` MCP tool stays in the server's registry for in-process testing. Phase 8: Stop hook (also `type: command`) signals the MCP server via a `kind=nudge_check` control envelope dropped into the agent's own mailbox. The MCP watch loop picks up the control envelope and runs nudge.fire_due_nudges() inside the event loop, preserving the SPEC §6.6 single-writer rule on _pending_reply_to.json. PreToolUse matcher Bash|Edit|Write|MultiEdit|NotebookEdit limits firing to side-effectful tools. Stop has no matcher (fires on every turn end).",
   "hooks": {
     "PreToolUse": [
       {
@@ -8,6 +8,17 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse-wrapper",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop-wrapper",
             "timeout": 10
           }
         ]

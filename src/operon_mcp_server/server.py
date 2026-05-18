@@ -40,6 +40,7 @@ from . import identity, watch
 from .tools import acknowledge_warning as acknowledge_warning_tool
 from .tools import activate_workflow as activate_workflow_tool
 from .tools import advance_phase as advance_phase_tool
+from .tools import arm_nudge_timer as arm_nudge_timer_tool
 from .tools import bind_handle as bind_handle_tool
 from .tools import broadcast_message as broadcast_message_tool
 from .tools import close_agent as close_agent_tool
@@ -107,10 +108,7 @@ def _maybe_configure_stderr_logging() -> None:
     logging.basicConfig(
         stream=sys.stderr,
         level=logging.DEBUG,
-        format=(
-            "[%(asctime)s] %(name)s %(levelname)s "
-            "(pid=%(process)d): %(message)s"
-        ),
+        format=("[%(asctime)s] %(name)s %(levelname)s (pid=%(process)d): %(message)s"),
     )
 
 
@@ -149,6 +147,11 @@ _TOOL_VISIBILITY: dict[str, str] = {
     # Phase 6.5: operon-session management.
     list_operon_sessions_tool.TOOL_NAME: _VISIBILITY_ALL,
     restore_operon_session_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
+    # Phase 8: nudge mechanism. arm_nudge_timer is hidden (hook-only
+    # + internal). The Stop hook uses `type: command` and signals via
+    # control envelope; this tool is a parallel in-process entry
+    # point for future use.
+    arm_nudge_timer_tool.TOOL_NAME: _VISIBILITY_HIDDEN,
 }
 
 #: Routing table: tool name -> handler coroutine. Includes HIDDEN tools
@@ -176,6 +179,8 @@ _TOOL_HANDLERS = {
     # Phase 6.5: operon-session management.
     list_operon_sessions_tool.TOOL_NAME: list_operon_sessions_tool.call,
     restore_operon_session_tool.TOOL_NAME: restore_operon_session_tool.call,
+    # Phase 8: nudge mechanism.
+    arm_nudge_timer_tool.TOOL_NAME: arm_nudge_timer_tool.call,
 }
 
 #: Tool descriptors keyed by name (used by the role-scoped filter to

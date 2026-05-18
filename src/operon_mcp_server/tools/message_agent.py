@@ -153,11 +153,34 @@ def _do_send(args: dict[str, Any]) -> dict[str, Any]:
         target_agent=target,
         kind=mailbox.KIND_DELIVER_MESSAGE,
     )
-    return {
+
+    # Phase 8: reply detection. If the SENDER's own pending-reply
+    # state has any entries from `target`, clear them -- this message
+    # IS the reply. Direct write to the sender's own
+    # `_pending_reply_to.json` (single-writer: sender's own MCP).
+    cleared: list[str] = []
+    try:
+        from .. import nudge as _nudge
+
+        removed = _nudge.clear_pending_for_sender(
+            agent_name=sender,
+            sender_name=target,
+        )
+        cleared = [e.correlation_id for e in removed]
+    except Exception:
+        # Best-effort: reply detection is observability, not safety.
+        # If it fails, the worst case is a stale nudge timer that
+        # gets caught by the generation check next fire.
+        pass
+
+    result: dict[str, Any] = {
         "correlation_id": envelope["correlation_id"],
         "delivered_to": target,
         "envelope_path": str(written),
     }
+    if cleared:
+        result["cleared_pending_correlation_ids"] = cleared
+    return result
 
 
 async def call(arguments: dict[str, Any] | None) -> list[mcp_types.TextContent]:

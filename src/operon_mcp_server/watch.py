@@ -195,14 +195,32 @@ def _format_channel_content(envelope: dict[str, Any]) -> tuple[str, dict[str, st
             )
         else:
             content = (
-                f"INTERRUPT from {sender}: your current activity has been "
-                "interrupted."
+                f"INTERRUPT from {sender}: your current activity has been interrupted."
             )
     elif kind == mailbox.KIND_CLOSE:
         content = (
             f"CLOSE from {sender}: this Agent is being shut down. "
             "Any in-flight work will not be resumed."
         )
+    elif kind == mailbox.KIND_NUDGE:
+        # Phase 8: surface the nudge in the agent's session. Includes
+        # the original sender + counts so the LLM has the context to
+        # reply.
+        from_who = str(payload.get("from", sender))
+        n = payload.get("nudge_count", "?")
+        rem = payload.get("remaining_nudges", "?")
+        body = str(payload.get("message", ""))
+        content = (
+            f"NUDGE #{n} (remaining {rem}) about an unreplied "
+            f"requires_answer message from {from_who!r}.\n{body}"
+        )
+        meta["nudge_count"] = str(n)
+    elif kind == mailbox.KIND_NUDGE_CHECK:
+        # Control envelope; no channel push intended (it's a
+        # server-internal signal). _process_envelope skips the push
+        # call for this kind. We return a placeholder content so the
+        # call site is uniform.
+        content = ""
     else:
         # Defensive: unrecognized kinds are surfaced verbatim so the
         # operator can see them.
@@ -238,8 +256,10 @@ def _self_stop(session_id: str) -> None:
         if proc.returncode != 0:
             _log.warning(
                 "self `claude stop %s` exited rc=%d: stdout=%r stderr=%r",
-                daemon_short, proc.returncode,
-                proc.stdout[:200], proc.stderr[:200],
+                daemon_short,
+                proc.returncode,
+                proc.stdout[:200],
+                proc.stderr[:200],
             )
         else:
             _log.info("self `claude stop %s` succeeded", daemon_short)
@@ -255,6 +275,7 @@ async def _process_envelope(
     path: Path,
     write_stream: MemoryObjectSendStream[SessionMessage],
     self_session_id: str | None,
+    self_agent_name: str | None = None,
 ) -> None:
     """Read, claim, dispatch one envelope. Idempotent on race."""
     _log.debug("process envelope: path=%s", path)
@@ -276,17 +297,62 @@ async def _process_envelope(
         _log.error("Failed to read claimed envelope %s: %s", claimed, exc)
         return
 
-    # 3) Push channel notification.
+    kind = envelope.get("kind")
+
+    # 3) Phase 8: nudge_check control envelopes are server-internal
+    #    signals. We process them BEFORE the channel-push step
+    #    because we don't want to leak them to the LLM. The Stop hook
+    #    drops these into mailbox/<self>/control/ to ask the MCP to
+    #    run a past-due-nudge check.
+    if kind == mailbox.KIND_NUDGE_CHECK:
+        if self_agent_name:
+            try:
+                # Local import to avoid a circular dep at module
+                # load time (nudge imports rules which imports paths
+                # which is fine, but keeping the import local is
+                # cheap insurance).
+                from . import nudge as _nudge
+
+                _nudge.fire_due_nudges(self_agent_name)
+            except Exception as exc:
+                _log.exception("nudge_check failed: %s", exc)
+        return
+
+    # 4) Push channel notification (for inbox-kind envelopes).
     content, meta = _format_channel_content(envelope)
     _log.debug(
         "pushing channel notification: kind=%s sender=%s content_len=%d",
-        envelope.get("kind"), envelope.get("sender"), len(content),
+        kind,
+        envelope.get("sender"),
+        len(content),
     )
     await _channel_push(write_stream, content=content, meta=meta)
     _log.debug("channel push sent for %s", claimed.name)
 
-    # 4) Side effects per kind.
-    kind = envelope.get("kind")
+    # 5) Phase 8: deliver_message envelopes with requires_answer=true
+    #    register a pending-reply obligation + schedule the initial
+    #    nudge timer. This runs INSIDE the MCP event loop, so the
+    #    SPEC §6.6 single-writer rule on _pending_reply_to.json holds.
+    if (
+        kind == mailbox.KIND_DELIVER_MESSAGE
+        and isinstance(envelope.get("payload"), dict)
+        and envelope["payload"].get("requires_answer")
+        and self_agent_name
+    ):
+        try:
+            from . import nudge as _nudge
+
+            entry = _nudge.add_pending(
+                agent_name=self_agent_name,
+                correlation_id=envelope["correlation_id"],
+                sender=str(envelope.get("sender", "")),
+                sender_handle="",  # not known here; can be enriched
+            )
+            _nudge.schedule_initial_timer(self_agent_name, entry)
+        except Exception as exc:
+            _log.exception("nudge add_pending / schedule failed: %s", exc)
+
+    # 6) Side effects per kind.
     if kind == mailbox.KIND_CLOSE:
         if self_session_id:
             # Defer slightly so the channel push has a chance to flush
@@ -296,7 +362,8 @@ async def _process_envelope(
         else:
             _log.warning(
                 "kind=close envelope %s received but no self_session_id "
-                "known; channel pushed but no self-stop.", claimed,
+                "known; channel pushed but no self-stop.",
+                claimed,
             )
 
 
@@ -402,7 +469,9 @@ async def run_watch_loop(
     observer.start()
     _log.info(
         "watch loop started for agent=%r inbox=%s control=%s",
-        agent_name, inbox, control,
+        agent_name,
+        inbox,
+        control,
     )
 
     # Sweep existing files into the queue once before processing the
@@ -425,11 +494,14 @@ async def run_watch_loop(
                 _log.exception("watch loop: queue.get raised: %s", exc)
                 continue
             try:
-                await _process_envelope(path, write_stream, self_session_id)
-            except Exception as exc:  # pragma: no cover (defensive)
-                _log.exception(
-                    "watch loop: error processing %s: %s", path, exc
+                await _process_envelope(
+                    path,
+                    write_stream,
+                    self_session_id,
+                    self_agent_name=agent_name,
                 )
+            except Exception as exc:  # pragma: no cover (defensive)
+                _log.exception("watch loop: error processing %s: %s", path, exc)
     finally:
         # Stop watchdog on cancellation. join() may briefly block; the
         # 2s ceiling is a hard upper bound on shutdown latency.
@@ -469,9 +541,10 @@ async def bootstrap_and_run(
         name, session_id = resolve_self()
         if name is not None:
             _log.info(
-                "watch bootstrap: identity resolved agent=%r session_id=%s "
-                "after %.1fs",
-                name, session_id, elapsed,
+                "watch bootstrap: identity resolved agent=%r session_id=%s after %.1fs",
+                name,
+                session_id,
+                elapsed,
             )
             await run_watch_loop(name, write_stream, session_id)
             return
