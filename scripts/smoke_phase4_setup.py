@@ -138,10 +138,33 @@ def _write_coord_handle(handle: str) -> Path:
     return path
 
 
-def _write_empty_roster() -> Path:
-    """Write `<run-dir>/agents.json` -> empty list."""
+def _write_initial_roster(coord_handle: str) -> Path:
+    """Write `<run-dir>/agents.json` with a Coordinator row.
+
+    Phase 5 prep: workers need to be able to `message_agent("Coordinator",
+    ...)` to send replies upstream. `message_agent` resolves targets via
+    `agents.json`, so the Coordinator MUST appear in the roster from
+    the moment the run is created. Same row schema as spawned worker
+    rows (SPEC §17 `agents.json`): `name, role, handle, session_id,
+    workflow_id, status, spawned_at, last_turn_at`.
+    """
+    now = _now_iso()
     path = PROJECT_ROOT / ".operon" / RUN_NAME / "agents.json"
-    _atomic_write_json(path, [])
+    _atomic_write_json(
+        path,
+        [
+            {
+                "name": "Coordinator",
+                "role": "coordinator",
+                "handle": coord_handle,
+                "session_id": COORDINATOR_SESSION_ID,
+                "workflow_id": WORKFLOW_ID,
+                "status": "idle",
+                "spawned_at": now,
+                "last_turn_at": now,
+            }
+        ],
+    )
     return path
 
 
@@ -154,7 +177,7 @@ def main() -> int:
     active_path = _write_active_pointer()
     phase_path = _write_phase_state()
     handle_path = _write_coord_handle(handle)
-    roster_path = _write_empty_roster()
+    roster_path = _write_initial_roster(handle)
 
     # Use stderr for human-readable confirmation so stdout stays clean
     # for the copy/paste-able export lines.
