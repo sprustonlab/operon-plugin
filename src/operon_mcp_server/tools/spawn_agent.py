@@ -705,27 +705,22 @@ def _spawn_subprocess(
         "--agent",
         role,
     ]
-    # Carryover #5 v4 (Phase 14 fix 7): conditionally drop --plugin-dir
-    # when the resolved channel tag is the marketplace form, so the
-    # bg worker's CC loads the plugin from its user marketplace cache
-    # (which matches the @<marketplace> tag). When the tag is @inline
-    # (dev-load), keep --plugin-dir so the worker finds the plugin
-    # source at all.
-    #
-    # Conditional logic mirrors commit c038230 (the original "no-
-    # patch alternative" branch) -- this is the form that empirically
-    # makes the worker's CC say "Channel notifications registered"
-    # for both install types. Phase 14 fix 2's always-keep-
-    # --plugin-dir-plus-dev-flag combination did not survive
-    # `/agents`-view respawn; the production `--channels=` flag does.
-    tag: str | None = None
+    # Carryover #5 v5 (Phase 14 fix 8): always keep --plugin-dir on
+    # the bg-worker argv, regardless of marketplace-install state.
+    # If OPERON_BG_CHANNELS=1, append the channel tag from
+    # `channel_tag.channel_tag_for_self`, which (post-fix-8) always
+    # returns `plugin:<plugin>@inline`. Empirically @inline +
+    # --plugin-dir is the only flag combination that produces
+    # "Channel notifications registered" in the worker's MCP log.
+    # The marketplace-vs-inline conditional from fix 7 was reverted
+    # after evidence that the @<marketplace> branch broke channel
+    # registration for Boaz's actual workflow.
+    if plugin_root:
+        argv.extend(["--plugin-dir", plugin_root])
     if _bg_channels_enabled():
         tag = channel_tag.channel_tag_for_self()
-    is_marketplace_tag = bool(tag) and not tag.endswith("@inline")
-    if plugin_root and not is_marketplace_tag:
-        argv.extend(["--plugin-dir", plugin_root])
-    if tag:
-        argv.append(f"--channels={tag}")
+        if tag:
+            argv.append(f"--channels={tag}")
     argv.append(initial_prompt)
 
     env = dict(os.environ)
