@@ -1,5 +1,5 @@
 {
-  "_comment": "operon-plugin hooks. Phase 6 fix: PreToolUse uses `type: command` (not `type: mcp_tool`) to avoid the chicken-and-egg where every tool call recurses through MCP. The pretooluse-wrapper script resolves a python and invokes pretooluse.py, which reuses operon_mcp_server.rules + guardrail_log.jsonl. Hidden `evaluate` MCP tool stays in the server's registry for in-process testing. Phase 8: Stop hook (also `type: command`) signals the MCP server via a `kind=nudge_check` control envelope dropped into the agent's own mailbox. The MCP watch loop picks up the control envelope and runs nudge.fire_due_nudges() inside the event loop, preserving the SPEC §6.6 single-writer rule on _pending_reply_to.json. PreToolUse matcher Bash|Edit|Write|MultiEdit|NotebookEdit limits firing to side-effectful tools. Stop has no matcher (fires on every turn end).",
+  "_comment": "operon-plugin hooks. PreToolUse fires the guardrail-rule evaluator out-of-process via pretooluse-wrapper -> pretooluse.py, which reuses operon_mcp_server.rules + guardrail_log.jsonl. The matcher Bash|Edit|Write|MultiEdit|NotebookEdit limits firing to side-effectful tools. Land 4 removed the Stop hook block (it called nudge.fire_due_nudges, which is gone with the nudge mechanism; agent lifecycle is the Anthropic runtime's contract under Agent Teams).",
   "hooks": {
     "PreToolUse": [
       {
@@ -8,17 +8,6 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse-wrapper",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop-wrapper",
             "timeout": 10
           }
         ]

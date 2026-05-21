@@ -279,13 +279,8 @@ def auto_bootstrap_if_needed(start: Path | None = None) -> str | None:
     if env_handle:
         if _env_handle_file_exists(env_handle, here):
             _log.debug("bootstrap: env handle resolves in this project; skipping")
-            # Phase 14 fix 4: freeze the env-supplied handle so a
-            # later mutation (cache override, env pop) can't flip
-            # identity. This is the spawn_agent worker path -- the
-            # subprocess inherits OPERON_AGENT_HANDLE from spawn,
-            # and we want that handle pinned for the worker's
-            # lifetime regardless of any later identity-write attempt.
-            identity.freeze_handle(env_handle)
+            # Land 4: identity.freeze_handle removed -- singleton MCP
+            # cannot drift; the env handle is authoritative on its own.
             return env_handle
         _log.warning(
             "bootstrap: ignoring stale %s=%s -- handle file not found in "
@@ -311,8 +306,7 @@ def auto_bootstrap_if_needed(start: Path | None = None) -> str | None:
     if existing is not None:
         _log.info("bootstrap: adopted existing coordinator handle=%s", existing)
         identity._set_cached_handle(existing)
-        # Phase 14 fix 4: freeze adopted handle.
-        identity.freeze_handle(existing)
+        # Land 4: identity.freeze_handle removed (singleton MCP).
         return existing
 
     # 3. Fresh bootstrap.
@@ -339,6 +333,5 @@ def auto_bootstrap_if_needed(start: Path | None = None) -> str | None:
         new_handle,
     )
     identity._set_cached_handle(new_handle)
-    # Phase 14 fix 4: freeze fresh-bootstrap handle.
-    identity.freeze_handle(new_handle)
+    # Land 4: identity.freeze_handle removed (singleton MCP).
     return new_handle

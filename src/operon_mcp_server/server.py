@@ -36,26 +36,20 @@ import mcp.types as mcp_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from . import bootstrap, identity, watch
+from . import bootstrap, identity
 from .tools import acknowledge_warning as acknowledge_warning_tool
 from .tools import activate_workflow as activate_workflow_tool
 from .tools import advance_phase as advance_phase_tool
-from .tools import arm_nudge_timer as arm_nudge_timer_tool
 from .tools import bind_handle as bind_handle_tool
-from .tools import broadcast_message as broadcast_message_tool
-from .tools import close_agent as close_agent_tool
 from .tools import evaluate as evaluate_tool
 from .tools import get_agent_info as get_agent_info_tool
 from .tools import get_applicable_rules as get_applicable_rules_tool
 from .tools import get_phase as get_phase_tool
-from .tools import interrupt_agent as interrupt_agent_tool
 from .tools import list_operon_sessions as list_operon_sessions_tool
-from .tools import message_agent as message_agent_tool
 from .tools import request_override as request_override_tool
 from .tools import restore_operon_session as restore_operon_session_tool
 from .tools import send_to_member as send_to_member_tool
 from .tools import set_artifact_dir as set_artifact_dir_tool
-from .tools import spawn_agent as spawn_agent_tool
 from .tools import whoami as whoami_tool
 
 #: MCP server name advertised in the `initialize` response. Must match
@@ -126,14 +120,15 @@ _VISIBILITY_HIDDEN = "hidden"
 
 #: Per-tool visibility metadata. Adding a new tool requires adding both
 #: a handler entry in `_TOOL_HANDLERS` and a visibility entry here.
+#:
+#: Land 4 (v2.9 plan section 6) removed the pre-pivot tool surfaces:
+#: spawn_agent, message_agent, broadcast_message, interrupt_agent,
+#: close_agent, arm_nudge_timer. Spawn is now the runtime's Agent
+#: tool; message delivery is via the inbox-write primitive
+#: (send_to_member + advance_phase team_broadcast).
 _TOOL_VISIBILITY: dict[str, str] = {
     whoami_tool.TOOL_NAME: _VISIBILITY_ALL,
-    spawn_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
     bind_handle_tool.TOOL_NAME: _VISIBILITY_HIDDEN,
-    message_agent_tool.TOOL_NAME: _VISIBILITY_ALL,
-    broadcast_message_tool.TOOL_NAME: _VISIBILITY_ALL,
-    interrupt_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
-    close_agent_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
     # Phase 5: workflow + phase engine.
     activate_workflow_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
     set_artifact_dir_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
@@ -148,16 +143,7 @@ _TOOL_VISIBILITY: dict[str, str] = {
     # Phase 6.5: operon-session management.
     list_operon_sessions_tool.TOOL_NAME: _VISIBILITY_ALL,
     restore_operon_session_tool.TOOL_NAME: _VISIBILITY_COORDINATOR_ONLY,
-    # Phase 8: nudge mechanism. arm_nudge_timer is hidden (hook-only
-    # + internal). The Stop hook uses `type: command` and signals via
-    # control envelope; this tool is a parallel in-process entry
-    # point for future use.
-    arm_nudge_timer_tool.TOOL_NAME: _VISIBILITY_HIDDEN,
     # Agent Teams pivot Land 2: inbox-write primitive surface.
-    # All-visible so any role can write into the runtime-shared
-    # inbox substrate. Does NOT replace message_agent yet; this
-    # is the new surface that proves the substrate works.
-    # message_agent/broadcast_message removal lands in Land 4.
     send_to_member_tool.TOOL_NAME: _VISIBILITY_ALL,
 }
 
@@ -166,12 +152,7 @@ _TOOL_VISIBILITY: dict[str, str] = {
 #: a handler even though the tool is not listed in `tools/list`.
 _TOOL_HANDLERS = {
     whoami_tool.TOOL_NAME: whoami_tool.call,
-    spawn_agent_tool.TOOL_NAME: spawn_agent_tool.call,
     bind_handle_tool.TOOL_NAME: bind_handle_tool.call,
-    message_agent_tool.TOOL_NAME: message_agent_tool.call,
-    broadcast_message_tool.TOOL_NAME: broadcast_message_tool.call,
-    interrupt_agent_tool.TOOL_NAME: interrupt_agent_tool.call,
-    close_agent_tool.TOOL_NAME: close_agent_tool.call,
     # Phase 5: workflow + phase engine.
     activate_workflow_tool.TOOL_NAME: activate_workflow_tool.call,
     set_artifact_dir_tool.TOOL_NAME: set_artifact_dir_tool.call,
@@ -186,8 +167,6 @@ _TOOL_HANDLERS = {
     # Phase 6.5: operon-session management.
     list_operon_sessions_tool.TOOL_NAME: list_operon_sessions_tool.call,
     restore_operon_session_tool.TOOL_NAME: restore_operon_session_tool.call,
-    # Phase 8: nudge mechanism.
-    arm_nudge_timer_tool.TOOL_NAME: arm_nudge_timer_tool.call,
     # Agent Teams pivot Land 2: inbox-write primitive.
     send_to_member_tool.TOOL_NAME: send_to_member_tool.call,
 }
@@ -198,11 +177,6 @@ _TOOL_HANDLERS = {
 #: name from hooks.
 _TOOL_DESCRIPTORS: dict[str, mcp_types.Tool] = {
     whoami_tool.TOOL_NAME: whoami_tool.tool_descriptor(),
-    spawn_agent_tool.TOOL_NAME: spawn_agent_tool.tool_descriptor(),
-    message_agent_tool.TOOL_NAME: message_agent_tool.tool_descriptor(),
-    broadcast_message_tool.TOOL_NAME: broadcast_message_tool.tool_descriptor(),
-    interrupt_agent_tool.TOOL_NAME: interrupt_agent_tool.tool_descriptor(),
-    close_agent_tool.TOOL_NAME: close_agent_tool.tool_descriptor(),
     # Phase 5 tools.
     activate_workflow_tool.TOOL_NAME: activate_workflow_tool.tool_descriptor(),
     set_artifact_dir_tool.TOOL_NAME: set_artifact_dir_tool.tool_descriptor(),
@@ -282,10 +256,11 @@ def _filter_tools_for_role(role: str | None) -> list[mcp_types.Tool]:
 def _build_server() -> Server:
     """Create the MCP `Server` instance with tool handlers attached.
 
-    The watch loop is no longer started from inside `list_tools`
-    (eager-start architecture; see SPEC §6.6 and the Phase 4 fix).
-    `_run()` schedules `watch.bootstrap_and_run` directly on the
-    long-lived task group at startup.
+    Land 4 removed the legacy mailbox watch loop; the lead's MCP
+    server is now stdio-only -- no concurrent background task. The
+    Anthropic runtime drives inbox delivery; operon's surface is
+    write-side only (inbox.write_to_member_inbox + send_to_member
+    + advance_phase team_broadcast).
     """
     server: Server = Server(SERVER_NAME, version=SERVER_VERSION)
 
@@ -315,17 +290,14 @@ def _build_server() -> Server:
 async def _run() -> None:
     """Run the stdio MCP server until the peer disconnects.
 
-    Phase 4 (eager-start fix): runs the background filesystem-watch
-    loop (`watch.bootstrap_and_run`) concurrently with the MCP
-    protocol loop. The watch loop is scheduled IMMEDIATELY at startup
-    -- not lazily on first `tools/list` -- because `claude --bg`
-    sessions may never invoke `tools/list` on their own (a worker
-    whose initial prompt is "wait for messages" does no tool calls
-    and would never trigger lazy start).
+    Land 4: the legacy filesystem-watch loop was removed. The lead's
+    operon MCP subprocess now runs only the stdio MCP protocol loop;
+    no concurrent background task. Anthropic's runtime watches the
+    inbox files; operon only writes to them.
 
-    The bootstrap waits for `OPERON_AGENT_HANDLE` to resolve to a
-    valid `_handles/<handle>.json` record before scheduling the
-    watcher itself.
+    Bootstrap still resolves the Coordinator identity for the
+    lead's subprocess (and any fixture handle the user has bound)
+    so the Coordinator-only tools find a valid role on first call.
     """
     _maybe_configure_stderr_logging()
     _log.info("operon MCP server boot: pid=%d cwd=%s", os.getpid(), os.getcwd())
@@ -337,10 +309,10 @@ async def _run() -> None:
 
     # Phase 14: auto-bootstrap a default Coordinator identity if no env
     # handle is set and the project has no existing operon-session.
-    # No-op when OPERON_AGENT_HANDLE is already exported (spawn_agent
-    # workers + manually-bound fixtures preserve existing behavior).
-    # Failures are logged and non-fatal; whoami will surface the
-    # missing identity to the LLM on first call.
+    # No-op when OPERON_AGENT_HANDLE is already exported (manually-bound
+    # fixtures preserve existing behavior). Failures are logged and
+    # non-fatal; whoami will surface the missing identity to the LLM
+    # on first call.
     try:
         bootstrap_handle = bootstrap.auto_bootstrap_if_needed()
         _log.debug(
@@ -352,26 +324,12 @@ async def _run() -> None:
         _log.warning("bootstrap raised unexpectedly: %s", exc)
 
     server = _build_server()
-    # Use the SDK helper: it auto-derives `capabilities.tools` from the
-    # registered `@server.list_tools()` handler and nests our
-    # `claude/channel` extension under `experimental` per MCP spec. The
-    # helper also sets `server_name` / `server_version` from the
-    # `Server(name, version=...)` arguments.
     init_options = server.create_initialization_options(
         experimental_capabilities=EXPERIMENTAL_CAPABILITIES,
     )
     async with stdio_server() as (read_stream, write_stream):
-        _log.info("stdio transport open; scheduling watch bootstrap")
-        async with anyio.create_task_group() as tg:
-            # Eager schedule: the watch bootstrap polls for identity
-            # and then runs the watch loop. Independent of any
-            # tools/list traffic.
-            tg.start_soon(watch.bootstrap_and_run, write_stream)
-            try:
-                await server.run(read_stream, write_stream, init_options)
-            finally:
-                _log.info("server.run() returned; cancelling task group")
-                tg.cancel_scope.cancel()
+        _log.info("stdio transport open")
+        await server.run(read_stream, write_stream, init_options)
 
 
 def main() -> None:

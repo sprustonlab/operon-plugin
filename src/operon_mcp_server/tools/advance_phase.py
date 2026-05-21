@@ -26,7 +26,7 @@ from typing import Any
 import mcp.types as mcp_types
 from mcp.server.lowlevel.server import request_ctx
 
-from .. import inbox, mailbox, paths, roster, workflow
+from .. import inbox, paths, workflow
 from . import spawn_agent as spawn_agent_tool
 
 #: MCP tool name. Coordinator-only per SPEC §7.1.
@@ -60,8 +60,9 @@ def tool_descriptor() -> mcp_types.Tool:
             "next phase per the workflow manifest. Runs the current "
             "phase's advance_checks in order (AND semantics, "
             "short-circuit on first failure). On all-pass, atomically "
-            "rewrites phase_state.json and notifies every other Agent "
-            "via mailbox envelope. Coordinator-only."
+            "rewrites phase_state.json and broadcasts per-role phase "
+            "briefs to every team member's inbox file via the "
+            "inbox-write primitive. Coordinator-only."
         ),
         inputSchema=INPUT_SCHEMA,
     )
@@ -277,55 +278,6 @@ def _broadcast_phase_brief(
     return result
 
 
-def _notify_other_agents(
-    coordinator_name: str,
-    from_phase: str,
-    to_phase: str,
-) -> list[str]:
-    """Drop one `kind=deliver_message` envelope into each non-Coordinator
-    Agent's inbox per SPEC §11.1 step 4.
-
-    Returns list of agent names notified. Best-effort: per-target write
-    failures are logged but do not roll back the advance (the advance
-    is already committed by this point).
-    """
-    notified: list[str] = []
-    try:
-        rows = roster.read_roster()
-    except roster.RosterError:
-        return notified
-    for row in rows:
-        target = row.get("name")
-        if not isinstance(target, str) or not target:
-            continue
-        if target == coordinator_name:
-            continue
-        envelope = mailbox.build_envelope(
-            sender=coordinator_name,
-            target=target,
-            kind=mailbox.KIND_DELIVER_MESSAGE,
-            payload={
-                "message_text": (
-                    f"Phase advanced from {from_phase!r} to "
-                    f"{to_phase!r}. Re-read phase_state.json / "
-                    f"get_applicable_rules for the new constraints."
-                ),
-                "requires_answer": False,
-                "_kind_hint": "phase_advance_notification",
-            },
-        )
-        try:
-            mailbox.write_envelope(
-                envelope, target_agent=target, kind=mailbox.KIND_DELIVER_MESSAGE
-            )
-            notified.append(target)
-        except mailbox.MailboxError:
-            # Skip silently; the audit trail of the advance is in
-            # phase_state.json.advance_history.
-            continue
-    return notified
-
-
 async def _do_advance() -> dict[str, Any]:
     coord_name, coord_role = _require_coordinator()
 
@@ -400,14 +352,12 @@ async def _do_advance() -> dict[str, Any]:
         triggered_by=coord_name,
     )
 
-    # Best-effort notification to non-Coordinator Agents per §11.1 step 4.
-    notified = _notify_other_agents(coord_name, current_phase, next_phase)
-
-    # Agent Teams Pivot Land 3: deliver per-role phase briefs to
-    # every team member's inbox file via the inbox-write primitive
-    # (Land 2). This runs in parallel with the legacy mailbox
-    # notification above; legacy substrate stays intact until
-    # Land 4. The broadcast is best-effort: per-recipient write
+    # Agent Teams Pivot Land 3 / Land 4: deliver per-role phase
+    # briefs to every team member's inbox file via the inbox-write
+    # primitive. Land 4 removed the legacy _notify_other_agents
+    # mailbox-substrate broadcast that used to run alongside this
+    # call -- inbox.broadcast_to_team is now the sole delivery
+    # path. The broadcast is best-effort: per-recipient write
     # failures are captured in the returned manifest and do NOT
     # roll back the phase advance (already committed above).
     team_broadcast = _broadcast_phase_brief(
@@ -437,9 +387,11 @@ async def _do_advance() -> dict[str, Any]:
         "to": next_phase,
         "at": history_entry.get("at"),
         "outcomes": outcomes_payload,
-        "notified": notified,
         "caller_brief": brief,
         # Land 3: per-role phase brief broadcast manifest.
+        # Land 4 dropped the legacy "notified" field (legacy mailbox
+        # substrate is gone; team_broadcast is the only delivery
+        # surface).
         "team_broadcast": team_broadcast,
     }
 
