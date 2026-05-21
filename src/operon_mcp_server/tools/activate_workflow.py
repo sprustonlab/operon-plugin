@@ -31,7 +31,7 @@ from typing import Any
 
 import mcp.types as mcp_types
 
-from .. import elicit, identity, paths, workflow
+from .. import elicit, identity, paths, subagent_install, workflow
 from . import spawn_agent as spawn_agent_tool
 
 #: MCP tool name. Coordinator-only per SPEC §7.1.
@@ -340,6 +340,24 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     except workflow.WorkflowError as exc:
         raise ActivateWorkflowError(str(exc)) from exc
 
+    # Land 1 of the Agent Teams pivot (v2.9 plan section 8 Land 1):
+    # compile every workflow role's identity.md into Anthropic's
+    # subagent-definition schema under ~/.claude/agents/<role>.md,
+    # install the operon-stub subagent definition, and register
+    # operon as a team member in ~/.claude/teams/<team>/config.json.
+    # The team name is the operon run_name; this is the natural
+    # identifier the user already named, and run_name is validated
+    # filesystem-safe above. The transformer and registration are
+    # purely additive -- no legacy code is touched (Land 1 deletes
+    # nothing per plan section 6 + section 8 Land 1).
+    try:
+        teams_manifest = subagent_install.install_for_activation(
+            workflow_id=workflow_id,
+            team_name=run_name,
+        )
+    except subagent_install.SubagentInstallError as exc:
+        raise ActivateWorkflowError(str(exc)) from exc
+
     # Phase 13 Finding 2: render the caller's role brief for the new
     # workflow's first phase so the Coordinator's LLM gets the same
     # per-phase context that spawned workers receive.
@@ -372,6 +390,10 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
         "killed_workers": killed_workers,
         "previous_run": current_run_dir.name if current_run_dir else None,
         "caller_brief": brief,
+        # Land 1 surfaces: which subagent definitions got written and
+        # which team config was registered. Boaz uses this to verify
+        # the demo end-to-end.
+        "team_install": teams_manifest,
     }
 
 
