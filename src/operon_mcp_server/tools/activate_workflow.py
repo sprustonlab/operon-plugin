@@ -75,11 +75,18 @@ def tool_descriptor() -> mcp_types.Tool:
     return mcp_types.Tool(
         name=TOOL_NAME,
         description=(
-            "Create a new operon-session: validates run_name, loads "
-            "the workflow manifest via the 3-tier loader, creates "
-            "<project>/.operon/<run_name>/{phase_state.json, agents.json, "
-            "_handles/, mailbox/}, and updates <project>/.operon/"
-            "_active.json to point at the new run. Coordinator-only."
+            "PREREQUISITE: call Anthropic's `TeamCreate(team_name="
+            "<your_run_name>)` MCP tool BEFORE this tool so the "
+            "Anthropic runtime's TUI sees the team (Shift+Down). "
+            "This tool validates that team exists, installs operon's "
+            "workflow content (compiles each role's identity.md into "
+            "~/.claude/agents/<role>.md as a subagent definition; "
+            "writes initial phase_state.json), registers operon as a "
+            "team member in ~/.claude/teams/<run_name>/config.json, "
+            "and sets <project>/.operon/_active.json to the new run. "
+            "Returns {status: 'team_not_created', next_step: ...} if "
+            "the TeamCreate prerequisite was skipped. "
+            "Coordinator-only."
         ),
         inputSchema=INPUT_SCHEMA,
     )
@@ -256,6 +263,30 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
         raise ActivateWorkflowError(
             f"Workflow {workflow_id!r} declares no phases; cannot activate."
         )
+
+    # Land 1 v2 (Boaz's demo 2026-05-21 finding 1): the Anthropic
+    # runtime TUI only sees teams created via Anthropic's TeamCreate
+    # MCP tool. Operon writing the team config from scratch leaves
+    # spawned teammates invisible to Shift+Down. Pre-check the team
+    # config exists; if it does not, return a structured error that
+    # tells the lead's LLM to call TeamCreate first. Return BEFORE
+    # the destructive prelude so we do not kill workers or create
+    # operon-side state on behalf of a non-existent team.
+    if not subagent_install.team_config_exists(run_name):
+        team_path = subagent_install.team_config_path(run_name)
+        return {
+            "activated": False,
+            "status": "team_not_created",
+            "error": (
+                f"No team exists at {team_path}. Call "
+                f"TeamCreate(team_name={run_name!r}) before "
+                f"activate_workflow so the Anthropic runtime TUI "
+                f"sees the team (Shift+Down)."
+            ),
+            "next_step": f"TeamCreate(team_name={run_name!r})",
+            "workflow_id": workflow_id,
+            "run_name": run_name,
+        }
 
     try:
         operon_dir = paths.operon_dir()

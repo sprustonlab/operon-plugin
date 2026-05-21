@@ -82,6 +82,30 @@ _OPERON_STUB_BODY = (
     "this is a bug -- reply 'ERR-OPERON-STUB-WAS-SPAWNED' and stop.\n"
 )
 
+#: Lifecycle-protocol footer appended to every compiled role
+#: definition. Boaz's Land 1 v1 demo (2026-05-21) surfaced that
+#: teammates default to APPROVING ``{type: "shutdown_request"}``
+#: messages and vanish from the TUI before the user can interact
+#: with them. The footer instructs the teammate to refuse shutdown
+#: unless the lead explicitly asks for it, which keeps the teammate
+#: visible across SendMessages until the user navigates to its
+#: session. NOT appended to the operon stub (the stub is never
+#: meant to be invoked at all; if it is, it should fail loudly via
+#: ERR-OPERON-STUB-WAS-SPAWNED, not refuse shutdown).
+_LIFECYCLE_PROTOCOL_FOOTER = """\
+## Lifecycle protocol
+
+If you receive a JSON message with `type: "shutdown_request"`, respond
+via SendMessage with:
+
+    {"type": "shutdown_response", "request_id": "<echo the request_id>",
+     "approve": false}
+
+Do not approve shutdown unless the lead explicitly asks you to. Stay
+alive across SendMessages so the user can navigate to your session
+and interact with you.
+"""
+
 #: Frontmatter delimiter regex (mirrors spawn_agent.py's parser but
 #: kept local so this module has no upward import).
 _FRONTMATTER_RE = re.compile(
@@ -164,8 +188,15 @@ def _format_frontmatter(name: str, description: str, model: str) -> str:
 
 def _compile_role_definition(role: str, identity_text: str) -> str:
     """Transform a role's identity.md body into Anthropic's subagent
-    definition shape. The result has YAML frontmatter followed by
-    the body of the source file (frontmatter stripped if present).
+    definition shape. The result has:
+
+      * YAML frontmatter (``name``, ``description``, ``model``).
+      * The body of the source file (frontmatter stripped if present).
+      * A lifecycle-protocol footer instructing the teammate to refuse
+        ``shutdown_request`` unless the lead explicitly asks for
+        shutdown (Land 1 v2 -- prevents teammates auto-approving
+        ``shutdown_request`` and vanishing from the TUI before the
+        user can interact with them).
     """
     body = _strip_frontmatter(identity_text).lstrip("\n")
     description = _extract_description(body, role)
@@ -174,7 +205,10 @@ def _compile_role_definition(role: str, identity_text: str) -> str:
     )
     if not body.endswith("\n"):
         body = body + "\n"
-    return f"{frontmatter}\n{body}"
+    # Ensure exactly one blank line between identity body and footer
+    # so the markdown renders cleanly. The footer ends with "\n" so the
+    # final file ends with a single newline.
+    return f"{frontmatter}\n{body}\n{_LIFECYCLE_PROTOCOL_FOOTER}"
 
 
 # -- atomic write --------------------------------------------------------
@@ -350,13 +384,28 @@ def install_workflow_subagents(workflow_id: str) -> dict[str, Any]:
 # -- public API: team config + operon-as-member registration ------------
 
 
-def _team_config_path(team_name: str) -> Path:
+def team_config_path(team_name: str) -> Path:
     """Return the path ``~/.claude/teams/<team>/config.json``.
 
     The literal segment ``teams/`` between ``.claude`` and the team
     name is required (v2.9 plan section 3.1).
+
+    Public helper: ``activate_workflow`` uses this to pre-check that
+    the team has been created via Anthropic's ``TeamCreate`` MCP tool
+    before operon installs subagent definitions or registers itself
+    as a member (Land 1 v2 -- the Anthropic runtime TUI only sees
+    teams created via TeamCreate; operon writing the file directly
+    is invisible to Shift+Down).
     """
     return TEAMS_DIR / team_name / "config.json"
+
+
+def team_config_exists(team_name: str) -> bool:
+    """Return True if the runtime-created team config exists.
+
+    Convenience wrapper over :func:`team_config_path`.
+    """
+    return team_config_path(team_name).is_file()
 
 
 def _now_ms() -> int:
@@ -394,21 +443,25 @@ def _operon_member_entry(team_name: str) -> dict[str, Any]:
 
 
 def register_operon_in_team_config(team_name: str) -> dict[str, Any]:
-    """Ensure ``~/.claude/teams/<team>/config.json`` exists with
-    operon registered as a member.
+    """Append operon as a member to an EXISTING team config.
 
-    Behaviour:
+    Land 1 v2: the team config must already exist (created by
+    Anthropic's ``TeamCreate`` MCP tool). Operon does NOT create the
+    team config itself -- the Anthropic runtime TUI only sees teams
+    that went through TeamCreate, so operon writing a config from
+    scratch is invisible to Shift+Down. ``activate_workflow``
+    pre-checks the file's existence via :func:`team_config_path` and
+    returns a structured "team_not_created" error to the lead if
+    absent; if this function is called without that pre-check and
+    the file is missing, it raises :class:`SubagentInstallError`.
 
-      * If the team config file is absent, create a minimal config
-        whose only member is operon. The runtime will append a
-        ``leadAgentId``/lead member entry the first time the lead's
-        session attaches to this team (TeamsSpike Round 1 validated
-        this idempotent append).
-      * If the file exists but does not include operon, read its
-        ``members`` list, append the operon entry, and write the
-        whole config back atomically (tmp + ``os.replace``).
-      * If the file exists and already includes operon, leave it
-        alone.
+    Behaviour when the file exists:
+
+      * Read the JSON config.
+      * If the ``members`` list already has an entry whose ``name``
+        is ``operon``, leave the file untouched (idempotent).
+      * Otherwise append the operon entry and atomically write back
+        (tmp + ``os.replace``).
 
     Returns a small manifest::
 
@@ -416,55 +469,54 @@ def register_operon_in_team_config(team_name: str) -> dict[str, Any]:
           "team": "<team>",
           "config_path": "<path>",
           "operon_registered": True,
-          "created_config": <bool>,
+          "operon_already_present": <bool>,
         }
     """
-    config_path = _team_config_path(team_name)
-    created = False
-    if config_path.is_file():
-        try:
-            text = config_path.read_text(encoding="utf-8")
-            config = json.loads(text)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SubagentInstallError(
-                f"Failed to read existing team config '{config_path}': "
-                f"{exc}"
-            ) from exc
-        if not isinstance(config, dict):
-            raise SubagentInstallError(
-                f"Team config '{config_path}' is not a JSON object."
-            )
-        members = config.get("members")
-        if not isinstance(members, list):
-            members = []
-            config["members"] = members
-        already_present = any(
-            isinstance(m, dict) and m.get("name") == OPERON_MEMBER_NAME
-            for m in members
+    config_path = team_config_path(team_name)
+    if not config_path.is_file():
+        raise SubagentInstallError(
+            f"Team config '{config_path}' does not exist. Call "
+            f"Anthropic's TeamCreate(team_name={team_name!r}) MCP "
+            f"tool before invoking activate_workflow so the team is "
+            f"visible to the runtime TUI."
         )
-        if not already_present:
-            members.append(_operon_member_entry(team_name))
-    else:
-        created = True
-        config = {
-            "name": team_name,
-            "createdAt": _now_ms(),
-            "members": [_operon_member_entry(team_name)],
-        }
-
-    serialized = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
-    _atomic_write_text(config_path, serialized)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        config = json.loads(text)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SubagentInstallError(
+            f"Failed to read existing team config '{config_path}': "
+            f"{exc}"
+        ) from exc
+    if not isinstance(config, dict):
+        raise SubagentInstallError(
+            f"Team config '{config_path}' is not a JSON object."
+        )
+    members = config.get("members")
+    if not isinstance(members, list):
+        # TeamCreate writes an empty list; tolerate older shapes by
+        # initializing the list rather than failing the install.
+        members = []
+        config["members"] = members
+    already_present = any(
+        isinstance(m, dict) and m.get("name") == OPERON_MEMBER_NAME
+        for m in members
+    )
+    if not already_present:
+        members.append(_operon_member_entry(team_name))
+        serialized = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+        _atomic_write_text(config_path, serialized)
     _log.info(
-        "subagent_install: team config %s (operon=%s, created=%s)",
+        "subagent_install: team config %s (operon=%s, already_present=%s)",
         config_path,
         OPERON_MEMBER_NAME,
-        created,
+        already_present,
     )
     return {
         "team": team_name,
         "config_path": str(config_path),
         "operon_registered": True,
-        "created_config": created,
+        "operon_already_present": already_present,
     }
 
 
