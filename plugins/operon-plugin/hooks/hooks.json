@@ -1,9 +1,9 @@
 {
-  "_comment": "operon-plugin hooks. PreToolUse fires the guardrail-rule evaluator out-of-process via pretooluse-wrapper -> pretooluse.py, which reuses operon_mcp_server.rules + guardrail_log.jsonl. The matcher Bash|Edit|Write|MultiEdit|NotebookEdit limits firing to side-effectful tools. Land 4 removed the Stop hook block (it called nudge.fire_due_nudges, which is gone with the nudge mechanism; agent lifecycle is the Anthropic runtime's contract under Agent Teams).",
+  "_comment": "operon-plugin hooks. PreToolUse fires pretooluse-wrapper -> pretooluse.py. Two responsibilities branch on tool_name inside the script: (a) Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule evaluation against operon_mcp_server.rules (deny/warn/log + audit log); (b) Agent -> WA1 transcript replay (v2.9 section 5.1) -- mutates tool_input.prompt to prepend prior sidechain transcripts so a re-spawned teammate gets first-person recall. WA1 fails open on any error and does NOT write to guardrail_log.jsonl. Land 4 removed the Stop hook block; Land 5 added Agent to the matcher.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Agent|Bash|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",

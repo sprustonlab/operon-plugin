@@ -1,34 +1,55 @@
 """`restore_operon_session` MCP tool (Coordinator-only).
 
-Per SPEC §7 + §13. Switches `<project>/.operon/_active.json` to point
-at a different existing operon-session, destructively closing any
-alive worker bg sessions in the CURRENT run first (with user
-confirmation via `elicitation/create`).
+Land 5 of the Agent Teams Pivot (see
+``docs/AGENT_TEAMS_PIVOT_PLAN.md`` v2.9 section 5.1 + section 8
+Land 5). Boaz's empirical 2026-05-21 finding: ``/resume`` of a
+post-Land-4 operon session does NOT auto-respawn the teammates
+that were alive at suspend time -- Shift+Down shows no
+composability teammate. Land 5 wires operon-driven RESTORE on
+top of WA1 (Section 5.1) so a previously-activated operon team
+project can be brought back to a workable state.
 
-Two entry modes:
+User-side framing (Boaz, 2026-05-21): "I want a RESTORE not a
+resume, it should be for an activated team project only."
+Translation:
 
-- `run_name` supplied: skip the picker, validate the target, run the
-  destructive-confirm + swap.
-- `run_name` omitted: discover available sessions via
-  `list_operon_sessions._do_list()`, issue a single-select picker
-  elicitation, then run the destructive-confirm + swap. This is the
-  flow `/restore` skill uses.
+  * Operon owns the operation; this MCP tool is the entry point.
+  * Precondition: previously-activated operon team project ->
+    both the team config at ``~/.claude/teams/<run>/config.json``
+    AND ``<cwd>/.operon/<run>/phase_state.json`` exist on disk.
+  * Generic ``/resume`` of a non-operon Claude Code session is
+    NOT in this tool's scope (the Anthropic runtime handles
+    lead-side ``/resume``; operon's job is the teammate respawn
+    manifest).
 
-The destructive-confirm step exists ONLY when the current active
-run has alive worker bg sessions. If the current run is empty or all
-workers are already dead, the swap proceeds silently.
+Two entry modes (matches the claudechic ``chicsessions.py`` /
+``chicsession_cmd.py`` restore pattern; the WA1 PreToolUse hook
+in ``plugins/operon-plugin/hooks/pretooluse.py`` is the WA1
+substitute for the SDK ``resume=session_id`` parameter):
 
-Ensures the Coordinator's handle file + roster row exist in the
-target run-dir BEFORE swapping `_active.json`, so subsequent tool
-calls from the same MCP subprocess can still resolve identity.
+  * ``run_name`` supplied: skip the picker, validate the target,
+    swap the active pointer, build the respawn manifest.
+  * ``run_name`` omitted: discover candidate runs via
+    ``list_operon_sessions._do_list()`` filtered to runs whose
+    BOTH team config + phase_state are present, surface a
+    single-select picker elicitation, then proceed.
+
+This tool does NOT spawn teammates itself (operon ships no
+lifecycle control over teammates per v2.9 section 6.1). It
+returns a structured manifest the lead's LLM uses to call
+``Agent(subagent_type=..., team_name=..., name=...)`` for each
+teammate to respawn. WA1 transcript replay happens inside the
+PreToolUse hook on the ``Agent`` tool.
+
+Cross-platform per project rules: ``pathlib.Path``,
+``encoding="utf-8"``, ``os.replace`` for atomic rename,
+ASCII-only.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import uuid
-from datetime import datetime, timezone
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +59,26 @@ from .. import elicit, identity, paths, workflow
 from . import list_operon_sessions as list_tool
 from . import spawn_agent as spawn_agent_tool
 
+_log = logging.getLogger(__name__)
+
 TOOL_NAME = "restore_operon_session"
+
+#: Operon's reserved team-member name (mirrors
+#: ``subagent_install.OPERON_MEMBER_NAME``; kept local so this module
+#: has no upward import into the install path).
+_OPERON_MEMBER_NAME = "operon"
+
+#: Lead's name in Anthropic's TeamCreate-shaped config. Empirically
+#: ``team-lead``; never participates in the respawn manifest because
+#: the lead is the user's foreground claude process and runtime
+#: ``/resume`` brings it back without operon's help.
+_LEAD_MEMBER_NAME = "team-lead"
+
+#: Anthropic team-config root. Local copy of the constant from
+#: ``subagent_install.TEAMS_DIR`` -- duplicated to avoid the import
+#: dependency on the install module from a Land-5 read path.
+_TEAMS_DIR = Path.home() / ".claude" / "teams"
+
 
 INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -46,9 +86,10 @@ INPUT_SCHEMA: dict[str, Any] = {
         "run_name": {
             "type": "string",
             "description": (
-                "Name of the operon-session to restore. If omitted, the "
-                "tool lists existing sessions and issues a picker "
-                "elicitation."
+                "Name of the operon team project to restore. If "
+                "omitted, the tool lists existing projects (filtered "
+                "to those with BOTH a team config and a phase_state) "
+                "and issues a picker."
             ),
         },
     },
@@ -60,11 +101,15 @@ def tool_descriptor() -> mcp_types.Tool:
     return mcp_types.Tool(
         name=TOOL_NAME,
         description=(
-            "Switch the active operon-session to a different existing "
-            "run-dir. Destructive: any alive worker bg sessions in the "
-            "CURRENT run are closed first (with user confirmation via "
-            "elicitation/create). Coordinator-only. When called with "
-            "no run_name, surfaces a picker."
+            "Restore a previously-activated operon team project. "
+            "Precondition: ~/.claude/teams/<run_name>/config.json AND "
+            "<cwd>/.operon/<run_name>/phase_state.json both exist. "
+            "Sets <cwd>/.operon/_active.json to point at the chosen "
+            "run, then returns a manifest of the team members that "
+            "need to be re-spawned via Anthropic's Agent tool. WA1 "
+            "transcript replay (v2.9 section 5.1) is delivered by the "
+            "PreToolUse hook on Agent. With no run_name argument, "
+            "surfaces a picker. Coordinator-only."
         ),
         inputSchema=INPUT_SCHEMA,
     )
@@ -72,10 +117,6 @@ def tool_descriptor() -> mcp_types.Tool:
 
 class RestoreOperonSessionError(RuntimeError):
     """Raised on validation or write failures; becomes a tool error."""
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _require_coordinator() -> dict[str, Any]:
@@ -86,330 +127,310 @@ def _require_coordinator() -> dict[str, Any]:
     return record
 
 
-def _upsert_coordinator_in_target(
-    target_run_dir: Path,
-    handle: str,
-    coord_record: dict[str, Any],
-    target_workflow_id: str | None,
-) -> None:
-    """Ensure the Coordinator's handle file + roster row exist in the
-    target run-dir BEFORE we swap `_active.json`.
+def _team_config_path(run_name: str) -> Path:
+    """Return ``~/.claude/teams/<run_name>/config.json``."""
+    return _TEAMS_DIR / run_name / "config.json"
 
-    Mirrors `activate_workflow._copy_coordinator_handle_and_roster_row`
-    but tolerant of an existing handle file (target may already have
-    been a Coordinator before; we overwrite with the current record
-    so the env-anchored identity round-trips through the new active
-    run). Same logic applies to the agents.json row -- de-dupe by
-    handle and update in-place.
 
-    Phase 13 Finding 1: if `target_workflow_id` is provided (read from
-    the target run-dir's phase_state.json), the upserted handle's
-    `workflow_id` is rewritten to that value so `whoami` and
-    `get_phase` agree after the swap. If None (target had no parseable
-    phase_state.json), preserve the original record's workflow_id.
+def _is_operon_team_project(run_name: str, operon_dir: Path) -> tuple[bool, str | None]:
+    """Return ``(ok, reason)`` for the operon-team-project precondition.
+
+    A run satisfies the precondition iff both:
+
+      1. ``~/.claude/teams/<run_name>/config.json`` exists (the
+         Anthropic runtime saw a TeamCreate for this name).
+      2. ``<cwd>/.operon/<run_name>/phase_state.json`` exists
+         (operon's activate_workflow ran against it).
+
+    Returns ``(False, "<human reason>")`` on failure; ``(True, None)``
+    on success.
     """
-    handles_dir = target_run_dir / paths.HANDLES_DIRNAME
-    handles_dir.mkdir(parents=True, exist_ok=True)
+    team_cfg = _team_config_path(run_name)
+    if not team_cfg.is_file():
+        return False, (
+            f"Team config not found at '{team_cfg}'. This run was "
+            f"never activated as an Anthropic team (no TeamCreate)."
+        )
+    phase_state = operon_dir / run_name / "phase_state.json"
+    if not phase_state.is_file():
+        return False, (
+            f"Operon phase_state not found at '{phase_state}'. This "
+            f"run was never activated by operon's activate_workflow."
+        )
+    return True, None
 
-    # Handle file (upsert). Phase 13 Finding 1: rewrite workflow_id.
-    handle_path = handles_dir / f"{handle}.json"
-    new_record = dict(coord_record)
-    if target_workflow_id:
-        new_record["workflow_id"] = target_workflow_id
-    payload = json.dumps(new_record, indent=2, ensure_ascii=False)
-    tmp = handle_path.with_name(
-        f"{handle_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
-    )
+
+def _read_team_members_for_restore(run_name: str) -> list[dict[str, Any]]:
+    """Read the team config and return the ``members`` list.
+
+    Defensive: returns ``[]`` on any read / parse failure. Restore
+    treats an unreadable team config as the manifest-empty case
+    rather than aborting -- the active-pointer swap is still useful.
+    """
+    cfg_path = _team_config_path(run_name)
     try:
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, handle_path)
-    except OSError as exc:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise RestoreOperonSessionError(
-            f"Failed to write Coordinator handle into target run: {exc}"
-        ) from exc
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _log.warning("restore: failed to read team config %s: %s", cfg_path, exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    members = data.get("members")
+    if not isinstance(members, list):
+        return []
+    return [m for m in members if isinstance(m, dict)]
 
-    # Roster row (upsert by handle).
-    roster_path = target_run_dir / "agents.json"
-    rows: list[dict[str, Any]] = []
-    if roster_path.is_file():
+
+def _cwd_mangled() -> str:
+    """Return the Claude Code project-dir name for the current cwd.
+
+    Empirical convention (verified 2026-05-21 against
+    ``~/.claude/projects/-tmp-operon-land4-test/``): each ``/`` in
+    the absolute cwd is replaced with ``-``. A path like
+    ``/tmp/operon-land4-test`` becomes ``-tmp-operon-land4-test``
+    (leading dash from the leading slash). The PreToolUse hook in
+    ``hooks/pretooluse.py`` uses the same convention to locate
+    sidechain transcripts at hook time.
+    """
+    return str(Path.cwd().resolve()).replace("/", "-")
+
+
+def _discover_sidechain_transcripts(agent_type: str) -> list[Path]:
+    """Find all ``agent-<hash>.jsonl`` transcripts whose sibling
+    ``agent-<hash>.meta.json`` declares ``agentType == agent_type``.
+
+    Walks ``~/.claude/projects/<cwd-mangled>/*/subagents/``. The
+    middle path segment is the parent session id; we glob across all
+    of them so a teammate that participated in multiple lead-side
+    sessions has its transcripts unioned. Sorted by file mtime
+    ascending for deterministic temporal order (matches v2.9 section
+    5.1 step 3 wording).
+
+    Defensive: returns ``[]`` on filesystem errors. Restore must not
+    crash on a missing projects dir or a malformed meta.json.
+    """
+    project_dir = Path.home() / ".claude" / "projects" / _cwd_mangled()
+    if not project_dir.is_dir():
+        return []
+    matches: list[tuple[float, Path]] = []
+    for meta_path in project_dir.glob("*/subagents/agent-*.meta.json"):
         try:
-            data = json.loads(roster_path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                rows = [r for r in data if isinstance(r, dict)]
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            rows = []
-    now = _now_iso()
-    coord_row = {
-        "name": coord_record.get("agent_name", "Coordinator"),
-        "role": coord_record.get("role", "coordinator"),
-        "handle": handle,
-        "session_id": coord_record.get("session_id", ""),
-        # Phase 13 Finding 1: pin to target_workflow_id when available
-        # so the roster row stays consistent with the rewritten
-        # handle file. Fallback to the record's original workflow_id
-        # if target's phase_state.json was unreadable.
-        "workflow_id": (
-            target_workflow_id
-            if target_workflow_id
-            else coord_record.get("workflow_id", "")
-        ),
-        "status": "idle",
-        "spawned_at": coord_record.get("spawned_at", now),
-        "last_turn_at": now,
-    }
-    # Drop any prior row with the same handle, append the upsert.
-    rows = [r for r in rows if r.get("handle") != handle]
-    rows.append(coord_row)
-
-    tmp = roster_path.with_name(
-        f"{roster_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
-    )
-    try:
-        tmp.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, roster_path)
-    except OSError as exc:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("agentType") != agent_type:
+            continue
+        jsonl_path = meta_path.with_suffix("")
+        # ``with_suffix("")`` strips only ``.json``; we need to strip
+        # ``.meta.json`` -> ``.jsonl``. Build it explicitly.
+        jsonl_path = meta_path.parent / (
+            meta_path.name[: -len(".meta.json")] + ".jsonl"
+        )
+        if not jsonl_path.is_file():
+            continue
         try:
-            tmp.unlink()
+            mtime = jsonl_path.stat().st_mtime
         except OSError:
-            pass
-        raise RestoreOperonSessionError(
-            f"Failed to upsert Coordinator row in target roster: {exc}"
-        ) from exc
+            continue
+        matches.append((mtime, jsonl_path))
+    matches.sort(key=lambda t: t[0])
+    return [p for _mtime, p in matches]
 
 
-async def _maybe_pick_run_name() -> str | None:
-    """Use `list_operon_sessions` + `elicit.select_one` to choose a run.
+def _build_respawn_manifest(run_name: str) -> list[dict[str, Any]]:
+    """For every member that is NOT operon and NOT the lead, record
+    the prior sidechain transcripts that WA1 will replay on Agent
+    spawn.
 
-    Returns the chosen run_name, or None if the user declined / no
-    sessions exist.
+    Returns one entry per respawn-target member::
+
+        {
+          "name": "<member name>",
+          "subagent_type": "<agentType>",  # what Agent(...) needs
+          "sidechain_count": <int>,
+          "sidechain_paths": ["<absolute path>", ...],
+        }
+
+    ``operon`` is excluded because it's a non-teammate member.
+    ``team-lead`` is excluded because the runtime's ``/resume``
+    handles the lead's own session.
+    """
+    members = _read_team_members_for_restore(run_name)
+    manifest: list[dict[str, Any]] = []
+    for m in members:
+        name = m.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if name in (_OPERON_MEMBER_NAME, _LEAD_MEMBER_NAME):
+            continue
+        agent_type = m.get("agentType")
+        if not isinstance(agent_type, str) or not agent_type:
+            # Fall back to the member name itself; Land 1's
+            # subagent_install installs definitions under
+            # ``<name>.md`` so name and agentType are typically
+            # equal for operon-roster members.
+            agent_type = name
+        transcripts = _discover_sidechain_transcripts(agent_type)
+        manifest.append(
+            {
+                "name": name,
+                "subagent_type": agent_type,
+                "sidechain_count": len(transcripts),
+                "sidechain_paths": [str(p) for p in transcripts],
+            }
+        )
+    return manifest
+
+
+async def _pick_run_name() -> str | None:
+    """Surface a picker over runs that satisfy the operon-team-project
+    precondition.
+
+    Returns the chosen ``run_name``, or ``None`` if the user declined
+    or no candidates exist.
     """
     listing = list_tool._do_list()
-    sessions = listing.get("sessions", [])
-    if not sessions:
+    raw_sessions = listing.get("sessions", []) or []
+    try:
+        op_dir = paths.operon_dir()
+    except paths.OperonPathError:
         return None
-    # Build picker label per session: "<run_name>  (workflow, phase,
-    # alive=N)". Picker enum values are the raw run_name strings so
-    # the post-pick lookup is trivial; the label is just the
-    # `message` body.
-    lines = ["Pick the operon-session to restore:\n"]
+
+    candidates: list[tuple[str, str, str]] = []
+    for s in raw_sessions:
+        rn = s.get("run_name")
+        if not isinstance(rn, str) or not rn:
+            continue
+        ok, _reason = _is_operon_team_project(rn, op_dir)
+        if not ok:
+            continue
+        wf = s.get("workflow_id") or "?"
+        ph = s.get("current_phase") or "?"
+        candidates.append((rn, wf, ph))
+    if not candidates:
+        return None
+
+    lines = ["Pick the operon team project to restore:\n"]
     choices: list[str] = []
-    for s in sessions:
-        rn = s.get("run_name", "?")
-        wf = s.get("workflow_id", "?")
-        ph = s.get("current_phase", "?")
-        alive = s.get("alive_agent_count", 0)
-        active_marker = "  [ACTIVE]" if s.get("is_active") else ""
-        lines.append(f"  - {rn}  (workflow={wf}, phase={ph}, alive={alive}){active_marker}")
+    for rn, wf, ph in candidates:
+        lines.append(f"  - {rn}  (workflow={wf}, phase={ph})")
         choices.append(rn)
-    msg = "\n".join(lines)
-    return await elicit.select_one(msg, choices, title="Operon-session")
+    return await elicit.select_one(
+        "\n".join(lines), choices, title="Operon team project"
+    )
 
 
 async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
-    coord_record = _require_coordinator()
+    # Identity gate (Coordinator-only). The record itself is not
+    # consumed downstream -- restore does not write any handle files
+    # in the post-Land-4 architecture -- but the call is retained for
+    # its side effect (raises if the caller is not the Coordinator).
+    _require_coordinator()
     coord_handle = identity.read_env_handle()
     if not coord_handle:
         raise RestoreOperonSessionError(
             "Coordinator identity is missing OPERON_AGENT_HANDLE."
         )
 
-    # Determine target run_name.
     raw_run_name = args.get("run_name")
     if raw_run_name is None:
-        run_name = await _maybe_pick_run_name()
+        run_name = await _pick_run_name()
         if run_name is None:
             return {
-                "restored": False,
-                "reason": "no_selection",
-                "detail": "User declined the picker or no sessions are available.",
+                "success": False,
+                "error": "no_candidates_or_user_declined",
+                "details": (
+                    "No operon team projects (runs with both team "
+                    "config and phase_state) were found, or the user "
+                    "declined the picker."
+                ),
             }
     else:
         if not isinstance(raw_run_name, str) or not raw_run_name:
             raise RestoreOperonSessionError("'run_name' must be a non-empty string")
         run_name = raw_run_name
 
-    # Resolve operon_dir (must exist; restore needs at least one
-    # existing run-dir).
     try:
         op_dir = paths.operon_dir()
     except paths.OperonPathError as exc:
         raise RestoreOperonSessionError(str(exc)) from exc
 
-    target_dir = op_dir / run_name
-    if not target_dir.is_dir():
-        raise RestoreOperonSessionError(
-            f"Operon-session '{run_name}' does not exist at '{target_dir}'."
-        )
-
-    target_phase_state = target_dir / "phase_state.json"
-    if not target_phase_state.is_file():
-        raise RestoreOperonSessionError(
-            f"Target run '{run_name}' is malformed: missing phase_state.json."
-        )
-
-    # No-op if target is already the active run.
-    current_run_dir: Path | None = None
-    try:
-        current_run_dir = paths.active_run_dir()
-    except paths.OperonPathError:
-        current_run_dir = None
-    if current_run_dir is not None and current_run_dir.name == run_name:
+    ok, reason = _is_operon_team_project(run_name, op_dir)
+    if not ok:
         return {
-            "restored": False,
-            "reason": "already_active",
+            "success": False,
+            "error": "not_an_operon_team_project",
+            "details": reason,
             "run_name": run_name,
         }
 
-    # Destructive prelude: alive-worker inspection in CURRENT run.
-    killed_workers: list[dict[str, Any]] = []
-    alive_workers: list[dict[str, Any]] = []
-    if current_run_dir is not None:
-        alive_workers = workflow.alive_agents_in_run(current_run_dir)
-
-    if alive_workers:
-        names = [w.get("name", "<unknown>") for w in alive_workers]
-        msg = (
-            f"Restore operon-session '{run_name}'?\n\n"
-            f"This will CLOSE these workers from current run "
-            f"'{current_run_dir.name if current_run_dir else '?'}':\n"
-            + "\n".join(f"  - {n}" for n in names)
-        )
-        approved = await elicit.confirm(msg)
-        if not approved:
-            return {
-                "restored": False,
-                "reason": "user_declined",
-                "would_have_killed": names,
-                "current_run": current_run_dir.name if current_run_dir else None,
-            }
-        for w in alive_workers:
-            short = w.get("_daemon_short", "")
-            stop_result = workflow.kill_bg_session(short)
-            killed_workers.append(
-                {
-                    "name": w.get("name"),
-                    "session_id": w.get("session_id"),
-                    "stop": stop_result,
-                }
-            )
-
-    # Phase 13 Finding 1: pre-read target's phase_state.json to get
-    # workflow_id; rewrite the upserted handle's workflow_id so
-    # `whoami` and `get_phase` agree after the swap.
-    target_workflow_id: str | None = None
-    try:
-        ps_data = json.loads(target_phase_state.read_text(encoding="utf-8"))
-        if isinstance(ps_data, dict):
-            wid = ps_data.get("workflow_id")
-            if isinstance(wid, str) and wid:
-                target_workflow_id = wid
-    except (OSError, json.JSONDecodeError):
-        target_workflow_id = None
-
-    # Upsert the Coordinator into the target run BEFORE swapping
-    # `_active.json` so identity resolution survives the switch.
-    _upsert_coordinator_in_target(
-        target_run_dir=target_dir,
-        handle=coord_handle,
-        coord_record=coord_record,
-        target_workflow_id=target_workflow_id,
-    )
-
-    # Atomic swap.
+    # Atomically swap the active pointer to the chosen run.
     try:
         workflow.write_active_pointer(op_dir, run_name)
     except workflow.WorkflowError as exc:
         raise RestoreOperonSessionError(str(exc)) from exc
 
-    # Re-read the target's phase state for the return payload.
+    # Read the restored phase state for the response.
+    target_phase_state = op_dir / run_name / "phase_state.json"
+    workflow_id: str | None = None
+    current_phase: str | None = None
     try:
-        phase_state = json.loads(target_phase_state.read_text(encoding="utf-8"))
+        ps = json.loads(target_phase_state.read_text(encoding="utf-8"))
+        if isinstance(ps, dict):
+            wid = ps.get("workflow_id")
+            if isinstance(wid, str) and wid:
+                workflow_id = wid
+            cp = ps.get("current_phase")
+            if isinstance(cp, str) and cp:
+                current_phase = cp
     except (OSError, json.JSONDecodeError) as exc:
-        # The swap already happened; surface the read failure but
-        # don't roll back -- the active pointer is now valid.
-        return {
-            "restored": True,
-            "run_name": run_name,
-            "previous_run": current_run_dir.name if current_run_dir else None,
-            "killed_workers": killed_workers,
-            "phase_state_read_error": str(exc),
-            "caller_brief": None,
-        }
-    if not isinstance(phase_state, dict):
-        phase_state = {}
-
-    # Roster summary for the response.
-    agent_count = 0
-    alive_count = 0
-    roster_path = target_dir / "agents.json"
-    if roster_path.is_file():
-        try:
-            data = json.loads(roster_path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                agent_count = len(data)
-                for r in data:
-                    if not isinstance(r, dict):
-                        continue
-                    if r.get("role") == "coordinator":
-                        alive_count += 1
-                        continue
-                    sid = r.get("session_id", "")
-                    if isinstance(sid, str) and sid:
-                        short = sid.split("-", 1)[0]
-                        if workflow.is_bg_session_alive(short):
-                            alive_count += 1
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    # Phase 13 Finding 2: render the caller's role brief for the
-    # target run's current phase.
-    caller_role = coord_record.get("role", "coordinator")
-    restored_workflow_id = phase_state.get("workflow_id")
-    restored_phase = phase_state.get("current_phase")
-    brief = None
-    if (
-        isinstance(caller_role, str)
-        and caller_role
-        and isinstance(restored_workflow_id, str)
-        and restored_workflow_id
-    ):
-        brief = spawn_agent_tool.assemble_caller_brief(
-            restored_workflow_id,
-            caller_role,
-            restored_phase if isinstance(restored_phase, str) else None,
+        _log.warning(
+            "restore: failed to read restored phase_state %s: %s",
+            target_phase_state,
+            exc,
         )
-        if brief is None:
-            brief = spawn_agent_tool.absent_caller_brief(
-                restored_workflow_id,
-                caller_role,
-                restored_phase if isinstance(restored_phase, str) else None,
-                reason=(
-                    f"No {caller_role}/identity.md in any tier for workflow "
-                    f"{restored_workflow_id!r}; caller will operate without a brief."
-                ),
-            )
+
+    members_to_respawn = _build_respawn_manifest(run_name)
+
+    lead_instructions = (
+        "For each member in members_to_respawn, call "
+        "Agent(subagent_type=<subagent_type>, team_name="
+        f"{run_name!r}, name=<name>, prompt=<your continuation "
+        "instruction>). Operon's PreToolUse hook on Agent injects "
+        "the matching sidechain transcripts in front of your prompt "
+        "(WA1 -- v2.9 section 5.1); the teammate spawns with "
+        "first-person recall of its prior work."
+    )
 
     return {
-        "restored": True,
+        "success": True,
         "run_name": run_name,
-        "previous_run": current_run_dir.name if current_run_dir else None,
-        "workflow_id": restored_workflow_id,
-        "current_phase": restored_phase,
-        "agent_count": agent_count,
-        "alive_agent_count": alive_count,
-        "killed_workers": killed_workers,
-        "caller_brief": brief,
+        "workflow_id": workflow_id,
+        "current_phase": current_phase,
+        "members_to_respawn": members_to_respawn,
+        "lead_instructions": lead_instructions,
     }
 
 
 async def call(arguments: dict[str, Any] | None) -> list[mcp_types.TextContent]:
     args = arguments or {}
-    result = await _do_restore(args)
+    try:
+        result = await _do_restore(args)
+    except RestoreOperonSessionError as exc:
+        result = {
+            "success": False,
+            "error": "validation_failed",
+            "details": str(exc),
+        }
     return [mcp_types.TextContent(type="text", text=json.dumps(result))]
 
 
-__all__ = ["TOOL_NAME", "INPUT_SCHEMA", "tool_descriptor", "call", "RestoreOperonSessionError"]
+__all__ = [
+    "TOOL_NAME",
+    "INPUT_SCHEMA",
+    "tool_descriptor",
+    "call",
+    "RestoreOperonSessionError",
+]

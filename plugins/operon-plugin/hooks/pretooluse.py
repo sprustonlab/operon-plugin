@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""PreToolUse hook entrypoint (Phase 6 fix + Phase 6 followup).
+"""PreToolUse hook entrypoint (Phase 6 fix + Phase 6 followup +
+Land 5 WA1).
 
 Replaces the prior `type: mcp_tool` hook wiring per SPEC §8 + §12.
 The mcp_tool form had a chicken-and-egg: every tool call (including
@@ -7,6 +8,20 @@ calls TO operon's own MCP tools) fires PreToolUse, which routes via
 MCP, which causes recursion / "MCP server not connected" errors
 during the connection race. Hookify's reference plugin (Anthropic's
 own example) uses `type: command` for exactly this reason.
+
+Two responsibilities branch on `tool_name`:
+
+  * `tool_name == "Agent"` -> WA1 transcript injection (Land 5, see
+    v2.9 section 5.1). The hook reads operon-installed sidechain
+    transcripts for the about-to-spawn teammate's `agentType` and
+    prepends them to `tool_input.prompt` so the re-spawned teammate
+    has first-person recall. The Agent branch BYPASSES the guardrail
+    evaluation pipeline (guardrails and WA1 do not interact) and
+    does NOT write to guardrail_log.jsonl. All failure modes are
+    fail-open: a discovery / read / decode error logs to stderr and
+    returns the input unchanged so the spawn proceeds normally.
+  * Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule
+    evaluation, the original Phase 6 path.
 
 This script implements TWO evaluation passes per the Phase 6
 followup brief:
@@ -172,7 +187,7 @@ def _deny_with_ack_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
     msg = (
         f"{rule_message.strip()}\n\n"
         f"Call mcp__operon__acknowledge_warning("
-        f"rule_id=\"{rule_id}\", reason=\"<explain why>\") "
+        f'rule_id="{rule_id}", reason="<explain why>") '
         f"if this is intentional, then retry the tool."
     )
     return _deny_output(msg)
@@ -185,7 +200,7 @@ def _deny_with_override_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
     msg = (
         f"{rule_message.strip()}\n\n"
         f"Call mcp__operon__request_override("
-        f"rule_id=\"{rule_id}\", reason=\"<explain why>\") "
+        f'rule_id="{rule_id}", reason="<explain why>") '
         f"to request user approval, then retry the tool."
     )
     return _deny_output(msg)
@@ -302,6 +317,7 @@ def _load_active_workflow_manifest():
         return None, None
     try:
         import yaml as _yaml
+
         data = _yaml.safe_load(decl.source_path.read_text(encoding="utf-8"))
     except Exception:
         return None, None
@@ -315,6 +331,170 @@ def _emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload))
     sys.stdout.flush()
     raise SystemExit(0)
+
+
+# ===========================================================================
+# Land 5: WA1 transcript injection for the `Agent` tool
+# ===========================================================================
+# Per v2.9 section 5.1: on every Agent tool call the hook prepends the
+# target teammate's prior sidechain transcripts (mtime-ascending) to
+# `tool_input.prompt`. Fresh spawns (no prior transcripts) return the
+# input unchanged. All errors fail open -- the spawn must work even if
+# transcript discovery fails. Guardrail-log is NOT written from this
+# path (the audit log is for the deny/warn/log evaluation pipeline,
+# not for WA1).
+# ===========================================================================
+
+
+def _wa1_cwd_mangled() -> str:
+    """Project-dir name for the current cwd per Claude Code convention.
+
+    Each `/` in the absolute cwd becomes `-`. Verified empirically
+    against `~/.claude/projects/-tmp-operon-land4-test/` (Land 4
+    demo, 2026-05-21).
+    """
+    from pathlib import Path
+
+    return str(Path.cwd().resolve()).replace("/", "-")
+
+
+def _wa1_discover_transcripts(agent_type: str) -> list:
+    """Return absolute paths of `agent-<hash>.jsonl` transcripts whose
+    sibling `agent-<hash>.meta.json` has `agentType == agent_type`,
+    sorted by file mtime ascending.
+
+    Walks `~/.claude/projects/<cwd-mangled>/*/subagents/` across all
+    parent-session directories so a teammate that participated in
+    multiple lead sessions has its transcripts unioned and
+    temporally ordered. Returns `[]` on any filesystem / parse
+    failure (fail-open).
+    """
+    from pathlib import Path
+
+    project_dir = Path.home() / ".claude" / "projects" / _wa1_cwd_mangled()
+    if not project_dir.is_dir():
+        return []
+    matches: list = []
+    try:
+        meta_iter = project_dir.glob("*/subagents/agent-*.meta.json")
+    except OSError:
+        return []
+    for meta_path in meta_iter:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("agentType") != agent_type:
+            continue
+        jsonl_path = meta_path.parent / (
+            meta_path.name[: -len(".meta.json")] + ".jsonl"
+        )
+        if not jsonl_path.is_file():
+            continue
+        try:
+            mtime = jsonl_path.stat().st_mtime
+        except OSError:
+            continue
+        matches.append((mtime, jsonl_path))
+    matches.sort(key=lambda t: t[0])
+    return [str(p) for _mt, p in matches]
+
+
+def _wa1_inject_transcripts(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return an updated `tool_input` dict with prior transcripts
+    prepended to the prompt, or the input unchanged on any miss.
+
+    Fail-open contract: every failure path returns the input
+    unchanged so the spawn proceeds with whatever the lead's LLM
+    originally wrote. Errors are logged to stderr only.
+    """
+    if not isinstance(tool_input, dict):
+        sys.stderr.write("[pretooluse][wa1] tool_input not a dict; fail-open\n")
+        return tool_input
+
+    # The runtime's Agent tool input shape is documented as carrying
+    # `subagent_type`, `name`, `team_name`, `prompt`. We resolve the
+    # teammate's agentType from `subagent_type` (the lookup key for
+    # Anthropic's subagent definition; same value our
+    # subagent_install module installs under `<role>.md`). Fall back
+    # to `name` if subagent_type is absent for any reason.
+    agent_type = tool_input.get("subagent_type")
+    if not isinstance(agent_type, str) or not agent_type:
+        agent_type = tool_input.get("name")
+    if not isinstance(agent_type, str) or not agent_type:
+        sys.stderr.write(
+            "[pretooluse][wa1] no subagent_type/name in tool_input; fail-open\n"
+        )
+        return tool_input
+
+    original_prompt = tool_input.get("prompt")
+    if not isinstance(original_prompt, str):
+        original_prompt = ""
+
+    try:
+        transcripts = _wa1_discover_transcripts(agent_type)
+    except Exception as exc:  # noqa: BLE001 -- fail-open on any error
+        sys.stderr.write(f"[pretooluse][wa1] discovery error: {exc!r}; fail-open\n")
+        return tool_input
+
+    if not transcripts:
+        # Fresh spawn (no prior transcripts). Nothing to inject.
+        sys.stderr.write(
+            f"[pretooluse][wa1] no prior transcripts for agentType="
+            f"{agent_type!r}; fresh spawn, no mutation\n"
+        )
+        return tool_input
+
+    # Concatenate raw JSONL contents in mtime-ascending order
+    # (matches v2.9 section 5.1 step 3: "concatenate the contents in
+    # that order").
+    parts: list[str] = []
+    for path_str in transcripts:
+        try:
+            with open(path_str, encoding="utf-8") as fp:
+                parts.append(fp.read())
+        except OSError as exc:
+            sys.stderr.write(
+                f"[pretooluse][wa1] failed to read {path_str}: {exc}; "
+                f"skipping that transcript\n"
+            )
+            continue
+    if not parts:
+        return tool_input
+    concatenated = "\n".join(parts)
+
+    mutated_prompt = (
+        "[PRIOR SESSION TRANSCRIPTS -- restored by operon WA1]\n\n"
+        f"{concatenated}\n\n"
+        "---\n\n"
+        f"{original_prompt}"
+    )
+    new_input = dict(tool_input)
+    new_input["prompt"] = mutated_prompt
+    sys.stderr.write(
+        f"[pretooluse][wa1] injected {len(parts)} transcript(s) "
+        f"({sum(len(p) for p in parts)} bytes) for agentType={agent_type!r}\n"
+    )
+    return new_input
+
+
+def _wa1_output(updated_input: dict[str, Any]) -> dict[str, Any]:
+    """Build the PreToolUse hook response that mutates tool input.
+
+    Per Claude Code hooks-reference: returning
+    `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+    "updatedInput": <dict>}}` replaces the tool input the runtime
+    feeds to the model's spawn. No `permissionDecision` field --
+    WA1 never blocks; it only mutates.
+    """
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": updated_input,
+        }
+    }
 
 
 def main() -> None:
@@ -352,6 +532,24 @@ def main() -> None:
         else:
             tool_input = {}
 
+    # ---- LAND 5: WA1 TRANSCRIPT INJECTION FOR THE Agent TOOL --------
+    # Branch BEFORE the guardrail evaluation pipeline. Agent calls are
+    # not subject to operon's guardrail rules (the rules target
+    # side-effectful tools like Bash/Edit/Write). WA1 mutates
+    # tool_input.prompt to prepend prior sidechain transcripts so a
+    # re-spawned teammate has first-person recall; on fail-open paths
+    # the input is returned unchanged and the spawn proceeds normally.
+    # No audit log row is written here (guardrail_log.jsonl is for the
+    # deny/warn/log pipeline, not for WA1).
+    if tool_name == "Agent":
+        try:
+            updated = _wa1_inject_transcripts(tool_input)
+        except Exception as exc:  # noqa: BLE001 -- fail-open on any error
+            sys.stderr.write(f"[pretooluse][wa1] fatal in inject: {exc!r}; fail-open\n")
+            updated = tool_input
+        _emit(_wa1_output(updated))
+        return
+
     # ---- FAIL-CLOSED PASS ------------------------------------------
     # Hardcoded safety patterns evaluated BEFORE the full rules engine.
     # These fire even when rules.yaml is missing / identity is
@@ -366,7 +564,10 @@ def main() -> None:
     agent_name, role, current_phase = _resolve_identity()
     _log.debug(
         "tool=%s role=%r phase=%r agent=%r failclosed=%s",
-        tool_name, role, current_phase, agent_name,
+        tool_name,
+        role,
+        current_phase,
+        agent_name,
         bool(failclosed),
     )
 
@@ -380,7 +581,9 @@ def main() -> None:
         if handle:
             try:
                 token = rules.find_active_token(
-                    kind="override", rule_id=rule_id, agent_handle=handle,
+                    kind="override",
+                    rule_id=rule_id,
+                    agent_handle=handle,
                 )
             except Exception as exc:
                 _log.warning("failclosed token lookup error: %s", exc)
@@ -478,7 +681,8 @@ def main() -> None:
         if handle and decision.rule_id:
             try:
                 token = rules.find_active_token(
-                    kind="override", rule_id=decision.rule_id,
+                    kind="override",
+                    rule_id=decision.rule_id,
                     agent_handle=handle,
                 )
             except Exception as exc:
@@ -490,9 +694,7 @@ def main() -> None:
                 return
         _log_row("blocked", "deny")
         _emit(
-            _deny_with_override_hint(
-                decision.rule_id or "<unknown>", decision.message
-            )
+            _deny_with_override_hint(decision.rule_id or "<unknown>", decision.message)
         )
         return
 
@@ -506,7 +708,8 @@ def main() -> None:
         if handle and decision.rule_id:
             try:
                 token = rules.find_active_token(
-                    kind="ack", rule_id=decision.rule_id,
+                    kind="ack",
+                    rule_id=decision.rule_id,
                     agent_handle=handle,
                 )
             except Exception as exc:
@@ -521,11 +724,7 @@ def main() -> None:
         # acknowledge_warning. Claude Code's native `ask` is bypassable
         # by permission mode; deny+ack-hint keeps the loop closed
         # to the LLM, not the user.
-        _emit(
-            _deny_with_ack_hint(
-                decision.rule_id or "<unknown>", decision.message
-            )
-        )
+        _emit(_deny_with_ack_hint(decision.rule_id or "<unknown>", decision.message))
         return
 
     # action == "allow" (no rule matched)
@@ -543,10 +742,14 @@ if __name__ == "__main__":
         # tool calls when our hook itself crashes. Emit a diagnostic
         # to stderr so the failure is visible.
         sys.stderr.write(f"[pretooluse] fatal: {exc!r}\n")
-        sys.stdout.write(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-            }
-        }))
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                    }
+                }
+            )
+        )
         sys.exit(0)
