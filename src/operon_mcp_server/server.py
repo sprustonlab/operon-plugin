@@ -53,6 +53,7 @@ from .tools import list_operon_sessions as list_operon_sessions_tool
 from .tools import message_agent as message_agent_tool
 from .tools import request_override as request_override_tool
 from .tools import restore_operon_session as restore_operon_session_tool
+from .tools import send_to_member as send_to_member_tool
 from .tools import set_artifact_dir as set_artifact_dir_tool
 from .tools import spawn_agent as spawn_agent_tool
 from .tools import whoami as whoami_tool
@@ -152,6 +153,12 @@ _TOOL_VISIBILITY: dict[str, str] = {
     # control envelope; this tool is a parallel in-process entry
     # point for future use.
     arm_nudge_timer_tool.TOOL_NAME: _VISIBILITY_HIDDEN,
+    # Agent Teams pivot Land 2: inbox-write primitive surface.
+    # All-visible so any role can write into the runtime-shared
+    # inbox substrate. Does NOT replace message_agent yet; this
+    # is the new surface that proves the substrate works.
+    # message_agent/broadcast_message removal lands in Land 4.
+    send_to_member_tool.TOOL_NAME: _VISIBILITY_ALL,
 }
 
 #: Routing table: tool name -> handler coroutine. Includes HIDDEN tools
@@ -181,6 +188,8 @@ _TOOL_HANDLERS = {
     restore_operon_session_tool.TOOL_NAME: restore_operon_session_tool.call,
     # Phase 8: nudge mechanism.
     arm_nudge_timer_tool.TOOL_NAME: arm_nudge_timer_tool.call,
+    # Agent Teams pivot Land 2: inbox-write primitive.
+    send_to_member_tool.TOOL_NAME: send_to_member_tool.call,
 }
 
 #: Tool descriptors keyed by name (used by the role-scoped filter to
@@ -209,6 +218,8 @@ _TOOL_DESCRIPTORS: dict[str, mcp_types.Tool] = {
     # Phase 6.5 tools.
     list_operon_sessions_tool.TOOL_NAME: list_operon_sessions_tool.tool_descriptor(),
     restore_operon_session_tool.TOOL_NAME: restore_operon_session_tool.tool_descriptor(),
+    # Agent Teams pivot Land 2: inbox-write primitive surface.
+    send_to_member_tool.TOOL_NAME: send_to_member_tool.tool_descriptor(),
 }
 
 _log = logging.getLogger(__name__)
