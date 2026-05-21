@@ -26,7 +26,7 @@ from typing import Any
 import mcp.types as mcp_types
 from mcp.server.lowlevel.server import request_ctx
 
-from .. import mailbox, roster, workflow
+from .. import inbox, mailbox, paths, roster, workflow
 from . import spawn_agent as spawn_agent_tool
 
 #: MCP tool name. Coordinator-only per SPEC §7.1.
@@ -88,9 +88,7 @@ def _require_coordinator() -> tuple[str, str]:
         )
     role = record.get("role")
     if not isinstance(role, str) or not role:
-        raise AdvancePhaseError(
-            "Coordinator handle record is missing 'role' field."
-        )
+        raise AdvancePhaseError("Coordinator handle record is missing 'role' field.")
     return name, role
 
 
@@ -119,6 +117,164 @@ def _build_elicit_closure():
         return bool(content.get("confirm"))
 
     return _elicit
+
+
+# -- Land 3: team inbox broadcast -----------------------------------------
+
+
+def _read_phase_brief(
+    workflow_root: Any, role: str, new_phase: str
+) -> tuple[str, str] | None:
+    """Resolve the per-role phase brief for ``new_phase``.
+
+    Lookup order (matches Land 3 dispatch's priority rules):
+
+      1. ``<workflow_root>/<role>/<new_phase>.md`` -- role-specific
+         brief for the destination phase.
+      2. ``<workflow_root>/<new_phase>.md`` -- a phase-level brief
+         shared across roles (used as the fallback for members
+         whose name does not match a role directory, e.g. the
+         lead with name ``"team-lead"``).
+
+    Returns ``(body_text, source_path_str)`` on first hit, or
+    ``None`` if neither file exists. Bodies are returned verbatim
+    -- no frontmatter stripping (briefs in operon's workflow
+    library do not currently carry frontmatter; if that changes,
+    transform here).
+    """
+    role_path = workflow_root / role / f"{new_phase}.md"
+    if role_path.is_file():
+        try:
+            return role_path.read_text(encoding="utf-8"), str(role_path)
+        except OSError:
+            pass
+    phase_path = workflow_root / f"{new_phase}.md"
+    if phase_path.is_file():
+        try:
+            return phase_path.read_text(encoding="utf-8"), str(phase_path)
+        except OSError:
+            pass
+    return None
+
+
+def _build_brief_map(
+    workflow_root: Any,
+    members: list[dict[str, Any]],
+    from_phase: str,
+    new_phase: str,
+    excluded: set[str],
+) -> dict[str, tuple[str, str]]:
+    """Compute per-member ``(text, source)`` brief mapping for the
+    team broadcast.
+
+    For each non-excluded member with a non-empty name:
+
+      * Try the role-specific then phase-level lookup via
+        :func:`_read_phase_brief`. If a body is found, that
+        ``(body, source)`` pair is the recipient's brief.
+      * Otherwise the member gets the fallback one-liner
+        documented in the dispatch: ``"Phase advanced: <old> ->
+        <new> (no brief content found)"``. ``source`` is the
+        sentinel ``"<fallback>"`` so the response distinguishes
+        real-file briefs from generated ones.
+
+    A small ``[operon:phase-advance <new_phase>]`` tag is
+    prepended to every body so the recipient's session can
+    recognise the brief as operon-originated phase context
+    (mirrors v2.9 plan section 5 step 4d).
+    """
+    brief_map: dict[str, tuple[str, str]] = {}
+    fallback_body = (
+        f"Phase advanced: {from_phase} -> {new_phase} (no brief content found)."
+    )
+    fallback_source = "<fallback>"
+    for m in members:
+        name = m.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if name in excluded:
+            continue
+        looked_up = _read_phase_brief(workflow_root, name, new_phase)
+        if looked_up is None:
+            body, source = fallback_body, fallback_source
+        else:
+            body, source = looked_up
+        tagged = f"[operon:phase-advance {new_phase}]\n\n{body.rstrip()}\n"
+        brief_map[name] = (tagged, source)
+    return brief_map
+
+
+def _broadcast_phase_brief(
+    workflow_root: Any,
+    from_phase: str,
+    new_phase: str,
+) -> dict[str, Any]:
+    """Land 3: deliver per-role phase briefs to every team member's
+    inbox after a successful phase advance.
+
+    Resolves the team name from the active operon run via
+    :func:`paths.active_run_dir` (Land 1 v2 convention:
+    team_name == run_name). Reads the team roster fresh from the
+    runtime-owned team config (no cache, per v2.9 plan section
+    4.6) and writes one inbox entry per recipient via
+    :func:`inbox.broadcast_to_team`. ``operon`` is excluded (it is
+    the writer); the lead is included so the user's foreground
+    session also sees the brief landed.
+
+    Returns the manifest documented in the dispatch::
+
+        {
+          "team": "<team_name>",
+          "recipients": [
+            {"name": "...", "inbox_path": "...", "retries": int,
+             "brief_source": "<path or <fallback>>"},
+            ...
+          ],
+          "skipped": ["operon", ...],
+          "errors": [{"name": "...", "error": "..."}, ...],
+        }
+
+    On any unrecoverable resolution failure (no active run, no
+    team config, etc.) returns a structured ``error`` key in the
+    manifest rather than raising -- the phase IS advanced by the
+    time we get here, so a broadcast failure must not roll it back.
+    """
+    try:
+        run_dir = paths.active_run_dir()
+    except paths.OperonPathError as exc:
+        return {
+            "team": None,
+            "recipients": [],
+            "skipped": [],
+            "errors": [{"name": "<active-run>", "error": str(exc)}],
+        }
+    team_name = run_dir.name
+    excluded = {"operon"}
+    members = inbox.read_team_members(team_name)
+    brief_map = _build_brief_map(
+        workflow_root=workflow_root,
+        members=members,
+        from_phase=from_phase,
+        new_phase=new_phase,
+        excluded=excluded,
+    )
+
+    def text_for(name: str) -> str | None:
+        pair = brief_map.get(name)
+        return pair[0] if pair else None
+
+    result = inbox.broadcast_to_team(
+        team_name=team_name,
+        text_for=text_for,
+        exclude_names=tuple(excluded),
+    )
+
+    # Fold per-recipient brief_source into the recipients records.
+    for rec in result["recipients"]:
+        name = rec.get("name")
+        pair = brief_map.get(name) if isinstance(name, str) else None
+        rec["brief_source"] = pair[1] if pair else None
+    return result
 
 
 def _notify_other_agents(
@@ -177,13 +333,9 @@ async def _do_advance() -> dict[str, Any]:
     workflow_id = state.get("workflow_id")
     current_phase = state.get("current_phase")
     if not isinstance(workflow_id, str) or not workflow_id:
-        raise AdvancePhaseError(
-            "phase_state.json missing non-empty 'workflow_id'."
-        )
+        raise AdvancePhaseError("phase_state.json missing non-empty 'workflow_id'.")
     if not isinstance(current_phase, str) or not current_phase:
-        raise AdvancePhaseError(
-            "phase_state.json missing non-empty 'current_phase'."
-        )
+        raise AdvancePhaseError("phase_state.json missing non-empty 'current_phase'.")
 
     try:
         decl = workflow.load_workflow(workflow_id)
@@ -251,11 +403,22 @@ async def _do_advance() -> dict[str, Any]:
     # Best-effort notification to non-Coordinator Agents per §11.1 step 4.
     notified = _notify_other_agents(coord_name, current_phase, next_phase)
 
+    # Agent Teams Pivot Land 3: deliver per-role phase briefs to
+    # every team member's inbox file via the inbox-write primitive
+    # (Land 2). This runs in parallel with the legacy mailbox
+    # notification above; legacy substrate stays intact until
+    # Land 4. The broadcast is best-effort: per-recipient write
+    # failures are captured in the returned manifest and do NOT
+    # roll back the phase advance (already committed above).
+    team_broadcast = _broadcast_phase_brief(
+        workflow_root=workflow_root,
+        from_phase=current_phase,
+        new_phase=next_phase,
+    )
+
     # Phase 13 Finding 3: render the caller's role brief for the
     # NEW phase so the Coordinator's LLM gets per-phase context.
-    brief = spawn_agent_tool.assemble_caller_brief(
-        workflow_id, coord_role, next_phase
-    )
+    brief = spawn_agent_tool.assemble_caller_brief(workflow_id, coord_role, next_phase)
     if brief is None:
         brief = spawn_agent_tool.absent_caller_brief(
             workflow_id,
@@ -276,6 +439,8 @@ async def _do_advance() -> dict[str, Any]:
         "outcomes": outcomes_payload,
         "notified": notified,
         "caller_brief": brief,
+        # Land 3: per-role phase brief broadcast manifest.
+        "team_broadcast": team_broadcast,
     }
 
 

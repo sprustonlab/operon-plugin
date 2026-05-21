@@ -52,6 +52,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -193,6 +194,12 @@ def build_operon_entry(team_name: str, text: str) -> dict[str, Any]:
       * ``timestamp`` : ISO8601 UTC ms-precision with trailing ``Z``.
       * ``color`` : looked up from the team config; falls back to
         ``"magenta"``.
+      * ``type``  : the literal string ``"message"``. Land 3
+        empirical addition: today's demo showed every on-disk inbox
+        entry carries this field. Either the runtime adds it
+        post-write on delivery, or some other process does. To stay
+        fully indistinguishable from runtime-authored writes, operon
+        pre-includes it on every entry it produces.
       * ``read``  : ``False`` -- the runtime flips to ``True`` after
         delivery.
     """
@@ -201,6 +208,7 @@ def build_operon_entry(team_name: str, text: str) -> dict[str, Any]:
         "text": text,
         "timestamp": _now_timestamp_z(),
         "color": _lookup_operon_color(team_name),
+        "type": "message",
         "read": False,
     }
 
@@ -287,3 +295,118 @@ def write_to_member_inbox(
         f"Failed to write to inbox '{path}' after {max_retries} "
         f"attempts (stat-retry exhausted)."
     ) from last_exc
+
+
+def read_team_members(team_name: str) -> list[dict[str, Any]]:
+    """Read the team roster from
+    ``~/.claude/teams/<team>/config.json`` and return its
+    ``members`` list. Returns ``[]`` if the config is missing,
+    malformed, or carries no members list.
+
+    Read-on-demand per v2.9 plan section 4.6 (no caching): the
+    runtime mutates this file on every spawn or shutdown
+    handshake, so any cache opens a staleness window. Callers
+    should call this fresh each time they need the roster.
+    """
+    config_path = TEAMS_DIR / team_name / "config.json"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    members = data.get("members")
+    if not isinstance(members, list):
+        return []
+    return [m for m in members if isinstance(m, dict)]
+
+
+def broadcast_to_team(
+    team_name: str,
+    text_for: Callable[[str], str | None],
+    *,
+    exclude_names: Iterable[str] = ("operon",),
+) -> dict[str, Any]:
+    """Write an operon-authored entry to every team member's inbox.
+
+    For each member in the live team roster (re-read fresh from the
+    team config per v2.9 plan section 4.6):
+
+      * If the member's name is in ``exclude_names``, skip it
+        (recorded under ``skipped`` in the return value).
+      * Else call ``text_for(member_name)``. If it returns
+        ``None``, skip the member (also recorded under
+        ``skipped``). This is how the caller signals "no brief
+        for this role" without ever attempting an empty write.
+      * Else build an entry via :func:`build_operon_entry` and
+        deliver via :func:`write_to_member_inbox`. The per-recipient
+        retry budget is the function default.
+
+    Per-recipient write failures do NOT abort the broadcast --
+    each error is captured in ``errors`` so the caller can surface
+    a structured manifest to the lead's LLM. The broadcast is
+    best-effort by design: operon's phase advance is already
+    committed to ``phase_state.json`` by the time advance_phase
+    invokes this; a downstream inbox-write failure must not roll
+    back the advance.
+
+    Returns::
+
+        {
+          "team": "<team_name>",
+          "recipients": [
+            {"name": "<member>", "inbox_path": "<path>",
+             "retries": <int>},
+            ...
+          ],
+          "skipped": ["<member>", ...],
+          "errors": [{"name": "<member>", "error": "<message>"}, ...],
+        }
+    """
+    excluded = set(exclude_names)
+    members = read_team_members(team_name)
+
+    recipients: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    errors: list[dict[str, str]] = []
+
+    for m in members:
+        name = m.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if name in excluded:
+            skipped.append(name)
+            continue
+        try:
+            body = text_for(name)
+        except Exception as exc:  # noqa: BLE001 -- caller closure can raise anything
+            errors.append({"name": name, "error": f"text_for raised: {exc}"})
+            continue
+        if body is None:
+            skipped.append(name)
+            continue
+        entry = build_operon_entry(team_name=team_name, text=body)
+        try:
+            result = write_to_member_inbox(
+                team_name=team_name,
+                recipient_name=name,
+                entry=entry,
+            )
+        except InboxWriteError as exc:
+            errors.append({"name": name, "error": str(exc)})
+            continue
+        recipients.append(
+            {
+                "name": name,
+                "inbox_path": result["inbox_path"],
+                "retries": result["retries"],
+            }
+        )
+
+    return {
+        "team": team_name,
+        "recipients": recipients,
+        "skipped": skipped,
+        "errors": errors,
+    }
