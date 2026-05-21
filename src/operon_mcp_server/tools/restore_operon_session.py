@@ -11,12 +11,18 @@ project can be brought back to a workable state.
 
 User-side framing (Boaz, 2026-05-21): "I want a RESTORE not a
 resume, it should be for an activated team project only."
-Translation:
+Translation (with the Land 5 v2 amendment, 2026-05-21):
 
   * Operon owns the operation; this MCP tool is the entry point.
-  * Precondition: previously-activated operon team project ->
-    both the team config at ``~/.claude/teams/<run>/config.json``
-    AND ``<cwd>/.operon/<run>/phase_state.json`` exist on disk.
+  * REQUIRED precondition: ``<cwd>/.operon/<run>/phase_state.json``
+    exists -- the proof an operon workflow was activated.
+  * OPTIONAL precondition: ``~/.claude/teams/<run>/config.json``.
+    When present, the response carries a ``members_to_respawn``
+    manifest derived from the team's ``members[]``. When absent,
+    restore still succeeds as a lead-only operon session and
+    surfaces a ``suggested_members`` list (derived from prior
+    sidechain transcripts on disk) plus a ``call TeamCreate
+    first`` lead-instructions hint.
   * Generic ``/resume`` of a non-operon Claude Code session is
     NOT in this tool's scope (the Anthropic runtime handles
     lead-side ``/resume``; operon's job is the teammate respawn
@@ -27,12 +33,14 @@ Two entry modes (matches the claudechic ``chicsessions.py`` /
 in ``plugins/operon-plugin/hooks/pretooluse.py`` is the WA1
 substitute for the SDK ``resume=session_id`` parameter):
 
-  * ``run_name`` supplied: skip the picker, validate the target,
-    swap the active pointer, build the respawn manifest.
+  * ``run_name`` supplied: skip the picker, validate the
+    REQUIRED precondition, swap the active pointer, branch on
+    team-config presence to build the response.
   * ``run_name`` omitted: discover candidate runs via
     ``list_operon_sessions._do_list()`` filtered to runs whose
-    BOTH team config + phase_state are present, surface a
-    single-select picker elicitation, then proceed.
+    phase_state.json is present (team config not required),
+    surface a single-select picker elicitation (each entry
+    tagged ``team=present|absent``), then proceed.
 
 This tool does NOT spawn teammates itself (operon ships no
 lifecycle control over teammates per v2.9 section 6.1). It
@@ -86,10 +94,11 @@ INPUT_SCHEMA: dict[str, Any] = {
         "run_name": {
             "type": "string",
             "description": (
-                "Name of the operon team project to restore. If "
-                "omitted, the tool lists existing projects (filtered "
-                "to those with BOTH a team config and a phase_state) "
-                "and issues a picker."
+                "Name of the operon workflow to restore. If "
+                "omitted, the tool lists existing runs (filtered "
+                "to those with a phase_state.json) and issues a "
+                "picker that marks each candidate "
+                "team=present|absent."
             ),
         },
     },
@@ -101,15 +110,19 @@ def tool_descriptor() -> mcp_types.Tool:
     return mcp_types.Tool(
         name=TOOL_NAME,
         description=(
-            "Restore a previously-activated operon team project. "
-            "Precondition: ~/.claude/teams/<run_name>/config.json AND "
-            "<cwd>/.operon/<run_name>/phase_state.json both exist. "
-            "Sets <cwd>/.operon/_active.json to point at the chosen "
-            "run, then returns a manifest of the team members that "
-            "need to be re-spawned via Anthropic's Agent tool. WA1 "
-            "transcript replay (v2.9 section 5.1) is delivered by the "
-            "PreToolUse hook on Agent. With no run_name argument, "
-            "surfaces a picker. Coordinator-only."
+            "Restore a previously-activated operon workflow. "
+            "Required precondition: <cwd>/.operon/<run_name>/"
+            "phase_state.json exists (proof an operon workflow was "
+            "activated). The Anthropic team config at "
+            "~/.claude/teams/<run_name>/config.json is OPTIONAL: when "
+            "present, the response includes the teammate-respawn "
+            "manifest; when absent, restore still succeeds as a "
+            "lead-only operon session and surfaces a "
+            "'call TeamCreate first' lead_instructions hint. Sets "
+            "<cwd>/.operon/_active.json to point at the chosen run. "
+            "WA1 transcript replay (v2.9 section 5.1) is delivered "
+            "by the PreToolUse hook on Agent. With no run_name "
+            "argument, surfaces a picker. Coordinator-only."
         ),
         inputSchema=INPUT_SCHEMA,
     )
@@ -132,25 +145,23 @@ def _team_config_path(run_name: str) -> Path:
     return _TEAMS_DIR / run_name / "config.json"
 
 
-def _is_operon_team_project(run_name: str, operon_dir: Path) -> tuple[bool, str | None]:
-    """Return ``(ok, reason)`` for the operon-team-project precondition.
+def _has_operon_state(run_name: str, operon_dir: Path) -> tuple[bool, str | None]:
+    """Return ``(ok, reason)`` for the operon-side precondition.
 
-    A run satisfies the precondition iff both:
+    The required precondition (Land 5 v2 amendment, coordinator
+    dispatch 2026-05-21): ``<cwd>/.operon/<run_name>/phase_state.json``
+    exists. This is the proof an operon workflow was activated
+    against this run.
 
-      1. ``~/.claude/teams/<run_name>/config.json`` exists (the
-         Anthropic runtime saw a TeamCreate for this name).
-      2. ``<cwd>/.operon/<run_name>/phase_state.json`` exists
-         (operon's activate_workflow ran against it).
+    The Anthropic team config at
+    ``~/.claude/teams/<run_name>/config.json`` is checked separately
+    by :func:`_has_team_config` and is OPTIONAL -- a workflow that
+    was activated but never had teammates spawned has no team
+    config, and restore still works for it.
 
-    Returns ``(False, "<human reason>")`` on failure; ``(True, None)``
-    on success.
+    Returns ``(False, "<human reason>")`` if phase_state is absent;
+    ``(True, None)`` otherwise.
     """
-    team_cfg = _team_config_path(run_name)
-    if not team_cfg.is_file():
-        return False, (
-            f"Team config not found at '{team_cfg}'. This run was "
-            f"never activated as an Anthropic team (no TeamCreate)."
-        )
     phase_state = operon_dir / run_name / "phase_state.json"
     if not phase_state.is_file():
         return False, (
@@ -158,6 +169,14 @@ def _is_operon_team_project(run_name: str, operon_dir: Path) -> tuple[bool, str 
             f"run was never activated by operon's activate_workflow."
         )
     return True, None
+
+
+def _has_team_config(run_name: str) -> bool:
+    """Return True iff ``~/.claude/teams/<run_name>/config.json``
+    exists. Optional precondition -- restore still succeeds when
+    this is False (lead-only operon session).
+    """
+    return _team_config_path(run_name).is_file()
 
 
 def _read_team_members_for_restore(run_name: str) -> list[dict[str, Any]]:
@@ -284,9 +303,77 @@ def _build_respawn_manifest(run_name: str) -> list[dict[str, Any]]:
     return manifest
 
 
+def _discover_suggested_members() -> list[dict[str, Any]]:
+    """Walk every sidechain meta in the current cwd's project dir and
+    return one manifest entry per distinct ``agentType`` seen,
+    excluding operon + team-lead.
+
+    Used by the team-config-absent branch of restore: the team
+    roster does not exist yet (the user previously cleaned it up or
+    never ran TeamCreate after activate_workflow), but the sidechain
+    transcripts from the prior session ARE on disk. Each distinct
+    agentType the user previously spawned becomes a suggested
+    member; the LLM can call ``TeamCreate`` + ``Agent`` to bring
+    them back, and operon's WA1 PreToolUse hook will replay the
+    matching transcripts at spawn time.
+
+    Returns the same per-entry shape :func:`_build_respawn_manifest`
+    produces::
+
+        {"name": "<agentType>",
+         "subagent_type": "<agentType>",
+         "sidechain_count": <int>,
+         "sidechain_paths": ["<path>", ...]}
+
+    The ``name`` field defaults to the agentType because we have no
+    team config to consult for a member ``name`` distinct from the
+    agentType; the lead can supply a different ``name`` to ``Agent``
+    when it spawns the teammate. Empirically the convention is
+    name == agentType for operon-installed roles (Land 1's
+    ``subagent_install`` installs definitions under ``<role>.md``),
+    so this default is the right one.
+
+    Defensive: returns ``[]`` if the projects dir is absent.
+    """
+    project_dir = Path.home() / ".claude" / "projects" / _cwd_mangled()
+    if not project_dir.is_dir():
+        return []
+    agent_types: set[str] = set()
+    for meta_path in project_dir.glob("*/subagents/agent-*.meta.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        at = meta.get("agentType")
+        if not isinstance(at, str) or not at:
+            continue
+        if at in (_OPERON_MEMBER_NAME, _LEAD_MEMBER_NAME):
+            continue
+        agent_types.add(at)
+    manifest: list[dict[str, Any]] = []
+    for agent_type in sorted(agent_types):
+        transcripts = _discover_sidechain_transcripts(agent_type)
+        manifest.append(
+            {
+                "name": agent_type,
+                "subagent_type": agent_type,
+                "sidechain_count": len(transcripts),
+                "sidechain_paths": [str(p) for p in transcripts],
+            }
+        )
+    return manifest
+
+
 async def _pick_run_name() -> str | None:
-    """Surface a picker over runs that satisfy the operon-team-project
-    precondition.
+    """Surface a picker over runs that have operon phase state on
+    disk.
+
+    Land 5 v2 amendment: filter is operon-state-only; team config is
+    NOT required for picker eligibility. Each candidate carries a
+    short ``team=present|absent`` marker so the user can see at a
+    glance which sessions had teammates and which were lead-only.
 
     Returns the chosen ``run_name``, or ``None`` if the user declined
     or no candidates exist.
@@ -298,28 +385,27 @@ async def _pick_run_name() -> str | None:
     except paths.OperonPathError:
         return None
 
-    candidates: list[tuple[str, str, str]] = []
+    candidates: list[tuple[str, str, str, str]] = []
     for s in raw_sessions:
         rn = s.get("run_name")
         if not isinstance(rn, str) or not rn:
             continue
-        ok, _reason = _is_operon_team_project(rn, op_dir)
+        ok, _reason = _has_operon_state(rn, op_dir)
         if not ok:
             continue
         wf = s.get("workflow_id") or "?"
         ph = s.get("current_phase") or "?"
-        candidates.append((rn, wf, ph))
+        tc_marker = "team=present" if _has_team_config(rn) else "team=absent"
+        candidates.append((rn, wf, ph, tc_marker))
     if not candidates:
         return None
 
-    lines = ["Pick the operon team project to restore:\n"]
+    lines = ["Pick the operon workflow to restore:\n"]
     choices: list[str] = []
-    for rn, wf, ph in candidates:
-        lines.append(f"  - {rn}  (workflow={wf}, phase={ph})")
+    for rn, wf, ph, tc in candidates:
+        lines.append(f"  - {rn}  (workflow={wf}, phase={ph}, {tc})")
         choices.append(rn)
-    return await elicit.select_one(
-        "\n".join(lines), choices, title="Operon team project"
-    )
+    return await elicit.select_one("\n".join(lines), choices, title="Operon workflow")
 
 
 async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
@@ -342,9 +428,8 @@ async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
                 "success": False,
                 "error": "no_candidates_or_user_declined",
                 "details": (
-                    "No operon team projects (runs with both team "
-                    "config and phase_state) were found, or the user "
-                    "declined the picker."
+                    "No operon workflows (runs with a phase_state.json) "
+                    "were found, or the user declined the picker."
                 ),
             }
     else:
@@ -357,11 +442,13 @@ async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
     except paths.OperonPathError as exc:
         raise RestoreOperonSessionError(str(exc)) from exc
 
-    ok, reason = _is_operon_team_project(run_name, op_dir)
+    # Step 1: REQUIRED precondition -- operon phase state for the
+    # chosen run must exist (Land 5 v2 amendment).
+    ok, reason = _has_operon_state(run_name, op_dir)
     if not ok:
         return {
             "success": False,
-            "error": "not_an_operon_team_project",
+            "error": "no_operon_state_for_run",
             "details": reason,
             "run_name": run_name,
         }
@@ -392,24 +479,52 @@ async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
             exc,
         )
 
-    members_to_respawn = _build_respawn_manifest(run_name)
+    # Step 2: OPTIONAL precondition -- branch on team config presence.
+    if _has_team_config(run_name):
+        members_to_respawn = _build_respawn_manifest(run_name)
+        lead_instructions = (
+            "For each member in members_to_respawn, call "
+            "Agent(subagent_type=<subagent_type>, team_name="
+            f"{run_name!r}, name=<name>, prompt=<your continuation "
+            "instruction>). Operon's PreToolUse hook on Agent "
+            "injects the matching sidechain transcripts in front of "
+            "your prompt (WA1 -- v2.9 section 5.1); the teammate "
+            "spawns with first-person recall of its prior work."
+        )
+        return {
+            "success": True,
+            "run_name": run_name,
+            "workflow_id": workflow_id,
+            "current_phase": current_phase,
+            "team_config": "present",
+            "members_to_respawn": members_to_respawn,
+            "lead_instructions": lead_instructions,
+        }
 
+    # team_config == "absent": no Anthropic team scaffold, but the
+    # operon side is intact. Walk the project's sidechain transcripts
+    # so the LLM can see which teammates were previously alive and
+    # decide whether to recreate the team.
+    suggested = _discover_suggested_members()
     lead_instructions = (
-        "For each member in members_to_respawn, call "
-        "Agent(subagent_type=<subagent_type>, team_name="
-        f"{run_name!r}, name=<name>, prompt=<your continuation "
-        "instruction>). Operon's PreToolUse hook on Agent injects "
-        "the matching sidechain transcripts in front of your prompt "
-        "(WA1 -- v2.9 section 5.1); the teammate spawns with "
-        "first-person recall of its prior work."
+        f"Call TeamCreate(team_name={run_name!r}) first to recreate "
+        "the Anthropic team scaffold (~/.claude/teams/<run>/"
+        "config.json). Then, for each entry in suggested_members, "
+        "call Agent(subagent_type=<subagent_type>, team_name="
+        f"{run_name!r}, name=<name>, prompt='continue from prior "
+        "session'). Operon's PreToolUse hook on Agent injects the "
+        "matching sidechain transcripts (WA1 -- v2.9 section 5.1) "
+        "so the re-spawned teammate has first-person recall. If you "
+        "want a lead-only restore (no teammates), skip the Agent "
+        "calls."
     )
-
     return {
         "success": True,
         "run_name": run_name,
         "workflow_id": workflow_id,
         "current_phase": current_phase,
-        "members_to_respawn": members_to_respawn,
+        "team_config": "absent",
+        "suggested_members": suggested,
         "lead_instructions": lead_instructions,
     }
 
