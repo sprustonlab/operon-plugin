@@ -908,17 +908,195 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
                 ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
             ],
         )
-        # TODO sub_act_4_spawn_teammates
-        #   Drive the lead to spawn three teammates via Agent tool:
-        #     composability (Leadership)
-        #     implementer  (Implementation)
-        #     skeptic      (Skeptic)
-        #   Each spawn includes `run_in_background=true` and
-        #   `team_name=<RUN_NAME>` so the runtime adds them to the
-        #   team config. Wait for the team config to grow to 4
-        #   members (lead + 3 teammates). MUST-NOT-see: any spawn
-        #   for `operon` (the synthetic external member per Land 1
-        #   v2; it's added during activate_workflow, not via Agent).
+        # =============== SUB-ACT 4: spawn 3 teammates ===============
+        # User vocabulary: "Bring in the team -- a Leadership
+        # (composability), an Implementer, and a Skeptic." Q3
+        # coordinator answer pinned these three. Each is spawned
+        # via the Agent tool with run_in_background=true and
+        # team_name=<RUN_NAME>; the runtime adds them to the team
+        # config under ~/.claude/teams/<RUN_NAME>/config.json.
+        #
+        # NOTE: this sub-act is independent of the Land 4 identity
+        # regression -- the spawn path doesn't touch warn-ack
+        # consumption or role-scoped rule firing. Built construction-
+        # only here; will run after Land1's fix lands as part of the
+        # rebase verification chain (1 / 1-ext / 2 / 3 / 4 / 5).
+        recorder.set_sub_act("sub_act_4_spawn_teammates")
+        recorder.record(
+            user_observable=(
+                "The user asks for the team to be assembled. "
+                "The lead spawns composability, implementer, and "
+                "skeptic teammates via Agent. After spawn, the "
+                "team config carries five members: lead + the "
+                "synthetic operon entry (added at activate time) "
+                "+ the three teammates."
+            ),
+            precise_state={
+                "teammate_names": ["composability", "implementer", "skeptic"],
+                "team_config_path": str(
+                    teams_dir / RUN_NAME / "config.json"
+                ),
+            },
+        )
+
+        marker_4 = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Spawn three teammates on team {team} via the Agent "
+            "tool, IN A SINGLE TURN (parallel Agent calls). For "
+            "each, pass run_in_background=true and "
+            "team_name={team!r}. The three teammates:\n"
+            "  1. subagent_type=composability, name=composability, "
+            "     prompt=\"You are composability on team {team}. "
+            "     Wait for messages from the lead. When pinged, "
+            "     reply briefly.\"\n"
+            "  2. subagent_type=implementer, name=implementer, "
+            "     prompt=\"You are implementer on team {team}. "
+            "     Wait for messages from the lead. When pinged, "
+            "     reply briefly.\"\n"
+            "  3. subagent_type=skeptic, name=skeptic, "
+            "     prompt=\"You are skeptic on team {team}. Wait "
+            "     for messages from the lead. When pinged, "
+            "     reply briefly.\"\n"
+            "After all three return, report only the comma-"
+            "separated list of teammate names you spawned, "
+            "nothing else.".format(team=RUN_NAME)
+        )
+        ok_4 = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=inbox_tracker,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_4,
+        )
+        assert ok_4, (
+            "sub-act 4: assistant never reached idle after "
+            f"teammate spawn within {SUB_ACT_TIMEOUT_S}s. "
+            f"Pane:\n{driver.capture_pane()}"
+        )
+
+        # Inspect the team config and verify membership.
+        team_config_path = teams_dir / RUN_NAME / "config.json"
+        assert team_config_path.is_file(), (
+            "MUST-see: team config at "
+            f"{team_config_path} does not exist post-spawn. "
+            "TeamCreate or Agent spawn failed."
+        )
+        team_config = json.loads(
+            team_config_path.read_text(encoding="utf-8")
+        )
+        members = team_config.get("members", [])
+        member_names = {m.get("name") for m in members}
+        member_types = {
+            m.get("name"): m.get("agentType") for m in members
+        }
+
+        # MUST see: all five expected members.
+        expected_member_names = {
+            "team-lead", "operon",
+            "composability", "implementer", "skeptic",
+        }
+        missing = expected_member_names - member_names
+        unexpected = member_names - expected_member_names
+        assert not missing, (
+            f"MUST-see: missing team members {sorted(missing)}. "
+            f"Got: {sorted(member_names)}"
+        )
+
+        # MUST see: each teammate's agentType matches its name.
+        teammate_role_match = (
+            member_types.get("composability") == "composability"
+            and member_types.get("implementer") == "implementer"
+            and member_types.get("skeptic") == "skeptic"
+        )
+        assert teammate_role_match, (
+            "MUST-see: teammate agentType mismatch. Expected "
+            "name == agentType for composability, implementer, "
+            f"skeptic. Got: {member_types}"
+        )
+
+        # MUST NOT see: the runtime tried to spawn the synthetic
+        # `operon` member as a real subagent. Inspect the project's
+        # subagents dir for any agent-*.meta.json with
+        # agentType=operon (the synthetic stub).
+        recs_4 = observer.all_records()
+        # The transcript_path is the lead's session jsonl; sibling
+        # `<session-id>/subagents/` holds the spawned teammate
+        # transcripts + meta files.
+        sub_dir = transcript_path.parent / transcript_path.stem
+        sub_dir = sub_dir / "subagents"  # convention: <session>/subagents
+        operon_spawned = False
+        subagent_metas: list[dict] = []
+        if sub_dir.is_dir():
+            for meta in sorted(sub_dir.glob("agent-*.meta.json")):
+                try:
+                    md = json.loads(meta.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                md["_meta_path"] = str(meta)
+                subagent_metas.append(md)
+                if md.get("agentType") in ("operon", "operon-stub"):
+                    operon_spawned = True
+        assert not operon_spawned, (
+            "MUST-NOT-see: a subagent meta file with "
+            "agentType in {operon, operon-stub} was created. "
+            "The runtime tried to spawn operon as a real "
+            "subagent (it should remain a synthetic external "
+            "member). Subagent metas: " + json.dumps(subagent_metas)
+        )
+
+        # Additional MUST-see: at least one subagent meta exists
+        # per spawned teammate (proves the Agent tool actually
+        # created the subagents, not just team-config entries).
+        meta_types = {
+            m.get("agentType") for m in subagent_metas
+        }
+        spawned_subagent_count = sum(
+            1 for t in ("composability", "implementer", "skeptic")
+            if t in meta_types
+        )
+        # We don't require all three to have meta files (one of
+        # them may finish ahead of the others on a slow box); but
+        # at least one should be present.
+        assert spawned_subagent_count >= 1, (
+            "MUST-see: no subagent meta files for composability "
+            "/ implementer / skeptic appeared after spawn. The "
+            "Agent tool path failed."
+        )
+
+        meter.checkpoint("sub_act_4")
+        meter.assert_under_cap("sub_act_4")
+        bundle.snapshot(
+            "sub_act_4_spawn_teammates",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "member_names": sorted(member_names),
+                "member_types": member_types,
+                "missing": sorted(missing),
+                "unexpected": sorted(unexpected),
+                "operon_spawned": operon_spawned,
+                "subagent_metas_summary": [
+                    {"agentType": m.get("agentType"),
+                     "name": m.get("name"),
+                     "path": m.get("_meta_path")}
+                    for m in subagent_metas
+                ],
+            },
+        )
+        gate_check(
+            "sub_act_4",
+            must_hold=[
+                ("team config exists", team_config_path.is_file()),
+                ("all expected members present", not missing),
+                ("teammate agentType matches name", teammate_role_match),
+                ("operon NOT spawned as subagent", not operon_spawned),
+                ("at least one teammate subagent meta present",
+                 spawned_subagent_count >= 1),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+            ],
+        )
 
         # =============== SUB-ACT 5: implementer deny + override ===============
         # Gated by RUN_SUBACT_5_OVERRIDE_FLOW. Blocked on the Land
