@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -283,13 +284,26 @@ def _build_server() -> Server:
         # B.0 PROBE (disposable; remove in B.1). When OPERON_DEBUG=1
         # is set in the lead's MCP subprocess env, dump the inbound
         # request's `_meta` field plus the initialize-time
-        # `clientInfo` block to stderr so we can see whether
-        # Anthropic's runtime forwards any teammate-identifying
-        # metadata on tool calls from in-process subagents. Output
-        # is tagged ``[B0-PROBE]`` so a grep finds it cleanly. All
-        # errors are caught locally; the probe MUST NOT block
-        # dispatch even if request_ctx is unset or the SDK shape
-        # drifts.
+        # `clientInfo` block so we can see whether Anthropic's
+        # runtime forwards any teammate-identifying metadata on
+        # tool calls from in-process subagents. Output is tagged
+        # ``[B0-PROBE]`` so a grep finds it cleanly. All errors are
+        # caught locally; the probe MUST NOT block dispatch even
+        # if request_ctx is unset or the SDK shape drifts.
+        #
+        # OUTPUT CHANNEL -- empirical finding 2026-05-22: Claude Code
+        # captures the MCP subprocess's stderr ONLY during the
+        # initial connection handshake. Boot-time INFO/DEBUG logging
+        # lands in the CC mcp-logs JSONL `"error":"Server stderr: ..."`
+        # block, but post-handshake `sys.stderr.write()` calls from
+        # runtime tool dispatch are SWALLOWED. The original B.0 probe
+        # (commit b1571bf) wrote to stderr and produced nothing on
+        # disk despite two confirmed whoami calls. Route to a file
+        # instead: `<cwd>/.operon-b0-probe.log`, project-local so
+        # the probe output sits next to the operon state Boaz is
+        # debugging. Open mode "a" appends across multiple calls;
+        # IOError is caught locally so a missing/unwritable path
+        # still doesn't block dispatch.
         if os.environ.get("OPERON_DEBUG", "").strip().lower() not in {
             "",
             "0",
@@ -330,7 +344,7 @@ def _build_server() -> Server:
                                 if hasattr(caps, "model_dump")
                                 else repr(caps)
                             )
-                sys.stderr.write(
+                line = (
                     "[B0-PROBE] "
                     f"tool={name!r} "
                     f"request_id={getattr(ctx, 'request_id', None)!r} "
@@ -338,10 +352,16 @@ def _build_server() -> Server:
                     f"clientInfo={client_info!r} "
                     f"clientCaps={client_caps!r}\n"
                 )
-                sys.stderr.flush()
             except Exception as exc:  # noqa: BLE001 -- probe must not block
-                sys.stderr.write(f"[B0-PROBE] error: {exc!r}\n")
-                sys.stderr.flush()
+                line = f"[B0-PROBE] error: {exc!r}\n"
+            try:
+                probe_path = (Path.cwd() / ".operon-b0-probe.log").resolve()
+                with open(probe_path, "a", encoding="utf-8") as fp:
+                    fp.write(line)
+            except OSError:
+                # File write failed (read-only fs, perms, etc.). Probe
+                # is best-effort; do not block dispatch.
+                pass
         handler = _TOOL_HANDLERS.get(name)
         if handler is None:
             raise ValueError(f"Unknown tool: {name!r}")
