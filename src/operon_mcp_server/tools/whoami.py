@@ -1,12 +1,24 @@
 """Implementation of the `whoami` MCP tool.
 
-Per SPEC.md section 7 (`whoami` row), this tool returns the canonical
-identity tuple for the calling MCP subprocess. Per SPEC.md section 7.1
-it is visible to All roles.
+Returns the canonical identity tuple for the calling team member.
 
-The handle anchored in `OPERON_AGENT_HANDLE` is the authoritative
-identity source; LLM-supplied claims are ignored. All resolution
-happens in `operon_mcp_server.identity`.
+Land 6 (caller_name): under in-process Agent Teams, operon's MCP
+runs as a singleton in the lead's claude process and serves every
+teammate's tool call through one stdio transport. The B.0 probe
+(commits ``b1571bf`` + ``2b4a7c3``, rolled back in this commit)
+empirically confirmed Anthropic's runtime does NOT forward
+teammate-identifying metadata via the JSON-RPC `_meta` field.
+Operon distinguishes callers via the operon-controlled
+``[OPERON IDENTITY]`` directive injected into every Agent spawn's
+first turn by ``plugins/operon-plugin/hooks/pretooluse.py`` (Land 5
+WA1 branch). The directive instructs the teammate to pass
+``caller_name=<name>`` on every ``mcp__operon__*`` call. Operon
+verifies the supplied name against the team roster at
+``~/.claude/teams/<team>/config.json`` ``members[]`` before
+trusting it (impersonation defense in
+``identity.resolve_caller_identity``). When ``caller_name`` is
+omitted -- the lead's own calls -- the response describes the
+lead's bootstrap identity, preserving prior behavior.
 """
 
 from __future__ import annotations
@@ -23,7 +35,19 @@ TOOL_NAME = "whoami"
 
 INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "caller_name": {
+            "type": "string",
+            "description": (
+                "Optional. Operon team-member name supplied by the "
+                "teammate's LLM per the [OPERON IDENTITY] spawn-time "
+                "directive. Verified against the team roster; an "
+                "unknown name falls back to the lead's identity with "
+                "a warning log. Omit (or pass empty) when the LEAD's "
+                "LLM calls this tool."
+            ),
+        },
+    },
     "additionalProperties": False,
 }
 
@@ -33,11 +57,16 @@ def tool_descriptor() -> mcp_types.Tool:
     return mcp_types.Tool(
         name=TOOL_NAME,
         description=(
-            "Return the canonical identity of the calling Agent: "
-            "{name, role, workflow_id, current_phase, cwd, session_id}. "
-            "Identity is anchored to the OPERON_AGENT_HANDLE env var and "
-            "looked up in _handles/<handle>.json -- LLM-supplied claims "
-            "are ignored."
+            "Return the canonical identity of the calling team "
+            "member: {name, role, workflow_id, current_phase, cwd, "
+            "session_id, source, ...}. When called from a teammate, "
+            "pass caller_name=<your team-member name> so operon "
+            "can resolve your identity from the team roster. When "
+            "called from the lead, omit caller_name -- you receive "
+            "the lead's bootstrap identity. Identity is verified "
+            "against ~/.claude/teams/<team>/config.json members[]; "
+            "unknown caller_name values fall back to the lead's "
+            "identity with a warning."
         ),
         inputSchema=INPUT_SCHEMA,
     )
@@ -46,11 +75,16 @@ def tool_descriptor() -> mcp_types.Tool:
 async def call(arguments: dict[str, Any] | None) -> list[mcp_types.TextContent]:
     """MCP `call_tool` handler for `whoami`.
 
-    `arguments` is ignored (the input schema permits no fields). On
-    success returns a single `TextContent` with a JSON-encoded identity
-    object. On failure raises `identity.IdentityError` so the MCP
-    framework surfaces it as a tool error.
+    Resolves the caller's identity via
+    :func:`identity.resolve_caller_identity`, which delegates to the
+    bootstrap (lead) identity when ``caller_name`` is omitted and to
+    the team roster when supplied. Never raises -- the resolver
+    returns a None-filled stub if the bootstrap identity is itself
+    unbound.
     """
-    del arguments  # tool takes no inputs
-    result = identity.whoami()
+    args = arguments or {}
+    caller_name = args.get("caller_name")
+    if not isinstance(caller_name, str):
+        caller_name = None
+    result = identity.resolve_caller_identity(caller_name)
     return [mcp_types.TextContent(type="text", text=json.dumps(result))]

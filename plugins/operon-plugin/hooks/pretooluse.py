@@ -402,13 +402,48 @@ def _wa1_discover_transcripts(agent_type: str) -> list:
     return [str(p) for _mt, p in matches]
 
 
-def _wa1_inject_transcripts(tool_input: dict[str, Any]) -> dict[str, Any]:
-    """Return an updated `tool_input` dict with prior transcripts
-    prepended to the prompt, or the input unchanged on any miss.
+def _wa1_build_identity_directive(name: str) -> str:
+    """Build the Land 6 ``[OPERON IDENTITY]`` directive prepended to
+    every Agent spawn's first turn.
 
-    Fail-open contract: every failure path returns the input
-    unchanged so the spawn proceeds with whatever the lead's LLM
-    originally wrote. Errors are logged to stderr only.
+    Empirical anchor (B.0 probe, 2026-05-22): Anthropic's runtime
+    does NOT propagate teammate identity through MCP `_meta` or
+    `clientInfo` -- both lead-side and teammate-side calls land
+    with identical metadata. Operon distinguishes callers via this
+    operon-controlled prompt-injection directive: the teammate is
+    told its name and instructed to pass ``caller_name=<name>`` on
+    every ``mcp__operon__*`` call. Operon verifies the supplied
+    name against the team roster (see
+    ``identity.resolve_caller_identity``) before trusting it; a
+    mismatch falls back to the lead's identity with a warning log.
+    """
+    return (
+        f'[OPERON IDENTITY] Your operon team-member name is "{name}". '
+        f"When you call any mcp__operon__* tool, include "
+        f'caller_name="{name}" in the tool arguments so operon '
+        f"knows which teammate is asking."
+    )
+
+
+def _wa1_inject_transcripts(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return an updated `tool_input` dict with the operon identity
+    directive (Land 6) and prior sidechain transcripts (Land 5 WA1)
+    prepended to the prompt.
+
+    Order of prepended blocks (when each is present):
+      1. ``[OPERON IDENTITY] ...`` -- always emitted when ``name``
+         resolves from ``tool_input``. Even on a fresh spawn (no
+         transcripts) the directive still fires; that is what
+         distinguishes teammate vs lead on subsequent mcp calls.
+      2. ``[PRIOR SESSION TRANSCRIPTS -- restored by operon WA1]``
+         + concatenated JSONL -- only when prior transcripts exist
+         for the teammate's ``agentType`` (Land 5 unchanged).
+      3. ``---`` separator -- only when at least one of the blocks
+         above was prepended.
+      4. The original ``tool_input.prompt``.
+
+    Fail-open: every failure path returns the input unchanged (or
+    with whatever blocks were resolvable) so the spawn proceeds.
     """
     if not isinstance(tool_input, dict):
         sys.stderr.write("[pretooluse][wa1] tool_input not a dict; fail-open\n")
@@ -429,6 +464,14 @@ def _wa1_inject_transcripts(tool_input: dict[str, Any]) -> dict[str, Any]:
         )
         return tool_input
 
+    # Land 6: the OPERON IDENTITY directive uses the runtime's
+    # ``name`` field directly (the teammate's roster slot in the team
+    # config's members[]). The transcript-discovery agent_type above
+    # may equal it, but the two resolutions are independent.
+    teammate_name = tool_input.get("name")
+    if not isinstance(teammate_name, str) or not teammate_name:
+        teammate_name = None
+
     original_prompt = tool_input.get("prompt")
     if not isinstance(original_prompt, str):
         original_prompt = ""
@@ -437,15 +480,7 @@ def _wa1_inject_transcripts(tool_input: dict[str, Any]) -> dict[str, Any]:
         transcripts = _wa1_discover_transcripts(agent_type)
     except Exception as exc:  # noqa: BLE001 -- fail-open on any error
         sys.stderr.write(f"[pretooluse][wa1] discovery error: {exc!r}; fail-open\n")
-        return tool_input
-
-    if not transcripts:
-        # Fresh spawn (no prior transcripts). Nothing to inject.
-        sys.stderr.write(
-            f"[pretooluse][wa1] no prior transcripts for agentType="
-            f"{agent_type!r}; fresh spawn, no mutation\n"
-        )
-        return tool_input
+        transcripts = []
 
     # Concatenate raw JSONL contents in mtime-ascending order
     # (matches v2.9 section 5.1 step 3: "concatenate the contents in
@@ -461,20 +496,36 @@ def _wa1_inject_transcripts(tool_input: dict[str, Any]) -> dict[str, Any]:
                 f"skipping that transcript\n"
             )
             continue
-    if not parts:
-        return tool_input
-    concatenated = "\n".join(parts)
 
-    mutated_prompt = (
-        "[PRIOR SESSION TRANSCRIPTS -- restored by operon WA1]\n\n"
-        f"{concatenated}\n\n"
-        "---\n\n"
-        f"{original_prompt}"
-    )
+    # Compose. Both blocks are independently optional; ``---``
+    # separator + the original prompt are emitted only when at least
+    # one prepended block is present.
+    blocks: list[str] = []
+    if teammate_name:
+        blocks.append(_wa1_build_identity_directive(teammate_name))
+    if parts:
+        concatenated = "\n".join(parts)
+        blocks.append(
+            f"[PRIOR SESSION TRANSCRIPTS -- restored by operon WA1]\n\n{concatenated}"
+        )
+
+    if not blocks:
+        # Nothing to inject. Log a diagnostic so the absence is
+        # visible in the operon stderr capture.
+        if not parts:
+            sys.stderr.write(
+                f"[pretooluse][wa1] no prior transcripts for agentType="
+                f"{agent_type!r}; fresh spawn, no identity name -- "
+                f"no mutation\n"
+            )
+        return tool_input
+
+    mutated_prompt = "\n\n".join(blocks) + "\n\n---\n\n" + original_prompt
     new_input = dict(tool_input)
     new_input["prompt"] = mutated_prompt
     sys.stderr.write(
-        f"[pretooluse][wa1] injected {len(parts)} transcript(s) "
+        f"[pretooluse][wa1] injected identity_directive={bool(teammate_name)} "
+        f"transcripts={len(parts)} "
         f"({sum(len(p) for p in parts)} bytes) for agentType={agent_type!r}\n"
     )
     return new_input

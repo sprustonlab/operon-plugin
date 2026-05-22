@@ -210,3 +210,185 @@ def whoami(start: Path | None = None) -> dict[str, Any]:
         "cwd": os.getcwd(),
         "session_id": session_id,
     }
+
+
+# -- Land 6: caller-identity resolution for team-aware tools ------------
+
+
+#: Member names that are NOT teammate-via-Agent and therefore should
+#: not be resolvable via :func:`resolve_caller_identity`.  ``"operon"``
+#: is the non-teammate MCP member; ``"team-lead"`` is the lead's own
+#: roster slot (the lead's identity is the bootstrap identity, not a
+#: team-member identity). A ``caller_name`` matching either falls
+#: back to the bootstrap path.
+_NON_TEAMMATE_MEMBER_NAMES = frozenset({"operon", "team-lead"})
+
+
+def _bootstrap_identity(start: Path | None = None) -> dict[str, Any]:
+    """Return the lead/bootstrap identity (current ``whoami()`` shape),
+    or ``None``-filled stub if the env handle is unbound.
+
+    Defensive wrapper used by :func:`resolve_caller_identity` so the
+    teammate-identity fallback never raises.
+    """
+    try:
+        base = whoami(start)
+    except IdentityError as exc:
+        _log.warning("resolve_caller_identity: bootstrap identity unbound: %s", exc)
+        return {
+            "name": None,
+            "role": None,
+            "workflow_id": None,
+            "current_phase": None,
+            "cwd": os.getcwd(),
+            "session_id": None,
+        }
+    return base
+
+
+def resolve_caller_identity(
+    caller_name: str | None,
+    start: Path | None = None,
+) -> dict[str, Any]:
+    """Land 6: resolve the calling team-member's identity.
+
+    Under in-process Agent Teams (post-pivot) operon's MCP runs in
+    the lead's claude process and serves every teammate's tool call
+    through one stdio transport. The mcp-1.x SDK exposes
+    ``request_ctx.get().meta`` per call, but the B.0 probe (commits
+    ``b1571bf`` + ``2b4a7c3``) empirically showed that Anthropic's
+    runtime does NOT forward teammate-identifying metadata on the
+    JSON-RPC `_meta` field -- both lead-side and teammate-side
+    whoami calls landed with identical ``meta.model_extra`` (only a
+    ``claudecode/toolUseId``) and identical ``clientInfo``. **Branch
+    beta** confirmed.
+
+    The mechanism here is the operon-controlled prompt-injection
+    fallback: the PreToolUse hook on the ``Agent`` tool
+    (``plugins/operon-plugin/hooks/pretooluse.py``) prepends an
+    ``[OPERON IDENTITY] ...`` directive to every spawned teammate's
+    first turn instructing it to pass ``caller_name="<name>"`` on
+    every ``mcp__operon__*`` tool call. Identity-aware tools
+    (``whoami``, ``get_agent_info``, ``get_applicable_rules``) read
+    this argument and delegate here.
+
+    Resolution rules:
+
+      * ``caller_name`` is ``None`` / empty / one of the reserved
+        non-teammate slot names (``"operon"``, ``"team-lead"``):
+        return the bootstrap identity (the lead's), tagged
+        ``source="bootstrap"``.
+      * ``caller_name`` is non-empty: look up the active team's
+        roster from ``~/.claude/teams/<team>/config.json`` (reading
+        fresh per v2.9 §4.6 -- no cache). Match by ``name``.
+          - If matched AND the member's ``backendType`` is
+            ``"in-process"`` (sanity check; in-process Agent Teams
+            is the only supported mode), return a merged identity
+            dict carrying the team-member fields and the operon-side
+            phase/workflow state, tagged ``source="team_roster"``.
+          - If no match or wrong backendType: warning log,
+            fall back to the bootstrap identity, tagged
+            ``source="bootstrap_fallback"``. The team-roster check
+            is the impersonation defense: a teammate that supplies
+            a ``caller_name`` not in the roster is treated as the
+            lead (with the warning surfacing the attempt).
+
+    Always returns a dict with at least:
+        ``name, role, workflow_id, current_phase, cwd, session_id,
+        source``
+    plus when ``source == "team_roster"``:
+        ``agent_type, color, agent_id, team_name``.
+
+    Never raises -- failures degrade to ``source="bootstrap_fallback"``
+    or a None-filled stub so downstream tools can always render a
+    response.
+    """
+    # Local import avoids a circular cycle at module-load time
+    # (inbox.py is a leaf; identity.py imports paths; both can be
+    # imported in either order, but the import-here pattern matches
+    # how restore_operon_session.py uses inbox.read_team_members).
+    from . import inbox
+
+    base = _bootstrap_identity(start)
+
+    if not isinstance(caller_name, str) or not caller_name:
+        base["source"] = "bootstrap"
+        return base
+    if caller_name in _NON_TEAMMATE_MEMBER_NAMES:
+        # An LLM claiming to be operon-the-MCP or team-lead-the-lead
+        # is conceptually self-impersonation; surface as the lead so
+        # the answer is at least factually correct, but tag the
+        # source so the audit trail shows the attempt.
+        _log.warning(
+            "resolve_caller_identity: caller_name=%r is a reserved "
+            "non-teammate member; returning lead identity",
+            caller_name,
+        )
+        base["source"] = "bootstrap_fallback"
+        return base
+
+    try:
+        team_name = paths.active_run_dir(start).name
+    except paths.OperonPathError as exc:
+        _log.warning(
+            "resolve_caller_identity: no active operon run "
+            "(caller_name=%r): %s -- falling back to lead identity",
+            caller_name,
+            exc,
+        )
+        base["source"] = "bootstrap_fallback"
+        return base
+
+    members = inbox.read_team_members(team_name)
+    matched: dict[str, Any] | None = None
+    for m in members:
+        if m.get("name") == caller_name:
+            matched = m
+            break
+    if matched is None:
+        _log.warning(
+            "resolve_caller_identity: caller_name=%r did not match any "
+            "member of team=%r; falling back to lead identity. "
+            "(Roster: %s)",
+            caller_name,
+            team_name,
+            [m.get("name") for m in members],
+        )
+        base["source"] = "bootstrap_fallback"
+        return base
+
+    backend = matched.get("backendType")
+    if backend != "in-process":
+        _log.warning(
+            "resolve_caller_identity: caller_name=%r has backendType=%r "
+            "(expected 'in-process'); falling back to lead identity",
+            caller_name,
+            backend,
+        )
+        base["source"] = "bootstrap_fallback"
+        return base
+
+    # Teammate identity. Inherit operon-side fields from the bootstrap
+    # (workflow_id, current_phase, session_id, the lead's MCP session)
+    # because they describe the operon-process state, which is shared
+    # across all callers under singleton-MCP.
+    agent_type = matched.get("agentType")
+    if not isinstance(agent_type, str) or not agent_type:
+        # Per Land 1's subagent_install convention name == agentType,
+        # so this is the natural fallback when agentType is missing.
+        agent_type = caller_name
+
+    resolved = dict(base)
+    resolved.update(
+        {
+            "name": caller_name,
+            "role": agent_type,
+            "agent_type": agent_type,
+            "color": matched.get("color"),
+            "agent_id": matched.get("agentId"),
+            "team_name": team_name,
+            "cwd": matched.get("cwd") or base.get("cwd"),
+            "source": "team_roster",
+        }
+    )
+    return resolved
