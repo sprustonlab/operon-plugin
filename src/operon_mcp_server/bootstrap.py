@@ -244,6 +244,54 @@ def _env_handle_file_exists(env_handle: str, start: Path) -> bool:
     return h_file.is_file()
 
 
+def discover_coordinator_handle(start: Path | None = None) -> str | None:
+    """Resolve an existing Coordinator handle WITHOUT bootstrapping.
+
+    Two-step discovery:
+
+      1. If ``OPERON_AGENT_HANDLE`` is set in env AND the named handle
+         file exists in the project's active run, return that handle.
+      2. Else scan ``<active-run>/_handles/`` for exactly one
+         coordinator-role handle file and return its uuid.
+      3. Else return ``None``.
+
+    Unlike :func:`auto_bootstrap_if_needed`, this function NEVER
+    creates a fresh operon-session on disk. It is the read-only
+    "find the lead" path the PreToolUse hook uses to resolve
+    identity in the hook subprocess (which Claude Code spawns from
+    the lead's CC process; the lead's CC env does NOT carry
+    OPERON_AGENT_HANDLE under singleton-MCP-in-process operation,
+    so without this helper the hook cannot map session -> handle
+    and every role-scoped rule / ack-token lookup degrades to
+    ``role=None``).
+
+    Pre-Land-4 (commit a95c18e) the multi-process MCP architecture
+    let the hook inherit the env from each spawned worker's subprocess;
+    Land 4's collapse to singleton-MCP closed that path for the lead
+    without exposing a disk-side replacement. This helper restores
+    the disk-side lookup. See the regression dispatch 2026-05-22 and
+    /tmp/operon-manual-test/.operon/default/guardrail_log.jsonl for
+    the empirical evidence (rule_fired_log rows with
+    ``agent: null, role: null`` vs ack_issued rows in the same
+    session with ``agent: "Coordinator", role: "coordinator"``).
+    """
+    here = Path(start) if start is not None else Path.cwd()
+    here = here.resolve()
+
+    # Step 1: env handle, if it resolves to a real file.
+    env_handle = os.environ.get(identity.ENV_HANDLE_VAR)
+    if env_handle and _env_handle_file_exists(env_handle, here):
+        return env_handle
+
+    # Step 2: on-disk coordinator scan.
+    try:
+        existing = _discover_existing_coordinator(here)
+    except Exception as exc:  # noqa: BLE001 -- never propagate from a discover path
+        _log.warning("discover_coordinator_handle: scan failed: %s", exc)
+        return None
+    return existing
+
+
 def auto_bootstrap_if_needed(start: Path | None = None) -> str | None:
     """Resolve or create identity context per Phase 14 dispatch.
 

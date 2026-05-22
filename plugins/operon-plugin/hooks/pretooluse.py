@@ -94,7 +94,7 @@ from typing import Any
 
 # `operon_mcp_server.identity` reads OPERON_AGENT_HANDLE + the
 # handle file; no MCP imports.
-from operon_mcp_server import identity, paths, rules, workflow
+from operon_mcp_server import bootstrap, identity, paths, rules, workflow
 
 
 # ===========================================================================
@@ -579,6 +579,40 @@ def _wa1_output(updated_input: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     _maybe_enable_debug()
+
+    # Land 4 regression fix (2026-05-22): the hook is a SEPARATE
+    # subprocess that Claude Code spawns from the lead's CC process
+    # for every PreToolUse event. Pre-Land-4 multi-process MCP let
+    # the hook inherit OPERON_AGENT_HANDLE from each spawned
+    # worker's subprocess env; Land 4's collapse to singleton-MCP
+    # closed that path for the lead (the lead's CC env does NOT
+    # carry OPERON_AGENT_HANDLE; only the lead's MCP subprocess
+    # sets it via bootstrap's in-process `_CACHED_HANDLE`, which
+    # is NOT visible from the hook subprocess). Empirically:
+    # /tmp/operon-manual-test/.operon/default/guardrail_log.jsonl
+    # rule_fired_log rows showed `agent: null, role: null` for
+    # lead-issued Bash calls while ack_issued rows in the same
+    # operon-session showed `agent: "Coordinator",
+    # role: "coordinator"` (because the ack tool runs IN the MCP
+    # subprocess, with the cache populated).
+    #
+    # Fix: at hook startup, discover the Coordinator's handle from
+    # disk and pin it in this subprocess's process-local cache so
+    # the existing `identity.read_env_handle()` call sites below
+    # resolve correctly. The discovery is read-only (never bootstraps
+    # a fresh operon-session from the hook -- creating .operon/
+    # subtrees as a side-effect of a tool call would be surprising).
+    # On no-active-operon-session, the cache stays None and all
+    # downstream identity resolution returns None gracefully (same
+    # as today; this fix only restores behavior for the populated
+    # case).
+    try:
+        discovered = bootstrap.discover_coordinator_handle()
+    except Exception as exc:  # noqa: BLE001 -- discovery must never crash hook
+        _log.warning("hook bootstrap discovery failed: %s; continuing", exc)
+        discovered = None
+    if discovered is not None:
+        identity._set_cached_handle(discovered)
 
     raw = sys.stdin.read()
     if not raw.strip():
