@@ -147,14 +147,33 @@ class TranscriptObserver:
             time.sleep(poll_s)
         return None
 
-    def last_assistant_stop(self) -> dict | None:
-        """Return the most recent assistant record with a ``stop_reason``."""
+    def last_assistant_stop(
+        self, terminal_only: bool = True
+    ) -> dict | None:
+        """Return the most recent assistant record with a stop_reason.
+
+        ``terminal_only=True`` (default) restricts to records whose
+        ``stop_reason`` indicates the END of a user-turn-handling
+        sequence (i.e. ``end_turn`` or ``max_tokens``). Intermediate
+        ``stop_reason: tool_use`` records, which occur when the
+        assistant pauses to invoke a tool but will continue, are
+        skipped. This is what callers want when waiting for an idle
+        session.
+
+        Set ``terminal_only=False`` to get any assistant message with
+        any stop_reason (legacy/debug behavior).
+        """
+        terminal = {"end_turn", "max_tokens"}
         for rec in reversed(self._records):
             if rec.get("type") != "assistant":
                 continue
             msg = rec.get("message") or {}
-            if msg.get("stop_reason"):
-                return rec
+            sr = msg.get("stop_reason")
+            if not sr:
+                continue
+            if terminal_only and sr not in terminal:
+                continue
+            return rec
         return None
 
 
