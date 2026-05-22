@@ -334,6 +334,123 @@ def _emit(payload: dict[str, Any]) -> None:
 
 
 # ===========================================================================
+# Land 7 amendment: reject teammate calls to operon identity tools
+# ===========================================================================
+# A teammate's LLM that does not yet know about the inbox-channel query
+# protocol will reflexively call mcp__operon__whoami / get_agent_info /
+# get_applicable_rules and discover the answer is the LEAD's identity --
+# costing 2-3 wasted turns before it switches channels. The PreToolUse
+# hook intercepts those calls and returns a structured deny carrying
+# the SendMessage-based instructions.
+#
+# Trick (per dispatch 2026-05-22): the hook input's `session_id` is the
+# claude conversation session id. Anthropic's team config carries
+# `leadSessionId` per team. session_id == leadSessionId => the lead
+# is calling (allow). Otherwise the caller is a teammate (deny).
+#
+# FAIL-OPEN on any inspection error -- we'd rather let a legitimate lead
+# call through and let the LLM degrade gracefully than block on a config
+# quirk.
+# ===========================================================================
+
+_OPERON_IDENTITY_MCP_TOOLS = frozenset(
+    {
+        "mcp__plugin_operon-plugin_operon__whoami",
+        "mcp__plugin_operon-plugin_operon__get_agent_info",
+        "mcp__plugin_operon-plugin_operon__get_applicable_rules",
+    }
+)
+
+_TEAMMATE_REJECT_REASON = (
+    "Teammates must query operon via the inbox channel. Send a "
+    'SendMessage to the "operon" team-member with text '
+    "'[OPERON_QUERY] <command>' where <command> is one of: whoami, "
+    "get_agent_info, get_applicable_rules. The response will arrive "
+    "in your inbox in a subsequent turn, prefixed "
+    "'[OPERON_REPLY] <command>'. The MCP tool path returns the "
+    "lead's identity, not yours, and is reserved for the lead."
+)
+
+
+def _read_active_run_name() -> str | None:
+    """Read ``<cwd>/.operon/_active.json`` -> ``active_run_name``.
+
+    Returns ``None`` on any failure (file absent / malformed /
+    missing field). The caller uses ``None`` to fail open.
+    """
+    from pathlib import Path
+
+    pointer = Path.cwd() / ".operon" / "_active.json"
+    if not pointer.is_file():
+        return None
+    try:
+        data = json.loads(pointer.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = data.get("active_run_name")
+    if not isinstance(name, str) or not name:
+        return None
+    return name
+
+
+def _read_team_lead_session_id(run_name: str) -> str | None:
+    """Read ``leadSessionId`` from
+    ``~/.claude/teams/<run_name>/config.json``. Returns ``None`` on
+    any failure.
+    """
+    from pathlib import Path
+
+    cfg = Path.home() / ".claude" / "teams" / run_name / "config.json"
+    if not cfg.is_file():
+        return None
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    sid = data.get("leadSessionId")
+    if not isinstance(sid, str) or not sid:
+        return None
+    return sid
+
+
+def _maybe_reject_teammate_identity_call(
+    tool_name: str, session_id: Any
+) -> dict[str, Any] | None:
+    """If the calling session is a TEAMMATE invoking one of operon's
+    identity MCP tools, return a deny payload pointing the LLM at
+    the inbox-channel query protocol. Otherwise return ``None`` so
+    the caller continues with normal dispatch.
+
+    Fail-open on every inspection failure: an unreadable
+    ``_active.json``, missing team config, missing ``leadSessionId``,
+    or a non-string ``session_id`` all yield ``None`` (allow). We
+    explicitly prefer to let an MCP call through and have the LLM
+    degrade gracefully over blocking a legitimate lead call due to
+    a config quirk.
+    """
+    if tool_name not in _OPERON_IDENTITY_MCP_TOOLS:
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    run_name = _read_active_run_name()
+    if run_name is None:
+        return None
+    lead_sid = _read_team_lead_session_id(run_name)
+    if lead_sid is None:
+        return None
+    if session_id == lead_sid:
+        # Lead caller -- allow. The MCP tool returns the lead's
+        # bootstrap identity, which is correct for the lead.
+        return None
+    # Teammate caller. Deny with the inbox-channel instructions.
+    return _deny_output(_TEAMMATE_REJECT_REASON)
+
+
+# ===========================================================================
 # Land 5: WA1 transcript injection for the `Agent` tool
 # ===========================================================================
 # Per v2.9 section 5.1: on every Agent tool call the hook prepends the
@@ -403,25 +520,23 @@ def _wa1_discover_transcripts(agent_type: str) -> list:
 
 
 def _wa1_build_identity_directive(name: str) -> str:
-    """Build the Land 6 ``[OPERON IDENTITY]`` directive prepended to
-    every Agent spawn's first turn.
+    """Build the ``[OPERON IDENTITY]`` directive prepended to every
+    Agent spawn's first turn.
 
-    Empirical anchor (B.0 probe, 2026-05-22): Anthropic's runtime
-    does NOT propagate teammate identity through MCP `_meta` or
-    `clientInfo` -- both lead-side and teammate-side calls land
-    with identical metadata. Operon distinguishes callers via this
-    operon-controlled prompt-injection directive: the teammate is
-    told its name and instructed to pass ``caller_name=<name>`` on
-    every ``mcp__operon__*`` call. Operon verifies the supplied
-    name against the team roster (see
-    ``identity.resolve_caller_identity``) before trusting it; a
-    mismatch falls back to the lead's identity with a warning log.
+    Land 7 amendment 3 (2026-05-22): the verbose query-protocol
+    instructions previously embedded here moved into the static
+    ``~/.claude/agents/<role>.md`` definition (see
+    ``subagent_install._OPERON_CONTEXT_QUERIES_FOOTER``). The
+    static MD path is more reliable than this dynamic hook
+    injection because the MD is loaded as part of the role's
+    identity at every spawn whether or not the WA1 hook fires.
+    The directive itself now only carries the per-spawn dynamic
+    info (the teammate's ``name``); the rest lives in the role
+    definition.
     """
     return (
         f'[OPERON IDENTITY] Your operon team-member name is "{name}". '
-        f"When you call any mcp__operon__* tool, include "
-        f'caller_name="{name}" in the tool arguments so operon '
-        f"knows which teammate is asking."
+        "See your role definition for how to query operon for context."
     )
 
 
@@ -599,6 +714,24 @@ def main() -> None:
             sys.stderr.write(f"[pretooluse][wa1] fatal in inject: {exc!r}; fail-open\n")
             updated = tool_input
         _emit(_wa1_output(updated))
+        return
+
+    # ---- LAND 7 AMENDMENT: TEAMMATE -> operon identity MCP REJECT ---
+    # If a teammate's LLM calls one of operon's identity MCP tools
+    # (whoami / get_agent_info / get_applicable_rules), block with a
+    # deny + structured 'use [OPERON_QUERY] via SendMessage' reason
+    # so the teammate's LLM does not waste turns chasing the lead's
+    # identity. The lead's own calls are allowed (session_id matches
+    # the team config's leadSessionId). Fail-open on any inspection
+    # error -- a config quirk must not block a legitimate lead call.
+    session_id = hook_input.get("session_id")
+    reject = _maybe_reject_teammate_identity_call(tool_name, session_id)
+    if reject is not None:
+        sys.stderr.write(
+            f"[pretooluse][identity] rejecting teammate call to {tool_name!r} "
+            f"(session_id={session_id!r}); pointing LLM at inbox channel\n"
+        )
+        _emit(reject)
         return
 
     # ---- FAIL-CLOSED PASS ------------------------------------------

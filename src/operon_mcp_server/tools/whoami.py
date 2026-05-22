@@ -1,24 +1,25 @@
 """Implementation of the `whoami` MCP tool.
 
-Returns the canonical identity tuple for the calling team member.
+Returns the lead's bootstrap identity. Under in-process Agent
+Teams operon's MCP is a singleton in the lead's claude process
+and serves every teammate's tool call through one stdio
+transport; the B.0 probe (Land 6 era) empirically confirmed
+Anthropic's runtime does NOT propagate teammate identity via
+MCP ``_meta``/``clientInfo``.
 
-Land 6 (caller_name): under in-process Agent Teams, operon's MCP
-runs as a singleton in the lead's claude process and serves every
-teammate's tool call through one stdio transport. The B.0 probe
-(commits ``b1571bf`` + ``2b4a7c3``, rolled back in this commit)
-empirically confirmed Anthropic's runtime does NOT forward
-teammate-identifying metadata via the JSON-RPC `_meta` field.
-Operon distinguishes callers via the operon-controlled
-``[OPERON IDENTITY]`` directive injected into every Agent spawn's
-first turn by ``plugins/operon-plugin/hooks/pretooluse.py`` (Land 5
-WA1 branch). The directive instructs the teammate to pass
-``caller_name=<name>`` on every ``mcp__operon__*`` call. Operon
-verifies the supplied name against the team roster at
-``~/.claude/teams/<team>/config.json`` ``members[]`` before
-trusting it (impersonation defense in
-``identity.resolve_caller_identity``). When ``caller_name`` is
-omitted -- the lead's own calls -- the response describes the
-lead's bootstrap identity, preserving prior behavior.
+Land 7 reversed Land 6's ``caller_name`` argument: identity
+queries for teammates now go through the inbox-channel protocol
+(``inbox_reader.py`` + ``query_protocol.py``). A teammate that
+needs its own identity does ``SendMessage(to="operon",
+text="[OPERON_QUERY] whoami")`` and reads the reply from its
+inbox. The runtime stamps the inbox entry's ``from`` field
+server-side and a teammate cannot spoof it -- that is the trust
+anchor identity now uses.
+
+This tool itself returns ONLY the lead's identity (no
+``caller_name`` argument). A teammate that calls it via the MCP
+proxy sees the lead's bootstrap data, which is technically
+correct: the singleton MCP IS the lead.
 """
 
 from __future__ import annotations
@@ -35,19 +36,7 @@ TOOL_NAME = "whoami"
 
 INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {
-        "caller_name": {
-            "type": "string",
-            "description": (
-                "Optional. Operon team-member name supplied by the "
-                "teammate's LLM per the [OPERON IDENTITY] spawn-time "
-                "directive. Verified against the team roster; an "
-                "unknown name falls back to the lead's identity with "
-                "a warning log. Omit (or pass empty) when the LEAD's "
-                "LLM calls this tool."
-            ),
-        },
-    },
+    "properties": {},
     "additionalProperties": False,
 }
 
@@ -57,16 +46,14 @@ def tool_descriptor() -> mcp_types.Tool:
     return mcp_types.Tool(
         name=TOOL_NAME,
         description=(
-            "Return the canonical identity of the calling team "
-            "member: {name, role, workflow_id, current_phase, cwd, "
-            "session_id, source, ...}. When called from a teammate, "
-            "pass caller_name=<your team-member name> so operon "
-            "can resolve your identity from the team roster. When "
-            "called from the lead, omit caller_name -- you receive "
-            "the lead's bootstrap identity. Identity is verified "
-            "against ~/.claude/teams/<team>/config.json members[]; "
-            "unknown caller_name values fall back to the lead's "
-            "identity with a warning."
+            "Return the LEAD's canonical identity: {name, role, "
+            "workflow_id, current_phase, cwd, session_id}. "
+            "TEAMMATES: do NOT call this for your own identity -- "
+            "operon's MCP is the lead's singleton, so this surface "
+            "reports the lead. Instead, send a SendMessage to the "
+            "operon team-member with text '[OPERON_QUERY] whoami'; "
+            "operon will write the verified reply to your inbox in "
+            "a subsequent turn."
         ),
         inputSchema=INPUT_SCHEMA,
     )
@@ -75,16 +62,13 @@ def tool_descriptor() -> mcp_types.Tool:
 async def call(arguments: dict[str, Any] | None) -> list[mcp_types.TextContent]:
     """MCP `call_tool` handler for `whoami`.
 
-    Resolves the caller's identity via
-    :func:`identity.resolve_caller_identity`, which delegates to the
-    bootstrap (lead) identity when ``caller_name`` is omitted and to
-    the team roster when supplied. Never raises -- the resolver
-    returns a None-filled stub if the bootstrap identity is itself
-    unbound.
+    Returns the lead's bootstrap identity. Per Land 7 the
+    teammate-aware path runs through the inbox-channel protocol
+    rather than an MCP argument.
     """
-    args = arguments or {}
-    caller_name = args.get("caller_name")
-    if not isinstance(caller_name, str):
-        caller_name = None
-    result = identity.resolve_caller_identity(caller_name)
+    del arguments  # this tool takes no inputs
+    try:
+        result = identity.whoami()
+    except identity.IdentityError as exc:
+        result = {"error": "identity_unbound", "reason": str(exc)}
     return [mcp_types.TextContent(type="text", text=json.dumps(result))]

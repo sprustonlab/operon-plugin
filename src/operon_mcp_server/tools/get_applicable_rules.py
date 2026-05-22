@@ -45,19 +45,6 @@ INPUT_SCHEMA: dict[str, Any] = {
                 "if it names another Agent."
             ),
         },
-        "caller_name": {
-            "type": "string",
-            "description": (
-                "Optional. Operon team-member name supplied by the "
-                "teammate's LLM per the [OPERON IDENTITY] spawn-time "
-                "directive (Land 6). When supplied, the (role, phase) "
-                "projection used to filter applicable rules is "
-                "computed from the teammate's role (agentType in the "
-                "team config) instead of the lead's. Verified against "
-                "the team roster; an unknown name falls back to the "
-                "lead's role with a warning log."
-            ),
-        },
         "include_skipped": {
             "type": "boolean",
             "description": (
@@ -77,54 +64,41 @@ def tool_descriptor() -> mcp_types.Tool:
         name=TOOL_NAME,
         description=(
             "Return the applicable constraints (advance checks for the "
-            "current phase) for the caller's (role, phase) projection, "
-            "rendered as markdown. All roles; cross-Agent inspection "
-            "lands in Phase 6."
+            "current phase) for the LEAD's (role, phase) projection, "
+            "rendered as markdown. TEAMMATES: do NOT use this for your "
+            "own role -- operon's MCP is the lead's singleton, so "
+            "this surface reports the lead's role. Instead send a "
+            "SendMessage to the operon team-member with text "
+            "'[OPERON_QUERY] get_applicable_rules'; operon writes "
+            "the verified reply to your inbox."
         ),
         inputSchema=INPUT_SCHEMA,
     )
 
 
-def _resolve_caller(caller_name: str | None = None) -> tuple[str, str, str]:
-    """Return ``(name, role, operon_handle)`` for the caller.
+def _resolve_caller() -> tuple[str, str, str]:
+    """Return (agent_name, role, handle) from env-anchored handle.
 
-    Land 6: ``caller_name``-aware. The ``name`` and ``role`` reflect
-    the teammate's identity when ``caller_name`` is supplied and
-    matches a real member of the active team's roster; otherwise
-    they reflect the lead's bootstrap identity.
-
-    The ``operon_handle`` returned is ALWAYS the lead's bootstrap
-    handle -- escape-token state (acks, overrides under
-    ``rules.find_active_token``) is keyed on the singleton MCP's
-    handle, which is the lead's. Token lookup must continue to use
-    the lead's handle even for teammate-side callers because the
-    escape-token files live in the operon run-dir, single-writer
-    by the lead's MCP.
-
-    Raises ``ValueError`` if neither identity path produces a
-    bound name + role.
+    Raises `ValueError` if identity is not bound.
     """
-    resolved = identity.resolve_caller_identity(caller_name)
-    name = resolved.get("name")
-    role = resolved.get("role")
-    if not isinstance(name, str) or not name:
-        raise ValueError(
-            f"Environment variable '{identity.ENV_HANDLE_VAR}' is not set "
-            "and resolve_caller_identity did not produce a bound name; "
-            "get_applicable_rules requires an env-anchored identity."
-        )
-    if not isinstance(role, str) or not role:
-        raise ValueError("resolve_caller_identity did not produce a bound role.")
-    # Operon escape-token state is lead-keyed regardless of who is
-    # logically asking (singleton MCP). Re-read the env handle here.
-    operon_handle = identity.read_env_handle()
-    if operon_handle is None:
+    handle = identity.read_env_handle()
+    if handle is None:
         raise ValueError(
             f"Environment variable '{identity.ENV_HANDLE_VAR}' is not set; "
-            "get_applicable_rules requires an env-anchored operon handle "
-            "for escape-token lookup."
+            "get_applicable_rules requires an env-anchored identity."
         )
-    return name, role, operon_handle
+    record = identity.read_handle_file(handle)
+    if record is None:
+        raise ValueError(
+            f"No handle record at _handles/{handle}.json; cannot resolve role."
+        )
+    name = record.get("agent_name")
+    role = record.get("role")
+    if not isinstance(name, str) or not name:
+        raise ValueError("Handle record missing 'agent_name'.")
+    if not isinstance(role, str) or not role:
+        raise ValueError("Handle record missing 'role'.")
+    return name, role, handle
 
 
 def _render_constraints_markdown(
@@ -207,11 +181,8 @@ def _render_constraints_markdown(
 
 def _do_get(args: dict[str, Any]) -> dict[str, Any]:
     requested_name = args.get("agent_name")
-    caller_name = args.get("caller_name")
-    if not isinstance(caller_name, str):
-        caller_name = None
 
-    name, role, handle = _resolve_caller(caller_name)
+    name, role, handle = _resolve_caller()
 
     if requested_name is not None and requested_name != name:
         return {

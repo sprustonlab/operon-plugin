@@ -1,9 +1,9 @@
 {
-  "_comment": "operon-plugin hooks. PreToolUse fires pretooluse-wrapper -> pretooluse.py. Two responsibilities branch on tool_name inside the script: (a) Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule evaluation against operon_mcp_server.rules (deny/warn/log + audit log); (b) Agent -> WA1 transcript replay (v2.9 section 5.1) -- mutates tool_input.prompt to prepend prior sidechain transcripts so a re-spawned teammate gets first-person recall. WA1 fails open on any error and does NOT write to guardrail_log.jsonl. Land 4 removed the Stop hook block; Land 5 added Agent to the matcher.",
+  "_comment": "operon-plugin hooks. PreToolUse fires pretooluse-wrapper -> pretooluse.py. Branches on tool_name inside the script: (a) Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule evaluation against operon_mcp_server.rules (deny/warn/log + audit log); (b) Agent -> WA1 transcript replay (Land 5) + [OPERON IDENTITY] directive injection (Land 6/7); (c) mcp__plugin_operon-plugin_operon__{whoami,get_agent_info,get_applicable_rules} -> Land 7 teammate-rejection branch (compares session_id to the team's leadSessionId; non-lead callers get deny + a structured 'use [OPERON_QUERY] via SendMessage' reason). Land 4 removed the Stop hook block.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Agent|Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Agent|Bash|Edit|Write|MultiEdit|NotebookEdit|mcp__plugin_operon-plugin_operon__whoami|mcp__plugin_operon-plugin_operon__get_agent_info|mcp__plugin_operon-plugin_operon__get_applicable_rules",
         "hooks": [
           {
             "type": "command",

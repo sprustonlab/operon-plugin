@@ -34,15 +34,6 @@ INPUT_SCHEMA: dict[str, Any] = {
                 "5 supports only the caller's own info."
             ),
         },
-        "caller_name": {
-            "type": "string",
-            "description": (
-                "Optional. Operon team-member name supplied by the "
-                "teammate's LLM per the [OPERON IDENTITY] spawn-time "
-                "directive (Land 6). Verified against the team "
-                "roster. Omit when the lead's LLM calls this tool."
-            ),
-        },
         "compact": {
             "type": "boolean",
             "description": (
@@ -61,9 +52,13 @@ def tool_descriptor() -> mcp_types.Tool:
     return mcp_types.Tool(
         name=TOOL_NAME,
         description=(
-            "Aggregator: whoami + get_phase + get_applicable_rules in "
-            "one document. All roles; cross-Agent inspection lands in "
-            "Phase 6."
+            "Aggregator over the LEAD: whoami + get_phase + "
+            "get_applicable_rules in one document. TEAMMATES: do NOT "
+            "use this for your own info -- operon's MCP is the "
+            "lead's singleton. Instead send a SendMessage to the "
+            "operon team-member with text "
+            "'[OPERON_QUERY] get_agent_info'; operon writes the "
+            "verified reply to your inbox in a subsequent turn."
         ),
         inputSchema=INPUT_SCHEMA,
     )
@@ -72,20 +67,14 @@ def tool_descriptor() -> mcp_types.Tool:
 def _do_get(args: dict[str, Any]) -> dict[str, Any]:
     requested = args.get("agent_name")
     compact = bool(args.get("compact", False))
-    caller_name = args.get("caller_name")
-    if not isinstance(caller_name, str):
-        caller_name = None
 
-    # whoami (Land 6: resolve via the team-aware caller-identity helper
-    # so a teammate's call returns its own identity, not the lead's).
-    who = identity.resolve_caller_identity(caller_name)
+    # whoami
+    try:
+        who = identity.whoami()
+    except identity.IdentityError as exc:
+        return {"error": "identity_unbound", "reason": str(exc)}
 
-    resolved_name = who.get("name")
-    if (
-        requested is not None
-        and isinstance(resolved_name, str)
-        and requested != resolved_name
-    ):
+    if requested is not None and requested != who["name"]:
         return {
             "error": "cross_agent_not_implemented",
             "reason": (
@@ -93,7 +82,7 @@ def _do_get(args: dict[str, Any]) -> dict[str, Any]:
                 "Cross-Agent inspection lands in Phase 6."
             ),
             "requested": requested,
-            "caller": resolved_name,
+            "caller": who["name"],
         }
 
     # get_phase
@@ -103,14 +92,10 @@ def _do_get(args: dict[str, Any]) -> dict[str, Any]:
     except workflow.WorkflowError as exc:
         phase_payload = {"error": str(exc)}
 
-    # get_applicable_rules (calls back into the same module's helper;
-    # propagate caller_name so the role/phase projection is built from
-    # the teammate's role, not the lead's).
+    # get_applicable_rules (calls back into the same module's helper)
     rules_payload: dict[str, Any]
     try:
-        rules_payload = gar_tool._do_get(
-            {"caller_name": caller_name} if caller_name else {}
-        )
+        rules_payload = gar_tool._do_get({})
     except (ValueError, workflow.WorkflowError, identity.IdentityError) as exc:
         rules_payload = {"error": str(exc)}
 

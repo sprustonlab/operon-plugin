@@ -36,7 +36,7 @@ import mcp.types as mcp_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from . import bootstrap, identity
+from . import bootstrap, identity, inbox_reader
 from .tools import acknowledge_warning as acknowledge_warning_tool
 from .tools import activate_workflow as activate_workflow_tool
 from .tools import advance_phase as advance_phase_tool
@@ -256,11 +256,11 @@ def _filter_tools_for_role(role: str | None) -> list[mcp_types.Tool]:
 def _build_server() -> Server:
     """Create the MCP `Server` instance with tool handlers attached.
 
-    Land 4 removed the legacy mailbox watch loop; the lead's MCP
-    server is now stdio-only -- no concurrent background task. The
-    Anthropic runtime drives inbox delivery; operon's surface is
-    write-side only (inbox.write_to_member_inbox + send_to_member
-    + advance_phase team_broadcast).
+    Land 4 removed the legacy mailbox watch loop. Land 7 added the
+    inbox-channel reader (``inbox_reader.run_forever``) for
+    teammate identity queries; that task is scheduled on the
+    anyio task group in :func:`_run`. Apart from that one
+    background task, the lead's MCP server is stdio-only.
     """
     server: Server = Server(SERVER_NAME, version=SERVER_VERSION)
 
@@ -290,10 +290,15 @@ def _build_server() -> Server:
 async def _run() -> None:
     """Run the stdio MCP server until the peer disconnects.
 
-    Land 4: the legacy filesystem-watch loop was removed. The lead's
-    operon MCP subprocess now runs only the stdio MCP protocol loop;
-    no concurrent background task. Anthropic's runtime watches the
-    inbox files; operon only writes to them.
+    Land 4 removed the legacy filesystem-watch loop. Land 7 adds
+    one long-running background task: the inbox-channel reader
+    (:func:`inbox_reader.run_forever`) that polls
+    ``~/.claude/teams/<team>/inboxes/operon.json`` for teammate
+    queries (``[OPERON_QUERY] <command>``) and writes verified
+    replies back to the sender's inbox. The reader is scheduled
+    on the same anyio task group that runs the MCP protocol;
+    on transport close, the task group cancels and the reader
+    exits cleanly.
 
     Bootstrap still resolves the Coordinator identity for the
     lead's subprocess (and any fixture handle the user has bound)
@@ -323,13 +328,34 @@ async def _run() -> None:
     except Exception as exc:
         _log.warning("bootstrap raised unexpectedly: %s", exc)
 
+    # Land 7: resolve the active team name once at boot for the
+    # inbox-channel reader. When there is no active operon run
+    # (the user has not called activate_workflow yet), the reader
+    # is skipped -- the identity-query channel only matters once
+    # there's a team to query against.
+    team_name = inbox_reader.resolve_active_team_name()
+    if team_name is None:
+        _log.info(
+            "inbox_reader: no active operon run at boot; skipping "
+            "inbox-channel reader. Teammate identity queries via "
+            "[OPERON_QUERY] will not be answered until "
+            "activate_workflow runs and the server restarts."
+        )
+
     server = _build_server()
     init_options = server.create_initialization_options(
         experimental_capabilities=EXPERIMENTAL_CAPABILITIES,
     )
     async with stdio_server() as (read_stream, write_stream):
         _log.info("stdio transport open")
-        await server.run(read_stream, write_stream, init_options)
+        async with anyio.create_task_group() as tg:
+            if team_name is not None:
+                tg.start_soon(inbox_reader.run_forever, team_name)
+            try:
+                await server.run(read_stream, write_stream, init_options)
+            finally:
+                _log.info("server.run() returned; cancelling task group")
+                tg.cancel_scope.cancel()
 
 
 def main() -> None:

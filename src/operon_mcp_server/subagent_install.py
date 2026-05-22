@@ -106,6 +106,51 @@ alive across SendMessages so the user can navigate to your session
 and interact with you.
 """
 
+#: Operon-context-query footer appended to every compiled role
+#: definition (Land 7 amendment 2, dispatched 2026-05-22). The
+#: positive guidance for the inbox-channel query protocol lives in
+#: the static role MD rather than only in the spawn-time WA1
+#: directive because the MD is loaded as part of the role's
+#: identity at every spawn regardless of whether the WA1 hook fires
+#: correctly. The spawn-time directive (see ``pretooluse.py
+#: _wa1_build_identity_directive``) now only carries the per-spawn
+#: dynamic info (the teammate's actual ``name``); the verbose query
+#: instructions live here.
+#:
+#: Empirical anchor (B.0 probe, 2026-05-22): Anthropic's runtime
+#: does NOT propagate teammate identity through MCP ``_meta`` or
+#: ``clientInfo``. Operon-side MCP calls return the LEAD's identity
+#: under singleton-MCP-in-process; the inbox channel is the only
+#: surface where the runtime stamps a verified (unspoofable)
+#: ``from`` field. NOT appended to ``operon.md`` (the stub is never
+#: meant to be invoked at all).
+_OPERON_CONTEXT_QUERIES_FOOTER = """\
+## Querying operon for your context
+
+You cannot get your role-scoped identity, current phase, or
+applicable rules from the operon MCP tools (`whoami`,
+`get_agent_info`, `get_applicable_rules`). Those tools return the
+LEAD's identity, not yours, because operon's MCP runs as a
+singleton in the lead's claude process. Operon's PreToolUse hook
+will also REJECT those calls when issued from a teammate session
+with a structured deny that points you back here.
+
+Instead, send a SendMessage to the `operon` team-member with one
+of these text forms:
+
+    [OPERON_QUERY] whoami
+    [OPERON_QUERY] get_agent_info
+    [OPERON_QUERY] get_applicable_rules
+
+Operon resolves your identity from the runtime-stamped `from`
+field on your message (unspoofable). It writes its response to
+your inbox; you will receive it as a SendMessage in a subsequent
+turn, prefixed with `[OPERON_REPLY] <command>`.
+
+This is a verified-identity channel: the response is guaranteed
+to be scoped to your team-member identity, not the lead's.
+"""
+
 #: Frontmatter delimiter regex (mirrors spawn_agent.py's parser but
 #: kept local so this module has no upward import).
 _FRONTMATTER_RE = re.compile(
@@ -177,13 +222,7 @@ def _format_frontmatter(name: str, description: str, model: str) -> str:
     double quotes without YAML-parse trouble.
     """
     safe_desc = description.replace('"', "'").replace("\n", " ").strip()
-    return (
-        "---\n"
-        f"name: {name}\n"
-        f'description: "{safe_desc}"\n'
-        f"model: {model}\n"
-        "---\n"
-    )
+    return f'---\nname: {name}\ndescription: "{safe_desc}"\nmodel: {model}\n---\n'
 
 
 def _compile_role_definition(role: str, identity_text: str) -> str:
@@ -197,6 +236,10 @@ def _compile_role_definition(role: str, identity_text: str) -> str:
         shutdown (Land 1 v2 -- prevents teammates auto-approving
         ``shutdown_request`` and vanishing from the TUI before the
         user can interact with them).
+      * An operon-context-queries footer documenting the inbox
+        channel for identity / phase / rules queries (Land 7
+        amendment 2 -- the positive guidance the WA1 spawn-time
+        directive no longer carries).
     """
     body = _strip_frontmatter(identity_text).lstrip("\n")
     description = _extract_description(body, role)
@@ -205,10 +248,15 @@ def _compile_role_definition(role: str, identity_text: str) -> str:
     )
     if not body.endswith("\n"):
         body = body + "\n"
-    # Ensure exactly one blank line between identity body and footer
-    # so the markdown renders cleanly. The footer ends with "\n" so the
-    # final file ends with a single newline.
-    return f"{frontmatter}\n{body}\n{_LIFECYCLE_PROTOCOL_FOOTER}"
+    # Ensure exactly one blank line between identity body and each
+    # footer block so the markdown renders cleanly. Each footer
+    # constant already ends with "\n" so the final file ends with a
+    # single newline.
+    return (
+        f"{frontmatter}\n{body}\n"
+        f"{_LIFECYCLE_PROTOCOL_FOOTER}\n"
+        f"{_OPERON_CONTEXT_QUERIES_FOOTER}"
+    )
 
 
 # -- atomic write --------------------------------------------------------
@@ -222,9 +270,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
     directories on demand.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(
-        f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
-    )
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         tmp.write_text(content, encoding="utf-8")
         os.replace(tmp, path)
@@ -258,8 +304,7 @@ def _discover_role_identity_files(workflow_id: str) -> list[tuple[str, Path]]:
         decl = workflow.load_workflow(workflow_id)
     except workflow.WorkflowError as exc:
         raise SubagentInstallError(
-            f"Cannot discover roles: workflow {workflow_id!r} did "
-            f"not load ({exc})."
+            f"Cannot discover roles: workflow {workflow_id!r} did not load ({exc})."
         ) from exc
 
     workflow_root = decl.source_path.parent
@@ -485,13 +530,10 @@ def register_operon_in_team_config(team_name: str) -> dict[str, Any]:
         config = json.loads(text)
     except (OSError, json.JSONDecodeError) as exc:
         raise SubagentInstallError(
-            f"Failed to read existing team config '{config_path}': "
-            f"{exc}"
+            f"Failed to read existing team config '{config_path}': {exc}"
         ) from exc
     if not isinstance(config, dict):
-        raise SubagentInstallError(
-            f"Team config '{config_path}' is not a JSON object."
-        )
+        raise SubagentInstallError(f"Team config '{config_path}' is not a JSON object.")
     members = config.get("members")
     if not isinstance(members, list):
         # TeamCreate writes an empty list; tolerate older shapes by
@@ -499,8 +541,7 @@ def register_operon_in_team_config(team_name: str) -> dict[str, Any]:
         members = []
         config["members"] = members
     already_present = any(
-        isinstance(m, dict) and m.get("name") == OPERON_MEMBER_NAME
-        for m in members
+        isinstance(m, dict) and m.get("name") == OPERON_MEMBER_NAME for m in members
     )
     if not already_present:
         members.append(_operon_member_entry(team_name))
@@ -523,9 +564,7 @@ def register_operon_in_team_config(team_name: str) -> dict[str, Any]:
 # -- top-level entry point ----------------------------------------------
 
 
-def install_for_activation(
-    workflow_id: str, team_name: str
-) -> dict[str, Any]:
+def install_for_activation(workflow_id: str, team_name: str) -> dict[str, Any]:
     """Compose the two Land-1 surfaces into one call.
 
     Order matters: subagent definitions are written BEFORE the team
