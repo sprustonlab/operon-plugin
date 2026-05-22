@@ -254,6 +254,51 @@ class TmuxClaudeDriver:
         r = self._tmux("capture-pane", "-t", self.session_name, "-p", "-J", "-S", "-2000")
         return r.stdout or ""
 
+    def accept_elicit_form(
+        self,
+        wait_for_substring: str,
+        timeout_s: float = 60.0,
+        poll_s: float = 0.5,
+    ) -> bool:
+        """Wait for an MCP elicit-form dialog in the pane and accept it.
+
+        The dialog observed empirically in CC v2.1.148:
+
+            MCP server "<name>" requests your input
+
+            <prompt text>
+
+            ❯ * <field name>: ☐
+              Accept    Decline
+
+            Esc to cancel · ↑/↓ to navigate · Backspace to unset
+              · Space to toggle
+
+        For a single-checkbox confirm form, the sequence to accept
+        is: Space (toggle the checkbox to true), Down (move to the
+        Accept button), Enter. Returns True if the form text was
+        observed and driven through; False on timeout.
+        """
+        deadline = time.time() + timeout_s
+        seen = False
+        while time.time() < deadline:
+            buf = self.capture_pane()
+            if wait_for_substring in buf and "Accept" in buf and "Decline" in buf:
+                seen = True
+                # Space toggles the checkbox.
+                self.send_special("Space")
+                time.sleep(0.2)
+                # Down moves to Accept button.
+                self.send_special("Down")
+                time.sleep(0.2)
+                # Enter confirms.
+                self.send_special("Enter")
+                # Give the form a moment to dismiss.
+                time.sleep(0.5)
+                return True
+            time.sleep(poll_s)
+        return seen
+
     def kill(self) -> None:
         """Kill the tmux session, terminating the claude process."""
         if not self.session_exists():

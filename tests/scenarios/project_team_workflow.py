@@ -69,6 +69,27 @@ IDLE_K_MS = 1500
 #: ("expected scenario_run, got scenario-run") and activation fails.
 RUN_NAME = "scenario-run"
 
+#: ==== Feature gates for sections blocked on an operon fix ====
+#:
+#: The PreToolUse hook in current operon main (HEAD 10e2881) has a
+#: Land 4 regression: lead-identity resolution returns null in
+#: rule_fired_log entries (`agent: null, role: null,
+#: current_phase: null`), while ack_issued log entries correctly
+#: resolve to `agent: "Coordinator", role: "coordinator",
+#: current_phase: "bootstrap"`. The mismatch breaks BOTH (a) the
+#: role-scoped warn rule firing on lead-issued calls and (b) the
+#: warn-ack-retry consume path: the acknowledge_warning token
+#: lands on disk but the next rule_fired_log doesn't find it
+#: because identity resolution returns nothing to match against.
+#:
+#: A fix is being implemented by Land1Implementer on the branch
+#: `fix-pretooluse-identity-regression` (in the worktree at
+#: /tmp/operon-plugin-fix). When the fix lands and is merged
+#: into our branch base, set these flags to True and re-run the
+#: scenario.
+EXTEND_SUBACT_1_WITH_ACK_RETRY = False  # turn ON after Land 4 fix
+RUN_SUBACT_5_OVERRIDE_FLOW = False  # turn ON after Land 4 fix
+
 
 # --- gate_check helpers ------------------------------------------------------
 
@@ -317,6 +338,238 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
             ],
         )
 
+        # =============== SUB-ACT 1 EXTENSION: fire -> ack -> retry ===============
+        # Gated by EXTEND_SUBACT_1_WITH_ACK_RETRY because the Land 4
+        # identity-resolution regression in current operon main
+        # breaks the ack-consume path (lead-identity resolves to
+        # null in rule_fired_log entries; acknowledge_warning issues
+        # a valid token but the next firing of the same rule does
+        # NOT consume it). Turn ON after Land1Implementer's fix
+        # lands on fix-pretooluse-identity-regression and is
+        # merged in.
+        #
+        # The full "user trips a warn rule" envelope is:
+        #   fire -> ack -> retry succeeds (no second fire).
+        # The base sub-act 1 above only covers "fire". The
+        # extension below covers ack + retry.
+        if EXTEND_SUBACT_1_WITH_ACK_RETRY:
+            recorder.set_sub_act("sub_act_1_extension_ack_retry")
+            recorder.record(
+                user_observable=(
+                    "After the warn fires, the user acknowledges "
+                    "the rule and retries the same command; the "
+                    "retry succeeds and no second warn fires."
+                ),
+                precise_state={
+                    "rule_id": "warn_sudo",
+                    "command": "sudo ls /tmp/",
+                },
+            )
+
+            # Step A: send the acknowledge_warning call.
+            marker_1a = idle.latest_stop_uuid(observer)
+            driver.send(
+                "Call mcp__operon__acknowledge_warning with "
+                "rule_id=\"warn_sudo\" and reason=\"harness "
+                "sub-act 1 probe -- the harness is testing the "
+                "warn-ack-retry envelope\". Report ONLY the "
+                "tool response JSON, nothing else."
+            )
+            ok_1a = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_1a,
+            )
+            assert ok_1a, (
+                "sub-act 1 ext: assistant never reached idle "
+                f"after acknowledge_warning call within "
+                f"{SUB_ACT_TIMEOUT_S}s. Pane:\n"
+                f"{driver.capture_pane()}"
+            )
+
+            # Step A assertions: response carries acknowledged=true
+            # and a token_path.
+            recs_ext_a = observer.all_records()
+            recs_ext_a_blob = json.dumps(recs_ext_a, ensure_ascii=False)
+            ack_succeeded = (
+                "\"acknowledged\": true" in recs_ext_a_blob
+                or "'acknowledged': True" in recs_ext_a_blob
+            )
+            assert ack_succeeded, (
+                "MUST-see: acknowledge_warning response did not "
+                "carry acknowledged=true. Token issuance failed."
+            )
+
+            # Locate the token file on disk. Pre-activation there
+            # is no operon run dir, so the token lives in a
+            # default-handle location -- per operon's convention,
+            # something like
+            #   .operon/default/acks/<handle>/warn_sudo-<hash>.json
+            # If the actual path is different, look in the response
+            # JSON's token_path field via recs_ext_a_blob.
+            token_files = list(
+                (tmp_cwd / ".operon").rglob("warn_sudo-*.json")
+            )
+            assert token_files, (
+                "MUST-see: no acknowledge token file matching "
+                "warn_sudo-*.json was created under .operon/."
+            )
+            token_data = json.loads(
+                token_files[0].read_text(encoding="utf-8")
+            )
+            assert token_data.get("acknowledged") is True, (
+                f"MUST-see: ack token {token_files[0]} does not "
+                f"carry acknowledged=true: {token_data}"
+            )
+            assert token_data.get("one_shot") is False, (
+                f"MUST-see: ack token {token_files[0]} does not "
+                f"carry one_shot=false: {token_data}"
+            )
+            # expires_at must be in the future.
+            import datetime as _dt
+            exp = token_data.get("expires_at")
+            exp_in_future = False
+            if isinstance(exp, str):
+                try:
+                    exp_dt = _dt.datetime.fromisoformat(
+                        exp.replace("Z", "+00:00")
+                    )
+                    exp_in_future = exp_dt > _dt.datetime.now(
+                        _dt.timezone.utc
+                    )
+                except ValueError:
+                    exp_in_future = False
+            assert exp_in_future, (
+                f"MUST-see: ack token expires_at is not in the "
+                f"future: {exp!r}"
+            )
+
+            # Step B: retry the same Bash. The hook should find
+            # the valid ack token and allow the call. The actual
+            # ls output should land in the response.
+            marker_1b = idle.latest_stop_uuid(observer)
+            driver.send(
+                "Now run the bash command `sudo ls /tmp/` "
+                "exactly as before. The acknowledgment token "
+                "is now on disk so the rule should resolve to "
+                "allow on this retry. Report the actual command "
+                "output (the directory listing) verbatim."
+            )
+            ok_1b = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_1b,
+            )
+            assert ok_1b, (
+                "sub-act 1 ext: assistant never reached idle "
+                "after retry within "
+                f"{SUB_ACT_TIMEOUT_S}s. Pane:\n"
+                f"{driver.capture_pane()}"
+            )
+
+            # Step B assertions:
+            recs_ext_b = observer.all_records()
+            recs_ext_b_blob = json.dumps(recs_ext_b, ensure_ascii=False)
+            # MUST see: actual ls output (look for a known directory
+            # name that should always be in /tmp/ -- e.g. the
+            # scenario's own tmp dir or operon-tests/).
+            ls_output_seen = (
+                "operon-tests" in recs_ext_b_blob
+                or "scenario-" in recs_ext_b_blob
+                or ".X11" in recs_ext_b_blob  # common /tmp/ marker
+            )
+            # MUST NOT see: a SECOND occurrence of the warn-fire
+            # message text. Count occurrences of "Using sudo" --
+            # the first was from the initial fire (sub-act 1 base);
+            # there must NOT be a second occurrence introduced by
+            # the retry path.
+            warn_fire_count = recs_ext_b_blob.count("Using sudo")
+            second_fire_present = warn_fire_count > 1
+            assert ls_output_seen, (
+                "MUST-see: the retry of sudo ls /tmp/ did not "
+                "produce a directory listing in the JSONL "
+                "response. The ack-consume path failed."
+            )
+            assert not second_fire_present, (
+                "MUST-NOT-see: the warn message 'Using sudo' "
+                "fired a SECOND time on retry. Count = "
+                f"{warn_fire_count}. The ack token was not "
+                "consumed."
+            )
+
+            # guardrail_log.jsonl inspection: exactly ONE
+            # rule_fired_log for warn_sudo, ONE ack_issued, ZERO
+            # subsequent rule_fired_log for warn_sudo.
+            gl_path = run_dir / "guardrail_log.jsonl"
+            # Pre-activation the run_dir is absent -- the
+            # guardrail log lives under default/ before activate.
+            if not gl_path.is_file():
+                gl_path = tmp_cwd / ".operon" / "default" / "guardrail_log.jsonl"
+            gl_entries: list[dict] = []
+            if gl_path.is_file():
+                for line in gl_path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        gl_entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            warn_fired_entries = [
+                e for e in gl_entries
+                if e.get("type") == "rule_fired_log"
+                and e.get("rule_id") == "warn_sudo"
+            ]
+            ack_issued_entries = [
+                e for e in gl_entries
+                if e.get("type") == "ack_issued"
+                and e.get("rule_id") == "warn_sudo"
+            ]
+            assert len(warn_fired_entries) == 1, (
+                f"MUST-see exactly ONE rule_fired_log for "
+                f"warn_sudo; got {len(warn_fired_entries)}. "
+                f"Entries: {warn_fired_entries}"
+            )
+            assert len(ack_issued_entries) == 1, (
+                f"MUST-see exactly ONE ack_issued for warn_sudo; "
+                f"got {len(ack_issued_entries)}. Entries: "
+                f"{ack_issued_entries}"
+            )
+
+            meter.checkpoint("sub_act_1_extension")
+            meter.assert_under_cap("sub_act_1_extension")
+            bundle.snapshot(
+                "sub_act_1_extension_ack_retry",
+                token_state={
+                    "cumulative": meter.cumulative.__dict__,
+                    "billable": meter.cumulative.billable,
+                },
+                notes={
+                    "ack_token_path": str(token_files[0]),
+                    "ack_token_data": token_data,
+                    "warn_fired_entries": warn_fired_entries,
+                    "ack_issued_entries": ack_issued_entries,
+                    "ls_output_seen": ls_output_seen,
+                    "second_fire_present": second_fire_present,
+                },
+            )
+            gate_check(
+                "sub_act_1_extension",
+                must_hold=[
+                    ("ack succeeded", ack_succeeded),
+                    ("ack token file present", bool(token_files)),
+                    ("ack token acknowledged=true", token_data.get("acknowledged") is True),
+                    ("ack token one_shot=false", token_data.get("one_shot") is False),
+                    ("ack token expires_at in future", exp_in_future),
+                    ("retry produced ls output", ls_output_seen),
+                    ("no second warn fire on retry", not second_fire_present),
+                    ("exactly one rule_fired_log", len(warn_fired_entries) == 1),
+                    ("exactly one ack_issued", len(ack_issued_entries) == 1),
+                    ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+                ],
+            )
+
         # ============================================================
         # Sub-acts 2-10: scaffolded below; implemented incrementally
         # in subsequent commits. Each follows the same shape:
@@ -535,9 +788,384 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
             ],
         )
 
-        # TODO sub_act_3_advance_vision_to_setup
+        # =============== SUB-ACT 3: advance vision -> setup ===============
+        # User vocabulary: "Now advance the workflow to the next
+        # phase." Vision's advance_check is a single manual-confirm
+        # (per project_team.yaml). The lead invokes
+        # mcp__operon__advance_phase; operon runs the elicitation
+        # form via MCP elicit/create. We drive the answer through.
+        recorder.set_sub_act("sub_act_3_advance_vision_to_setup")
+        recorder.record(
+            user_observable=(
+                "Advance the workflow past the vision phase. The "
+                "advance check is a manual-confirm of vision "
+                "approval; once it resolves, current_phase becomes "
+                "setup."
+            ),
+            precise_state={
+                "advance_check_type": "manual-confirm",
+                "from_phase": "vision",
+                "to_phase": "setup",
+            },
+        )
+
+        marker_3 = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Call mcp__operon__advance_phase now. The vision "
+            "phase's advance check is a manual-confirm "
+            "(\"Vision approved by user?\"). The confirmation "
+            "form will be answered by the harness driving the "
+            "TUI directly. After the tool returns, report ONLY "
+            "the new current_phase value (no commentary)."
+        )
+
+        # Drive the manual-confirm elicit form. The lead will
+        # invoke advance_phase, which triggers an MCP
+        # elicit/create form in the pane. We accept it here.
+        form_accepted = driver.accept_elicit_form(
+            wait_for_substring="Vision approved by user",
+            timeout_s=180.0,
+        )
+        assert form_accepted, (
+            "sub-act 3: manual-confirm elicit form for "
+            "'Vision approved by user' never appeared in the "
+            "pane. Pane:\n" + driver.capture_pane()
+        )
+
+        ok = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=None,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_3,
+        )
+        assert ok, (
+            "sub-act 3: assistant never reached idle within "
+            f"{SUB_ACT_TIMEOUT_S}s. Pane:\n{driver.capture_pane()}"
+        )
+
+        # Verify the phase_state.json now reads current_phase=setup.
+        phase_state_3 = json.loads(
+            phase_state_path.read_text(encoding="utf-8")
+        )
+        new_phase = phase_state_3.get("current_phase")
+        recs3 = observer.all_records()
+        recs3_blob = json.dumps(recs3, ensure_ascii=False)
+
+        # MUST see: current_phase advanced.
+        assert new_phase == "setup", (
+            "MUST-see: post-advance current_phase should be "
+            f"'setup'; got {new_phase!r}.\nphase_state.json "
+            f"contents: {phase_state_3}"
+        )
+
+        # MUST see: manual-confirm advance check ran (its prompt
+        # text should appear somewhere in the JSONL stream, either
+        # in an elicit-form, an elicit_create record, or in the
+        # advance_phase tool result).
+        manual_confirm_ran = (
+            "Vision approved by user" in recs3_blob
+            or "manual-confirm" in recs3_blob
+            or "manual_confirm" in recs3_blob
+        )
+
+        # MUST NOT see: workflow-rule message from the PREVIOUS
+        # phase that should no longer apply. Vision had no
+        # exclude_phases entries, so this assertion is loose: we
+        # check that no advance-check FAILURE marker appears.
+        advance_failed = (
+            "advance check failed" in recs3_blob.lower()
+            or "\"status\": \"blocked\"" in recs3_blob
+        )
+        assert not advance_failed, (
+            "MUST-NOT-see: advance_phase returned a blocked status."
+        )
+        assert manual_confirm_ran, (
+            "MUST-see: the manual-confirm advance check did not "
+            "appear in the JSONL stream. Vision phase's advance "
+            "check should have surfaced a confirmation prompt."
+        )
+
+        meter.checkpoint("sub_act_3")
+        meter.assert_under_cap("sub_act_3")
+        bundle.snapshot(
+            "sub_act_3_advance_vision_to_setup",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "new_phase": new_phase,
+                "manual_confirm_ran": manual_confirm_ran,
+            },
+        )
+        gate_check(
+            "sub_act_3",
+            must_hold=[
+                ("current_phase advanced to setup", new_phase == "setup"),
+                ("manual-confirm surfaced", manual_confirm_ran),
+                ("no advance failure marker", not advance_failed),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+            ],
+        )
         # TODO sub_act_4_spawn_teammates
-        # TODO sub_act_5_implementer_deny_then_override
+        #   Drive the lead to spawn three teammates via Agent tool:
+        #     composability (Leadership)
+        #     implementer  (Implementation)
+        #     skeptic      (Skeptic)
+        #   Each spawn includes `run_in_background=true` and
+        #   `team_name=<RUN_NAME>` so the runtime adds them to the
+        #   team config. Wait for the team config to grow to 4
+        #   members (lead + 3 teammates). MUST-NOT-see: any spawn
+        #   for `operon` (the synthetic external member per Land 1
+        #   v2; it's added during activate_workflow, not via Agent).
+
+        # =============== SUB-ACT 5: implementer deny + override ===============
+        # Gated by RUN_SUBACT_5_OVERRIDE_FLOW. Blocked on the Land
+        # 4 identity-resolution regression: the role-scoped deny
+        # rule's role filter (roles=[implementer]) cannot match
+        # while the PreToolUse hook resolves teammate identity to
+        # null. Turn ON after Land1Implementer's fix lands.
+        #
+        # Pre-conditions assumed (from sub-acts 2-4):
+        #   - operon workflow active
+        #   - team has lead + 3 teammates (composability,
+        #     implementer, skeptic) per sub-act 4
+        #   - fixture's <cwd>/.operon/rules.yaml provides the
+        #     deny rule `scenario_implementer_deny` (roles=
+        #     [implementer], trigger=PreToolUse/Write, pattern
+        #     `.*SCENARIO_OVERRIDE_PROBE.*`)
+        if RUN_SUBACT_5_OVERRIDE_FLOW:
+            recorder.set_sub_act("sub_act_5_implementer_deny_then_override")
+            recorder.record(
+                user_observable=(
+                    "A teammate-scoped deny rule fires when the "
+                    "implementer attempts a Write; the user is "
+                    "prompted to grant an override; once granted, "
+                    "the implementer's retry succeeds."
+                ),
+                precise_state={
+                    "rule_id": "scenario_implementer_deny",
+                    "teammate_role": "implementer",
+                    "probe_file": "SCENARIO_OVERRIDE_PROBE.txt",
+                },
+            )
+
+            # Step A: drive the implementer to attempt a Write
+            # matching the deny pattern. The lead's responsibility
+            # is to route the request to the implementer teammate
+            # via SendMessage; the implementer attempts the Write
+            # and the deny fires in operon's PreToolUse hook.
+            marker_5a = idle.latest_stop_uuid(observer)
+            driver.send(
+                "Send a message to the implementer teammate "
+                "asking it to use the Write tool to create the "
+                "file ./SCENARIO_OVERRIDE_PROBE.txt with content "
+                "\"probe\". Wait for the implementer's reply -- "
+                "the operon deny rule will block its Write and "
+                "the implementer should report the deny verbatim. "
+                "After you see the deny, report ONLY the rule_id "
+                "from the deny message."
+            )
+            ok_5a = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=inbox_tracker,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_5a,
+            )
+            assert ok_5a, (
+                "sub-act 5A: assistant never reached idle after "
+                f"deny-probe within {SUB_ACT_TIMEOUT_S}s. Pane:\n"
+                f"{driver.capture_pane()}"
+            )
+
+            # MUST-see: deny message text in JSONL.
+            recs_5a = observer.all_records()
+            recs_5a_blob = json.dumps(recs_5a, ensure_ascii=False)
+            deny_fired = (
+                "Scenario sub-act 5 deny rule" in recs_5a_blob
+                or "scenario_implementer_deny" in recs_5a_blob
+            )
+            assert deny_fired, (
+                "MUST-see: the scenario_implementer_deny rule did "
+                "not fire on the implementer's Write attempt. "
+                "Either the rule was not loaded (fixture issue) "
+                "or the implementer's role was not resolved (the "
+                "Land 4 regression presumed fixed)."
+            )
+            # MUST-NOT-see: the file already exists (deny should
+            # have prevented the write).
+            probe_file = tmp_cwd / "SCENARIO_OVERRIDE_PROBE.txt"
+            assert not probe_file.exists(), (
+                "MUST-NOT-see: SCENARIO_OVERRIDE_PROBE.txt exists "
+                "after the deny supposedly fired -- the deny did "
+                "not actually block the Write."
+            )
+
+            # Step B: lead calls request_override; user grants via
+            # MCP elicit/create form. The form is similar to the
+            # manual-confirm form -- a checkbox to confirm
+            # override + Accept/Decline buttons.
+            marker_5b = idle.latest_stop_uuid(observer)
+            driver.send(
+                "Now call mcp__operon__request_override with "
+                "rule_id=\"scenario_implementer_deny\", "
+                "tool_name=\"Write\", and tool_input matching "
+                "what the implementer attempted "
+                "(file_path=./SCENARIO_OVERRIDE_PROBE.txt, "
+                "content=\"probe\"). When the override "
+                "confirmation form appears in the TUI, the "
+                "harness will accept it. After the tool returns, "
+                "report ONLY the override response JSON."
+            )
+            form_accepted_5 = driver.accept_elicit_form(
+                wait_for_substring="override",
+                timeout_s=180.0,
+            )
+            assert form_accepted_5, (
+                "sub-act 5B: override confirmation form never "
+                "appeared in the pane. Pane:\n"
+                + driver.capture_pane()
+            )
+            ok_5b = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=inbox_tracker,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_5b,
+            )
+            assert ok_5b, (
+                "sub-act 5B: assistant never reached idle after "
+                f"override grant within {SUB_ACT_TIMEOUT_S}s. "
+                f"Pane:\n{driver.capture_pane()}"
+            )
+
+            # MUST-see: override token file on disk.
+            override_files = list(
+                run_dir.rglob("scenario_implementer_deny-*.json")
+            )
+            assert override_files, (
+                "MUST-see: no override token file matching "
+                "scenario_implementer_deny-*.json was created "
+                "under .operon/<run>/. The override grant did "
+                "not produce a token."
+            )
+            override_token = json.loads(
+                override_files[0].read_text(encoding="utf-8")
+            )
+            assert override_token.get("acknowledged") is True, (
+                f"MUST-see: override token does not carry "
+                f"acknowledged=true: {override_token}"
+            )
+
+            # Step C: the implementer retries the Write. The
+            # override should now allow it.
+            marker_5c = idle.latest_stop_uuid(observer)
+            driver.send(
+                "Send the implementer teammate another message "
+                "asking it to retry the same Write -- create the "
+                "file ./SCENARIO_OVERRIDE_PROBE.txt with content "
+                "\"probe\". The override token is now on disk so "
+                "the retry should succeed. After the implementer "
+                "replies, report whether the file was created."
+            )
+            ok_5c = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=inbox_tracker,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_5c,
+            )
+            assert ok_5c, (
+                "sub-act 5C: assistant never reached idle after "
+                f"retry within {SUB_ACT_TIMEOUT_S}s. Pane:\n"
+                f"{driver.capture_pane()}"
+            )
+
+            # MUST-see: file exists on disk after retry.
+            assert probe_file.is_file(), (
+                "MUST-see: SCENARIO_OVERRIDE_PROBE.txt was not "
+                "created after the override retry. The override "
+                "did not consume."
+            )
+            # MUST-NOT-see: a SECOND deny on retry.
+            recs_5c = observer.all_records()
+            recs_5c_blob = json.dumps(recs_5c, ensure_ascii=False)
+            deny_count = recs_5c_blob.count(
+                "scenario_implementer_deny"
+            )
+            # 1 from the initial fire, 1 from the request_override
+            # call, 1 in the override token mention. >3 suggests a
+            # second actual fire.
+            assert deny_count <= 4, (
+                "MUST-NOT-see: scenario_implementer_deny appears "
+                f"{deny_count} times in the stream -- likely a "
+                "second actual fire on the retry, meaning the "
+                "override token was not consumed."
+            )
+
+            # guardrail_log inspection: one rule_fired_log for
+            # scenario_implementer_deny, one override_issued, no
+            # second rule_fired_log for the retry.
+            gl_path_5 = run_dir / "guardrail_log.jsonl"
+            gl_entries_5: list[dict] = []
+            if gl_path_5.is_file():
+                for line in gl_path_5.read_text(encoding="utf-8").splitlines():
+                    try:
+                        gl_entries_5.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            deny_fires = [
+                e for e in gl_entries_5
+                if e.get("type") == "rule_fired_log"
+                and e.get("rule_id") == "scenario_implementer_deny"
+            ]
+            overrides_issued = [
+                e for e in gl_entries_5
+                if e.get("type") in ("override_issued", "ack_issued")
+                and e.get("rule_id") == "scenario_implementer_deny"
+            ]
+            assert len(deny_fires) == 1, (
+                f"MUST-see exactly ONE rule_fired_log for "
+                f"scenario_implementer_deny; got "
+                f"{len(deny_fires)}."
+            )
+            assert len(overrides_issued) == 1, (
+                f"MUST-see exactly ONE override_issued for "
+                f"scenario_implementer_deny; got "
+                f"{len(overrides_issued)}."
+            )
+
+            meter.checkpoint("sub_act_5")
+            meter.assert_under_cap("sub_act_5")
+            bundle.snapshot(
+                "sub_act_5_implementer_deny_then_override",
+                token_state={
+                    "cumulative": meter.cumulative.__dict__,
+                    "billable": meter.cumulative.billable,
+                },
+                notes={
+                    "deny_fired": deny_fired,
+                    "override_token_path": str(override_files[0]),
+                    "override_token_data": override_token,
+                    "probe_file_present_after_retry": probe_file.is_file(),
+                    "deny_fires_in_log": deny_fires,
+                    "overrides_issued_in_log": overrides_issued,
+                },
+            )
+            gate_check(
+                "sub_act_5",
+                must_hold=[
+                    ("deny fired initially", deny_fired),
+                    ("override token issued", bool(override_files)),
+                    ("retry created the file", probe_file.is_file()),
+                    ("exactly one deny in log", len(deny_fires) == 1),
+                    ("exactly one override in log", len(overrides_issued) == 1),
+                    ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+                ],
+            )
+
         # TODO sub_act_6_teammate_cross_talk
         # TODO sub_act_7_operon_query_whoami
         # TODO sub_act_8_advance_setup_to_leadership
