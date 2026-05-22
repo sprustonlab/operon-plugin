@@ -34,6 +34,7 @@ from typing import Any
 import anyio
 import mcp.types as mcp_types
 from mcp.server import Server
+from mcp.server.lowlevel.server import request_ctx
 from mcp.server.stdio import stdio_server
 
 from . import bootstrap, identity
@@ -279,6 +280,68 @@ def _build_server() -> Server:
         name: str, arguments: dict[str, Any] | None
     ) -> list[mcp_types.TextContent]:
         _log.debug("tools/call: name=%r", name)
+        # B.0 PROBE (disposable; remove in B.1). When OPERON_DEBUG=1
+        # is set in the lead's MCP subprocess env, dump the inbound
+        # request's `_meta` field plus the initialize-time
+        # `clientInfo` block to stderr so we can see whether
+        # Anthropic's runtime forwards any teammate-identifying
+        # metadata on tool calls from in-process subagents. Output
+        # is tagged ``[B0-PROBE]`` so a grep finds it cleanly. All
+        # errors are caught locally; the probe MUST NOT block
+        # dispatch even if request_ctx is unset or the SDK shape
+        # drifts.
+        if os.environ.get("OPERON_DEBUG", "").strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+        }:
+            try:
+                ctx = request_ctx.get()
+                meta = getattr(ctx, "meta", None)
+                if meta is not None:
+                    meta_dump = {
+                        "progressToken": getattr(meta, "progressToken", None),
+                        "model_extra": getattr(meta, "model_extra", None) or {},
+                        "model_fields_set": sorted(
+                            getattr(meta, "model_fields_set", set()) or set()
+                        ),
+                    }
+                else:
+                    meta_dump = None
+                session = getattr(ctx, "session", None)
+                client_info = None
+                client_caps = None
+                if session is not None:
+                    client_params = getattr(session, "client_params", None)
+                    if client_params is not None:
+                        ci = getattr(client_params, "clientInfo", None)
+                        if ci is not None:
+                            client_info = {
+                                "name": getattr(ci, "name", None),
+                                "version": getattr(ci, "version", None),
+                                "title": getattr(ci, "title", None),
+                                "model_extra": getattr(ci, "model_extra", None) or {},
+                            }
+                        caps = getattr(client_params, "capabilities", None)
+                        if caps is not None:
+                            client_caps = (
+                                caps.model_dump(exclude_none=True, mode="json")
+                                if hasattr(caps, "model_dump")
+                                else repr(caps)
+                            )
+                sys.stderr.write(
+                    "[B0-PROBE] "
+                    f"tool={name!r} "
+                    f"request_id={getattr(ctx, 'request_id', None)!r} "
+                    f"meta={meta_dump!r} "
+                    f"clientInfo={client_info!r} "
+                    f"clientCaps={client_caps!r}\n"
+                )
+                sys.stderr.flush()
+            except Exception as exc:  # noqa: BLE001 -- probe must not block
+                sys.stderr.write(f"[B0-PROBE] error: {exc!r}\n")
+                sys.stderr.flush()
         handler = _TOOL_HANDLERS.get(name)
         if handler is None:
             raise ValueError(f"Unknown tool: {name!r}")
