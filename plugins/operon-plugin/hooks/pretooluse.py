@@ -334,120 +334,34 @@ def _emit(payload: dict[str, Any]) -> None:
 
 
 # ===========================================================================
-# Land 7 amendment: reject teammate calls to operon identity tools
+# ROLLED BACK: Land 7 amendment 1 reject-teammate-identity-MCP branch
 # ===========================================================================
-# A teammate's LLM that does not yet know about the inbox-channel query
-# protocol will reflexively call mcp__operon__whoami / get_agent_info /
-# get_applicable_rules and discover the answer is the LEAD's identity --
-# costing 2-3 wasted turns before it switches channels. The PreToolUse
-# hook intercepts those calls and returns a structured deny carrying
-# the SendMessage-based instructions.
+# The Land 7 amendment 1 (commit 773cfbf) added a PreToolUse branch that
+# compared the hook's session_id to the team's leadSessionId to deny
+# teammate-originated calls to operon's identity MCP tools (whoami /
+# get_agent_info / get_applicable_rules). Boaz's 2026-05-22
+# /tmp/operon-land7-test demo showed the deny never fires: under
+# in-process Agent Teams, ALL teammate MCP calls multiplex through the
+# lead's single stdio MCP transport, so PreToolUse always sees the
+# lead's session_id regardless of which teammate originated the call.
+# Same architectural wall as the B.0 probe surfaced for MCP `_meta`:
+# Anthropic's runtime does not differentiate teammate-originated from
+# lead-originated at the MCP layer. The PreToolUse hook inherits the
+# same limitation.
 #
-# Trick (per dispatch 2026-05-22): the hook input's `session_id` is the
-# claude conversation session id. Anthropic's team config carries
-# `leadSessionId` per team. session_id == leadSessionId => the lead
-# is calling (allow). Otherwise the caller is a teammate (deny).
-#
-# FAIL-OPEN on any inspection error -- we'd rather let a legitimate lead
-# call through and let the LLM degrade gracefully than block on a config
-# quirk.
+# The amendment-1 branch + helpers are removed in this commit. The
+# hooks.json matcher is also reverted to its pre-amendment-1 shape.
+# Static positive guidance (amendment 2 -- ~/.claude/agents/<role>.md
+# footer) and the simplified dynamic WA1 directive (amendment 3) are
+# the surfaces that REMAIN for steering teammates away from MCP
+# identity tools; they remind the LLM to use [OPERON_QUERY] via
+# SendMessage. The enforcement story is "the LLM follows the
+# guidance" rather than "the hook blocks the wrong path", which is
+# a softer guarantee but the strongest the platform supports today.
+# Future work: if Anthropic exposes a per-caller signal at the
+# PreToolUse layer, the reject branch can be reinstated with that
+# signal as the discriminator instead of session_id.
 # ===========================================================================
-
-_OPERON_IDENTITY_MCP_TOOLS = frozenset(
-    {
-        "mcp__plugin_operon-plugin_operon__whoami",
-        "mcp__plugin_operon-plugin_operon__get_agent_info",
-        "mcp__plugin_operon-plugin_operon__get_applicable_rules",
-    }
-)
-
-_TEAMMATE_REJECT_REASON = (
-    "Teammates must query operon via the inbox channel. Send a "
-    'SendMessage to the "operon" team-member with text '
-    "'[OPERON_QUERY] <command>' where <command> is one of: whoami, "
-    "get_agent_info, get_applicable_rules. The response will arrive "
-    "in your inbox in a subsequent turn, prefixed "
-    "'[OPERON_REPLY] <command>'. The MCP tool path returns the "
-    "lead's identity, not yours, and is reserved for the lead."
-)
-
-
-def _read_active_run_name() -> str | None:
-    """Read ``<cwd>/.operon/_active.json`` -> ``active_run_name``.
-
-    Returns ``None`` on any failure (file absent / malformed /
-    missing field). The caller uses ``None`` to fail open.
-    """
-    from pathlib import Path
-
-    pointer = Path.cwd() / ".operon" / "_active.json"
-    if not pointer.is_file():
-        return None
-    try:
-        data = json.loads(pointer.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    name = data.get("active_run_name")
-    if not isinstance(name, str) or not name:
-        return None
-    return name
-
-
-def _read_team_lead_session_id(run_name: str) -> str | None:
-    """Read ``leadSessionId`` from
-    ``~/.claude/teams/<run_name>/config.json``. Returns ``None`` on
-    any failure.
-    """
-    from pathlib import Path
-
-    cfg = Path.home() / ".claude" / "teams" / run_name / "config.json"
-    if not cfg.is_file():
-        return None
-    try:
-        data = json.loads(cfg.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    sid = data.get("leadSessionId")
-    if not isinstance(sid, str) or not sid:
-        return None
-    return sid
-
-
-def _maybe_reject_teammate_identity_call(
-    tool_name: str, session_id: Any
-) -> dict[str, Any] | None:
-    """If the calling session is a TEAMMATE invoking one of operon's
-    identity MCP tools, return a deny payload pointing the LLM at
-    the inbox-channel query protocol. Otherwise return ``None`` so
-    the caller continues with normal dispatch.
-
-    Fail-open on every inspection failure: an unreadable
-    ``_active.json``, missing team config, missing ``leadSessionId``,
-    or a non-string ``session_id`` all yield ``None`` (allow). We
-    explicitly prefer to let an MCP call through and have the LLM
-    degrade gracefully over blocking a legitimate lead call due to
-    a config quirk.
-    """
-    if tool_name not in _OPERON_IDENTITY_MCP_TOOLS:
-        return None
-    if not isinstance(session_id, str) or not session_id:
-        return None
-    run_name = _read_active_run_name()
-    if run_name is None:
-        return None
-    lead_sid = _read_team_lead_session_id(run_name)
-    if lead_sid is None:
-        return None
-    if session_id == lead_sid:
-        # Lead caller -- allow. The MCP tool returns the lead's
-        # bootstrap identity, which is correct for the lead.
-        return None
-    # Teammate caller. Deny with the inbox-channel instructions.
-    return _deny_output(_TEAMMATE_REJECT_REASON)
 
 
 # ===========================================================================
@@ -716,23 +630,15 @@ def main() -> None:
         _emit(_wa1_output(updated))
         return
 
-    # ---- LAND 7 AMENDMENT: TEAMMATE -> operon identity MCP REJECT ---
-    # If a teammate's LLM calls one of operon's identity MCP tools
-    # (whoami / get_agent_info / get_applicable_rules), block with a
-    # deny + structured 'use [OPERON_QUERY] via SendMessage' reason
-    # so the teammate's LLM does not waste turns chasing the lead's
-    # identity. The lead's own calls are allowed (session_id matches
-    # the team config's leadSessionId). Fail-open on any inspection
-    # error -- a config quirk must not block a legitimate lead call.
-    session_id = hook_input.get("session_id")
-    reject = _maybe_reject_teammate_identity_call(tool_name, session_id)
-    if reject is not None:
-        sys.stderr.write(
-            f"[pretooluse][identity] rejecting teammate call to {tool_name!r} "
-            f"(session_id={session_id!r}); pointing LLM at inbox channel\n"
-        )
-        _emit(reject)
-        return
+    # Land 7 amendment-1 reject-teammate-MCP branch was rolled back
+    # here (2026-05-22). See the rollback rationale block higher in
+    # this file: in-process teammates multiplex MCP through the
+    # lead's session, so session_id is lead-uniform at the hook
+    # layer; the deny path never fired. The static MD footer
+    # installed by subagent_install.py and the WA1 directive
+    # injected at spawn-time both steer the teammate's LLM toward
+    # the [OPERON_QUERY] inbox channel without needing a hook-side
+    # block.
 
     # ---- FAIL-CLOSED PASS ------------------------------------------
     # Hardcoded safety patterns evaluated BEFORE the full rules engine.

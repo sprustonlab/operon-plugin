@@ -131,9 +131,11 @@ You cannot get your role-scoped identity, current phase, or
 applicable rules from the operon MCP tools (`whoami`,
 `get_agent_info`, `get_applicable_rules`). Those tools return the
 LEAD's identity, not yours, because operon's MCP runs as a
-singleton in the lead's claude process. Operon's PreToolUse hook
-will also REJECT those calls when issued from a teammate session
-with a structured deny that points you back here.
+singleton in the lead's claude process and all in-process
+teammate MCP calls multiplex through the lead's session; operon
+cannot distinguish your calls from the lead's at the MCP layer.
+Calling these tools will silently return the wrong identity --
+do not rely on the answer.
 
 Instead, send a SendMessage to the `operon` team-member with one
 of these text forms:
@@ -143,9 +145,9 @@ of these text forms:
     [OPERON_QUERY] get_applicable_rules
 
 Operon resolves your identity from the runtime-stamped `from`
-field on your message (unspoofable). It writes its response to
-your inbox; you will receive it as a SendMessage in a subsequent
-turn, prefixed with `[OPERON_REPLY] <command>`.
+field on your SendMessage (unspoofable). It writes its response
+to your inbox; you will receive it as a SendMessage in a
+subsequent turn, prefixed with `[OPERON_REPLY] <command>`.
 
 This is a verified-identity channel: the response is guaranteed
 to be scoped to your team-member identity, not the lead's.

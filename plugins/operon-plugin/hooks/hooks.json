@@ -1,9 +1,9 @@
 {
-  "_comment": "operon-plugin hooks. PreToolUse fires pretooluse-wrapper -> pretooluse.py. Branches on tool_name inside the script: (a) Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule evaluation against operon_mcp_server.rules (deny/warn/log + audit log); (b) Agent -> WA1 transcript replay (Land 5) + [OPERON IDENTITY] directive injection (Land 6/7); (c) mcp__plugin_operon-plugin_operon__{whoami,get_agent_info,get_applicable_rules} -> Land 7 teammate-rejection branch (compares session_id to the team's leadSessionId; non-lead callers get deny + a structured 'use [OPERON_QUERY] via SendMessage' reason). Land 4 removed the Stop hook block.",
+  "_comment": "operon-plugin hooks. PreToolUse fires pretooluse-wrapper -> pretooluse.py. Branches on tool_name inside the script: (a) Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule evaluation against operon_mcp_server.rules (deny/warn/log + audit log); (b) Agent -> WA1 transcript replay (Land 5) + [OPERON IDENTITY] directive injection (Land 6/7). Land 7 also added an MCP-identity-tool reject branch (matcher entries + _maybe_reject_teammate_identity_call); that was rolled back 2026-05-22 because in-process teammates multiplex MCP through the lead's session, leaving session_id lead-uniform at the hook layer -- the same architectural wall the B.0 probe surfaced for MCP `_meta`. Static MD guidance (subagent_install._OPERON_CONTEXT_QUERIES_FOOTER) and the dynamic WA1 directive remain to steer teammates toward [OPERON_QUERY] via SendMessage.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Agent|Bash|Edit|Write|MultiEdit|NotebookEdit|mcp__plugin_operon-plugin_operon__whoami|mcp__plugin_operon-plugin_operon__get_agent_info|mcp__plugin_operon-plugin_operon__get_applicable_rules",
+        "matcher": "Agent|Bash|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",

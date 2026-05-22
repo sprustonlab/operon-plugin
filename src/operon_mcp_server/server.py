@@ -328,20 +328,16 @@ async def _run() -> None:
     except Exception as exc:
         _log.warning("bootstrap raised unexpectedly: %s", exc)
 
-    # Land 7: resolve the active team name once at boot for the
-    # inbox-channel reader. When there is no active operon run
-    # (the user has not called activate_workflow yet), the reader
-    # is skipped -- the identity-query channel only matters once
-    # there's a team to query against.
-    team_name = inbox_reader.resolve_active_team_name()
-    if team_name is None:
-        _log.info(
-            "inbox_reader: no active operon run at boot; skipping "
-            "inbox-channel reader. Teammate identity queries via "
-            "[OPERON_QUERY] will not be answered until "
-            "activate_workflow runs and the server restarts."
-        )
-
+    # Land 7 hotfix (2026-05-22): inbox_reader.run_forever() now
+    # re-resolves the active operon run / team on every poll
+    # iteration instead of snapshotting it once at boot. The MCP
+    # server starts in the "no active run" state for fresh
+    # projects (or in the bootstrap-auto-created `default` run);
+    # the user's `activate_workflow` call later flips
+    # `_active.json` to the real team. If we snapshotted here, the
+    # reader would poll the wrong team for the rest of the
+    # session. Always start the reader -- it is a cheap idle loop
+    # when no team is active.
     server = _build_server()
     init_options = server.create_initialization_options(
         experimental_capabilities=EXPERIMENTAL_CAPABILITIES,
@@ -349,8 +345,7 @@ async def _run() -> None:
     async with stdio_server() as (read_stream, write_stream):
         _log.info("stdio transport open")
         async with anyio.create_task_group() as tg:
-            if team_name is not None:
-                tg.start_soon(inbox_reader.run_forever, team_name)
+            tg.start_soon(inbox_reader.run_forever)
             try:
                 await server.run(read_stream, write_stream, init_options)
             finally:

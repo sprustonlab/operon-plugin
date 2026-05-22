@@ -236,28 +236,71 @@ def _scan_once(team_name: str) -> int:
     return dispatched
 
 
-async def run_forever(team_name: str) -> None:
+async def run_forever() -> None:
     """Run the polling loop until the surrounding task group
     cancels.
+
+    Re-resolves the active operon run / team name on EVERY
+    iteration -- not just once at boot. The Land 7 hotfix
+    (2026-05-22) surfaced that the original "resolve once at
+    server boot" version snapshotted the bootstrap-auto-created
+    ``default`` team and never noticed when ``activate_workflow``
+    later flipped ``_active.json`` to a user-named team; every
+    teammate query landed in the new team's inbox and was never
+    read. The fix is one stat + one tiny JSON read per second
+    (cheap; ``_active.json`` is a few hundred bytes), which is
+    well below the latency budget Boaz approved.
+
+    If there is no active run when an iteration starts (e.g. the
+    MCP server booted before ``activate_workflow`` ran), the
+    iteration is a no-op and we wait for the next poll. No crash,
+    no error log spam -- just an INFO line the first time we
+    successfully resolve an active team, and another INFO line
+    whenever the resolved team changes, so the transition is
+    observable from operon's stderr.
 
     Defensive against transient errors: a per-iteration exception
     is logged and the loop continues. The only path that exits
     the loop is anyio cancellation (clean shutdown).
     """
     _log.info(
-        "inbox_reader: starting poll loop for team=%r (interval=%.1fs)",
-        team_name,
+        "inbox_reader: starting poll loop (interval=%.1fs, "
+        "active team resolved per-iteration)",
         _POLL_INTERVAL_SECONDS,
     )
+    last_team: str | None = None
     try:
         while True:
             try:
-                _scan_once(team_name)
+                team_name = resolve_active_team_name()
+                if team_name != last_team:
+                    if team_name is None:
+                        _log.info(
+                            "inbox_reader: no active operon run; "
+                            "iteration is a no-op until activate_workflow "
+                            "or restore_operon_session sets _active.json"
+                        )
+                    elif last_team is None:
+                        _log.info(
+                            "inbox_reader: active team resolved to %r; "
+                            "polling its inbox",
+                            team_name,
+                        )
+                    else:
+                        _log.info(
+                            "inbox_reader: active team switched %r -> %r; "
+                            "polling new inbox",
+                            last_team,
+                            team_name,
+                        )
+                    last_team = team_name
+                if team_name is not None:
+                    _scan_once(team_name)
             except Exception as exc:  # noqa: BLE001 -- loop must survive
                 _log.exception("inbox_reader: scan iteration raised: %s", exc)
             await anyio.sleep(_POLL_INTERVAL_SECONDS)
     except anyio.get_cancelled_exc_class():
-        _log.info("inbox_reader: cancelled for team=%r; exiting cleanly", team_name)
+        _log.info("inbox_reader: cancelled; exiting cleanly")
         raise
 
 
@@ -266,7 +309,9 @@ def resolve_active_team_name() -> str | None:
     Land 1 v2 convention), or ``None`` if there is no active run.
 
     Mirrors the pattern used by :mod:`send_to_member` and
-    :mod:`restore_operon_session`.
+    :mod:`restore_operon_session`. Called every poll iteration by
+    :func:`run_forever` so a mid-process ``activate_workflow`` is
+    picked up promptly.
     """
     try:
         run_dir = paths.active_run_dir()
