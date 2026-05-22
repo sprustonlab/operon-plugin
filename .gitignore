@@ -15,6 +15,10 @@ venv/
 
 # Operon project-local state (defensive: should never live inside this repo)
 .operon/
+# ... except fixture seed trees, which legitimately ship project-tier
+# state to be copied into each scenario's tmp_cwd at test start.
+!tests/fixtures/**/.operon/
+!tests/fixtures/**/.operon/**
 
 # OS
 .DS_Store

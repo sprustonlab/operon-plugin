@@ -1,0 +1,29 @@
+# Per-scenario project-tier rules overlay (Q4 path 4a).
+#
+# operon's rules loader walks tiers
+#   plugin-tier  <plugin>/rules.yaml
+#   user-tier    ~/.operon/rules.yaml
+#   project-tier <cwd>/.operon/rules.yaml      <-- THIS FILE
+#   workflow     active workflow's `rules:` block
+# and merges them with "higher tier wins per rule id". A new rule
+# id at the project tier is therefore additive.
+#
+# This file adds ONE deny-level rule scoped to the `implementer`
+# teammate role so sub-act 5 of the project_team_workflow scenario
+# can exercise the request_override flow. The base
+# `plugins/operon-plugin/rules.yaml` is unmodified; this file lives
+# under `<cwd>/.operon/` which the harness pre-seeds from the
+# fixture seed tree at scenario start.
+
+- id: scenario_implementer_deny
+  trigger: PreToolUse/Write
+  enforcement: deny
+  detect:
+    field: file_path
+    pattern: ".*SCENARIO_OVERRIDE_PROBE.*"
+  message: >-
+    Scenario sub-act 5 deny rule -- exercises the request_override
+    flow. The implementer teammate attempted to write a file
+    matching SCENARIO_OVERRIDE_PROBE; the lead must escalate via
+    request_override and the user must confirm.
+  roles: [implementer]

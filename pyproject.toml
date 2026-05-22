@@ -41,3 +41,23 @@ Repository = "https://github.com/SprustonLab/operon-plugin"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/operon_mcp_server"]
+
+[dependency-groups]
+# E2E test infrastructure -- per
+# `.project_team/claude_code_port/specification/TEST_SPECIFICATION.md`,
+# the test bed is real subscription-path Claude Code driven via tmux
+# with JSONL transcripts as observers. The harness lives under
+# `tests/_harness/` and is plain-stdlib (no extra runtime deps); the
+# only dev requirement is pytest + pytest-timeout.
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# All scenario file names end with the scenario name (e.g.
+# `project_team_workflow.py`); pytest's default `test_*.py` discovery
+# does not match, so widen the pattern.
+python_files = ["test_*.py", "*_workflow.py", "_smoke_*.py"]
+python_functions = ["test_*"]
