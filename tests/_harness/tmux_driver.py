@@ -284,20 +284,41 @@ class TmuxClaudeDriver:
             return name
         return None
 
+    def wait_for_team_panel(
+        self, timeout_s: float = 30.0, poll_s: float = 0.5
+    ) -> bool:
+        """Block until the lead's team panel widget is visible.
+
+        After Agent(run_in_background=true) spawns, the teammate
+        subprocess's CC TUI can overlay the lead's pane temporarily
+        (both share the inherited TTY). The team-panel widget,
+        which carries the ``╒═`` focus marker, is only present in
+        the lead's TUI. This helper polls capture_pane for the
+        marker and returns True when it appears. Used before any
+        focus navigation to ensure the harness is reading the
+        lead's TUI state, not a teammate's overlay.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            buf = self.capture_pane()
+            if self.FOCUS_MARKER in buf:
+                return True
+            time.sleep(poll_s)
+        return False
+
     def focus_main_thread(
         self, settle_s: float = 0.5, max_hops: int = 6
     ) -> bool:
         """Move TUI focus to the lead's main thread (``team-lead``).
 
-        After a parallel-2 Agent spawn, empirically focus STAYS
-        on team-lead (Boaz manual walkthrough): no navigation
-        is needed in that case. This method is idempotent --
-        if we're already on team-lead, return immediately.
-        Otherwise send Shift+Up until ``current_focus() ==
-        "team-lead"`` or ``max_hops`` is exhausted.
-
-        Returns True iff focus is on team-lead at exit.
+        Idempotent: returns immediately if already on team-lead.
+        Otherwise sends Shift+Up until ``current_focus() ==
+        "team-lead"`` or ``max_hops`` exhausted. Before navigating,
+        waits for the team-panel widget to be visible (a teammate
+        subprocess's TUI overlay may temporarily hide it).
         """
+        if not self.wait_for_team_panel(timeout_s=30.0):
+            return False
         for _ in range(max_hops + 1):
             if self.current_focus() == "team-lead":
                 time.sleep(settle_s)
@@ -312,16 +333,26 @@ class TmuxClaudeDriver:
     ) -> bool:
         """Move TUI focus into a specific teammate's conversation.
 
-        Sends Shift+Down until the ``╒═`` marker is on the row
-        whose name matches ``teammate_name``. Returns True iff
-        the teammate is in focus at exit.
+        Sends Shift+Down (or Shift+Up if currently below the
+        target) until the ``╒═`` marker is on the row whose name
+        matches ``teammate_name``. Returns True iff the teammate
+        is in focus at exit. Waits for the team-panel widget to
+        be visible before navigating.
         """
-        # If we're already there, done.
+        if not self.wait_for_team_panel(timeout_s=30.0):
+            return False
         if self.current_focus() == teammate_name:
             time.sleep(settle_s)
             return True
         for _ in range(max_hops):
             self.send_special("S-Down")
+            time.sleep(0.25)
+            if self.current_focus() == teammate_name:
+                time.sleep(settle_s)
+                return True
+        # If we overshot or went the wrong direction, try Up.
+        for _ in range(max_hops):
+            self.send_special("S-Up")
             time.sleep(0.25)
             if self.current_focus() == teammate_name:
                 time.sleep(settle_s)
