@@ -90,6 +90,13 @@ RUN_NAME = "scenario-run"
 EXTEND_SUBACT_1_WITH_ACK_RETRY = True  # Land 4 fix landed (49ab0bc)
 RUN_SUBACT_5_OVERRIDE_FLOW = True  # Land 4 fix landed (49ab0bc)
 
+#: Debug-hygiene flag (Q18a). When True the harness does NOT delete
+#: ~/.claude/teams/<RUN_NAME> at scenario start. Useful when iterating
+#: a single failing sub-act and wanting to inspect team state from the
+#: previous run BEFORE the next run wipes it. Should default to False
+#: for normal runs (deterministic clean start).
+KEEP_TEAM_CONFIG_ON_FAIL = False
+
 
 # --- gate_check helpers ------------------------------------------------------
 
@@ -146,9 +153,12 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
     _seed_fixture(tmp_cwd)
     # Clean up any leftover team config from prior runs that share the
     # same RUN_NAME. The runtime's leader-uniqueness check refuses
-    # activate_workflow if a team by that name already exists.
+    # activate_workflow if a team by that name already exists. The
+    # KEEP_TEAM_CONFIG_ON_FAIL flag (Q18a) bypasses this cleanup so a
+    # debugger can inspect the previous run's team state before the
+    # next run wipes it.
     _stale_team = Path.home() / ".claude" / "teams" / RUN_NAME
-    if _stale_team.exists():
+    if _stale_team.exists() and not KEEP_TEAM_CONFIG_ON_FAIL:
         shutil.rmtree(_stale_team)
 
     session_id = str(uuid.uuid4())
@@ -1297,26 +1307,39 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
             # is to route the request to the implementer teammate
             # via SendMessage; the implementer attempts the Write
             # and the deny fires in operon's PreToolUse hook.
-            # Return focus to main first so the lead receives the
-            # message (sub-act 4 left focus on a teammate channel).
-            driver.focus_main_thread()
+            # Sub-act 4's parallel-2 spawn auto-focused the TUI on
+            # one of the new teammates (empirically: implementer).
+            # focus_main_thread's S-Up navigation is unreliable in
+            # CC v2.1.150. We work WITH the auto-focus: speak
+            # directly to the auto-focused teammate (assumed
+            # implementer) and ask it to attempt the Write. The
+            # implementer-scoped deny rule fires when the
+            # implementer (NOT the lead) issues a Write -- so for
+            # sub-act 5a the actor identity must be the implementer
+            # regardless of which path the prompt takes to it.
+            #
+            # If the auto-focus landed on composability instead,
+            # the same prompt asks composability to write -- which
+            # would NOT fire the implementer-scoped rule. That's
+            # detectable by the assertion: deny_fired would be
+            # False, and we'd retry the focus shift.
             marker_5a = idle.latest_stop_uuid(observer)
+            probe_file_path = tmp_cwd / "SCENARIO_OVERRIDE_PROBE.txt"
             driver.send(
-                "Delegate this to the implementer teammate via "
-                "SendMessage. Do NOT do the work yourself. Do "
-                "NOT call the Write tool from your own session. "
-                "Do NOT delegate to any other teammate.\n\n"
-                "Use mcp__plugin_operon-plugin_operon__send_to_member "
-                "(or the equivalent SendMessage) to deliver this "
-                "exact message to teammate 'implementer':\n\n"
-                "  message: 'Please use the Write tool to create "
-                "the file SCENARIO_OVERRIDE_PROBE.txt at the "
-                f"workspace root ({tmp_cwd}/SCENARIO_OVERRIDE_PROBE.txt) "
-                "with content \"probe\". If a guardrail blocks "
-                "you, report the rule_id and the deny message "
-                "verbatim back to me.'\n\n"
-                "After implementer replies, report ONLY the "
-                "rule_id from its deny reply."
+                "Controlled scenario probe. You are the "
+                "implementer teammate. Please attempt to use "
+                f"the Write tool to create {probe_file_path} "
+                "with content \"probe\".\n\n"
+                "operon's scenario_implementer_deny rule (a "
+                "fixture-added deny scoped to the implementer "
+                "role) will block your Write -- this is the "
+                "expected behavior of this probe; the harness "
+                "wants to observe the rule firing.\n\n"
+                "Do NOT try to work around the deny. Do NOT use "
+                "a different tool. Do NOT skip the Write. After "
+                "the deny, reply with ONLY the rule_id from the "
+                "deny message and the verbatim message text, "
+                "then stop."
             )
             ok_5a = idle.wait_idle_pre_kill(
                 observer=observer,
