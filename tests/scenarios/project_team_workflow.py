@@ -1272,16 +1272,24 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
         )
 
         # =============== SUB-ACT 5: implementer deny + override ===============
-        # Gated by RUN_SUBACT_5_OVERRIDE_FLOW. Blocked on the Land
-        # 4 identity-resolution regression: the role-scoped deny
-        # rule's role filter (roles=[implementer]) cannot match
-        # while the PreToolUse hook resolves teammate identity to
-        # null. Turn ON after Land1Implementer's fix lands.
+        # Land 4 fix landed; this section is enabled by
+        # RUN_SUBACT_5_OVERRIDE_FLOW. Revised design per Boaz's
+        # manual walkthrough: the entire flow runs IN THE
+        # IMPLEMENTER'S CHANNEL, with no lead bounce. CC's elicit-
+        # form routing follows the originating MCP-call session,
+        # so request_override called from the implementer's
+        # channel produces a form there; the harness drives the
+        # form in-place (no channel switch). operon's
+        # request_override mints the token under the resolved
+        # Coordinator handle regardless of which session called
+        # it (B.0 MCP-identity limit), so the implementer-self
+        # path produces an override token usable by the
+        # implementer on retry.
         #
         # Pre-conditions assumed (from sub-acts 2-4):
-        #   - operon workflow active
-        #   - team has lead + 3 teammates (composability,
-        #     implementer, skeptic) per sub-act 4
+        #   - operon workflow active, phase = setup
+        #   - team has lead + 2 teammates (composability,
+        #     implementer) per sub-act 4 [Q3 path b]
         #   - fixture's <cwd>/.operon/rules.yaml provides the
         #     deny rule `scenario_implementer_deny` (roles=
         #     [implementer], trigger=PreToolUse/Write, pattern
@@ -1302,39 +1310,29 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
                 },
             )
 
-            # Step A: drive the implementer to attempt a Write
-            # matching the deny pattern. The lead's responsibility
-            # is to route the request to the implementer teammate
-            # via SendMessage; the implementer attempts the Write
-            # and the deny fires in operon's PreToolUse hook.
-            # Sub-act 4's parallel-2 spawn auto-focused the TUI on
-            # one of the new teammates (empirically: implementer).
-            # focus_main_thread's S-Up navigation is unreliable in
-            # CC v2.1.150. We work WITH the auto-focus: speak
-            # directly to the auto-focused teammate (assumed
-            # implementer) and ask it to attempt the Write. The
-            # implementer-scoped deny rule fires when the
-            # implementer (NOT the lead) issues a Write -- so for
-            # sub-act 5a the actor identity must be the implementer
-            # regardless of which path the prompt takes to it.
-            #
-            # If the auto-focus landed on composability instead,
-            # the same prompt asks composability to write -- which
-            # would NOT fire the implementer-scoped rule. That's
-            # detectable by the assertion: deny_fired would be
-            # False, and we'd retry the focus shift.
+            # Step A: navigate INTO the implementer's channel,
+            # then ask it to attempt the Write. After sub-act 4
+            # focus is on team-lead (Boaz manual walkthrough
+            # confirmed); we Shift+Down to implementer.
+            focused = driver.focus_teammate_thread(
+                "implementer", max_hops=4
+            )
+            assert focused, (
+                "sub-act 5A pre-step: could not focus the "
+                "implementer channel via Shift+Down. "
+                f"current_focus={driver.current_focus()!r}. "
+                f"Pane:\n{driver.capture_pane()}"
+            )
             marker_5a = idle.latest_stop_uuid(observer)
             probe_file_path = tmp_cwd / "SCENARIO_OVERRIDE_PROBE.txt"
             driver.send(
-                "Controlled scenario probe. You are the "
-                "implementer teammate. Please attempt to use "
-                f"the Write tool to create {probe_file_path} "
+                "Controlled scenario probe. Please attempt to "
+                f"use the Write tool to create {probe_file_path} "
                 "with content \"probe\".\n\n"
                 "operon's scenario_implementer_deny rule (a "
-                "fixture-added deny scoped to the implementer "
-                "role) will block your Write -- this is the "
-                "expected behavior of this probe; the harness "
-                "wants to observe the rule firing.\n\n"
+                "fixture-added deny scoped to your role) will "
+                "block your Write -- this is the expected "
+                "behavior of this probe.\n\n"
                 "Do NOT try to work around the deny. Do NOT use "
                 "a different tool. Do NOT skip the Write. After "
                 "the deny, reply with ONLY the rule_id from the "
@@ -1377,21 +1375,24 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
                 "not actually block the Write."
             )
 
-            # Step B: lead calls request_override; user grants via
-            # MCP elicit/create form. The form is similar to the
-            # manual-confirm form -- a checkbox to confirm
-            # override + Accept/Decline buttons.
+            # Step B: STILL IN THE IMPLEMENTER'S CHANNEL. Ask the
+            # implementer to call request_override itself. CC
+            # routes the resulting elicit/create form to the
+            # originating session, which is the implementer's
+            # channel. The harness drives the form in-place (no
+            # channel switch -- accept_elicit_form just polls the
+            # current pane for the form text and sends Space +
+            # Down + Enter).
             marker_5b = idle.latest_stop_uuid(observer)
             driver.send(
-                "Now call mcp__operon__request_override with "
-                "rule_id=\"scenario_implementer_deny\", "
-                "tool_name=\"Write\", and tool_input matching "
-                "what the implementer attempted "
-                "(file_path=./SCENARIO_OVERRIDE_PROBE.txt, "
-                "content=\"probe\"). When the override "
-                "confirmation form appears in the TUI, the "
-                "harness will accept it. After the tool returns, "
-                "report ONLY the override response JSON."
+                "Now call mcp__operon__request_override directly. "
+                "Parameters: rule_id=\"scenario_implementer_deny\", "
+                "tool_name=\"Write\", tool_input={\"file_path\": "
+                f"\"{probe_file_path}\", \"content\": \"probe\"}}. "
+                "An override confirmation form will appear here "
+                "in your channel -- the harness will accept it. "
+                "After the tool returns, reply with ONLY the "
+                "override response JSON and stop."
             )
             form_accepted_5 = driver.accept_elicit_form(
                 wait_for_substring="override",
@@ -1399,7 +1400,7 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
             )
             assert form_accepted_5, (
                 "sub-act 5B: override confirmation form never "
-                "appeared in the pane. Pane:\n"
+                "appeared in the implementer's channel. Pane:\n"
                 + driver.capture_pane()
             )
             ok_5b = idle.wait_idle_pre_kill(
@@ -1415,34 +1416,47 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
                 f"Pane:\n{driver.capture_pane()}"
             )
 
-            # MUST-see: override token file on disk.
-            override_files = list(
-                run_dir.rglob("scenario_implementer_deny-*.json")
+            # MUST-see: override token file on disk. Operon's
+            # request_override mints the token under the resolved
+            # Coordinator handle (B.0 MCP-identity limit -- MCP
+            # cannot tell teammates from lead), so the token
+            # lives under .operon/<run>/overrides/<coord-handle>/.
+            # Search the whole run dir to be tier-agnostic.
+            override_files = (
+                list(run_dir.rglob("scenario_implementer_deny-*.json"))
+                + list((tmp_cwd / ".operon").rglob("scenario_implementer_deny-*.json"))
             )
             assert override_files, (
                 "MUST-see: no override token file matching "
                 "scenario_implementer_deny-*.json was created "
-                "under .operon/<run>/. The override grant did "
-                "not produce a token."
+                "under .operon/. The override grant did not "
+                "produce a token."
             )
             override_token = json.loads(
                 override_files[0].read_text(encoding="utf-8")
             )
-            assert override_token.get("acknowledged") is True, (
-                f"MUST-see: override token does not carry "
-                f"acknowledged=true: {override_token}"
+            # Token shape mirrors the ack-token (kind='ack' on
+            # disk; the response JSON carries acknowledged=true).
+            # The empirical token doesn't carry an `acknowledged`
+            # field on disk -- see sub-act 1 ext findings. Check
+            # for an override-kind marker instead.
+            assert override_token.get("kind") in ("override", "ack"), (
+                f"MUST-see: override token kind not in "
+                f"{{override, ack}}: {override_token}"
             )
 
-            # Step C: the implementer retries the Write. The
-            # override should now allow it.
+            # Step C: still in the implementer's channel. Ask the
+            # implementer to retry the Write. The override token
+            # is now on disk; the PreToolUse hook should consume
+            # it and allow the Write.
             marker_5c = idle.latest_stop_uuid(observer)
             driver.send(
-                "Send the implementer teammate another message "
-                "asking it to retry the same Write -- create the "
-                "file ./SCENARIO_OVERRIDE_PROBE.txt with content "
-                "\"probe\". The override token is now on disk so "
-                "the retry should succeed. After the implementer "
-                "replies, report whether the file was created."
+                "Now retry the same Write tool call -- create the "
+                f"file {probe_file_path} with content \"probe\". "
+                "The override token is on disk so the retry "
+                "should succeed. After the Write returns, reply "
+                "with ONLY whether the file was created (yes/no) "
+                "and stop."
             )
             ok_5c = idle.wait_idle_pre_kill(
                 observer=observer,
@@ -1479,9 +1493,13 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
                 "override token was not consumed."
             )
 
-            # guardrail_log inspection: one rule_fired_log for
-            # scenario_implementer_deny, one override_issued, no
-            # second rule_fired_log for the retry.
+            # guardrail_log inspection. Per sub-act 1 ext
+            # findings the fire->ack->retry envelope produces:
+            #   rule_fired_log outcome=blocked   (initial fire)
+            #   ack_issued / override_issued    (token mint)
+            #   rule_fired_log outcome=acked    (retry, consumed)
+            # Expect this exact shape for scenario_implementer_deny
+            # too.
             gl_path_5 = run_dir / "guardrail_log.jsonl"
             gl_entries_5: list[dict] = []
             if gl_path_5.is_file():
@@ -1495,18 +1513,30 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
                 if e.get("type") == "rule_fired_log"
                 and e.get("rule_id") == "scenario_implementer_deny"
             ]
+            deny_blocked = [
+                e for e in deny_fires
+                if e.get("outcome") == "blocked"
+            ]
+            deny_acked = [
+                e for e in deny_fires
+                if e.get("outcome") == "acked"
+            ]
             overrides_issued = [
                 e for e in gl_entries_5
                 if e.get("type") in ("override_issued", "ack_issued")
                 and e.get("rule_id") == "scenario_implementer_deny"
             ]
-            assert len(deny_fires) == 1, (
-                f"MUST-see exactly ONE rule_fired_log for "
-                f"scenario_implementer_deny; got "
-                f"{len(deny_fires)}."
+            assert len(deny_blocked) == 1, (
+                f"MUST-see exactly ONE rule_fired_log outcome=blocked "
+                f"for scenario_implementer_deny; got {len(deny_blocked)}."
+            )
+            assert len(deny_acked) == 1, (
+                f"MUST-see exactly ONE rule_fired_log outcome=acked "
+                f"for scenario_implementer_deny (the retry); got "
+                f"{len(deny_acked)}."
             )
             assert len(overrides_issued) == 1, (
-                f"MUST-see exactly ONE override_issued for "
+                f"MUST-see exactly ONE override/ack_issued for "
                 f"scenario_implementer_deny; got "
                 f"{len(overrides_issued)}."
             )
@@ -1534,11 +1564,18 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
                     ("deny fired initially", deny_fired),
                     ("override token issued", bool(override_files)),
                     ("retry created the file", probe_file.is_file()),
-                    ("exactly one deny in log", len(deny_fires) == 1),
-                    ("exactly one override in log", len(overrides_issued) == 1),
+                    ("exactly one deny outcome=blocked", len(deny_blocked) == 1),
+                    ("exactly one deny outcome=acked", len(deny_acked) == 1),
+                    ("exactly one override/ack issued", len(overrides_issued) == 1),
                     ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
                 ],
             )
+
+            # Post-5: return focus to team-lead for any downstream
+            # sub-acts that expect to talk to the lead. Sub-acts
+            # 6/7 will Shift+Down into specific teammates as
+            # needed; sub-act 8 (advance_phase) is a lead action.
+            driver.focus_main_thread()
 
         # TODO sub_act_6_teammate_cross_talk
         # TODO sub_act_7_operon_query_whoami

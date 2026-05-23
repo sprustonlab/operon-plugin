@@ -254,59 +254,80 @@ class TmuxClaudeDriver:
         r = self._tmux("capture-pane", "-t", self.session_name, "-p", "-J", "-S", "-2000")
         return r.stdout or ""
 
-    def focus_main_thread(self, settle_s: float = 0.5, hops: int = 6) -> None:
-        """Return TUI focus to the lead's main conversation thread.
+    #: CC v2.1.150's TUI team panel shows the focused row with a
+    #: ``╒═`` decoration on the left margin (verified by Boaz in
+    #: a manual walkthrough). Other rows use ``├─`` / ``└─``.
+    #: The harness uses ``╒═ <name>`` substring matching to
+    #: determine which row currently has focus.
+    FOCUS_MARKER = "╒═"  # ╒═
 
-        Empirically in CC v2.1.150: after the lead spawns a
-        teammate via Agent(run_in_background=true), the TUI's
-        input cursor jumps into the new teammate's conversation
-        thread (footer shows e.g. ``@composability``). Subsequent
-        driver.send() lands in that teammate's channel; teammates
-        cannot spawn other named teammates ("the team roster is
-        flat"), so the harness must return focus to main between
-        sequential spawn turns.
+    def current_focus(self) -> str | None:
+        """Return the name of the row currently in focus, or None.
 
-        The CC keybinding is Shift+Up to cycle towards main
-        (counterpart of Shift+Down to enter a teammate). Sending
-        Shift+Up multiple times eventually lands on main
-        regardless of the starting position. ``hops`` controls
-        how many Shift+Up presses to send; 6 is enough to step
-        past several teammates back to the top.
+        Reads the pane buffer and looks for the ``╒═ <name>``
+        decoration. Returns the name (e.g. ``"team-lead"``,
+        ``"composability"``, ``"implementer"``) or None if no
+        focused row is detected.
         """
-        for _ in range(hops):
-            # tmux's named keysym for Shift+Up is `S-Up`. Send
-            # it and check the pane after each press to detect
-            # when the @teammate decoration has cleared.
+        buf = self.capture_pane()
+        for line in buf.splitlines():
+            idx = line.find(self.FOCUS_MARKER)
+            if idx < 0:
+                continue
+            # Extract the name token after the marker.
+            tail = line[idx + len(self.FOCUS_MARKER):].strip()
+            # Format is e.g. "team-lead · shift + ↑/↓ to select".
+            # The name is the first whitespace/dot-delimited token.
+            if not tail:
+                continue
+            name = tail.split()[0].strip(".·")
+            return name
+        return None
+
+    def focus_main_thread(
+        self, settle_s: float = 0.5, max_hops: int = 6
+    ) -> bool:
+        """Move TUI focus to the lead's main thread (``team-lead``).
+
+        After a parallel-2 Agent spawn, empirically focus STAYS
+        on team-lead (Boaz manual walkthrough): no navigation
+        is needed in that case. This method is idempotent --
+        if we're already on team-lead, return immediately.
+        Otherwise send Shift+Up until ``current_focus() ==
+        "team-lead"`` or ``max_hops`` is exhausted.
+
+        Returns True iff focus is on team-lead at exit.
+        """
+        for _ in range(max_hops + 1):
+            if self.current_focus() == "team-lead":
+                time.sleep(settle_s)
+                return True
             self.send_special("S-Up")
-            time.sleep(0.3)
-            buf = self.capture_pane()
-            # The footer shows `── @<teammate-name> ──` when
-            # focused on a teammate. Absence of that decoration
-            # means we're on main.
-            if "── @" not in buf and "@composability" not in buf and "@implementer" not in buf and "@skeptic" not in buf:
-                break
+            time.sleep(0.25)
         time.sleep(settle_s)
+        return self.current_focus() == "team-lead"
 
     def focus_teammate_thread(
         self, teammate_name: str, settle_s: float = 0.5, max_hops: int = 8
     ) -> bool:
         """Move TUI focus into a specific teammate's conversation.
 
-        Used by sub-acts 6+7 where the harness needs to direct
-        a message from a specific teammate. Sends Shift+Down
-        repeatedly and checks the pane footer after each step;
-        stops when the footer mentions ``@<teammate_name>``.
-        Returns True if the teammate was reached.
+        Sends Shift+Down until the ``╒═`` marker is on the row
+        whose name matches ``teammate_name``. Returns True iff
+        the teammate is in focus at exit.
         """
+        # If we're already there, done.
+        if self.current_focus() == teammate_name:
+            time.sleep(settle_s)
+            return True
         for _ in range(max_hops):
             self.send_special("S-Down")
-            time.sleep(0.15)
-            buf = self.capture_pane()
-            if f"@{teammate_name}" in buf:
+            time.sleep(0.25)
+            if self.current_focus() == teammate_name:
                 time.sleep(settle_s)
                 return True
         time.sleep(settle_s)
-        return False
+        return self.current_focus() == teammate_name
 
     def accept_elicit_form(
         self,
