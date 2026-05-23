@@ -26,7 +26,7 @@ from typing import Any
 import mcp.types as mcp_types
 from mcp.server.lowlevel.server import request_ctx
 
-from .. import inbox, paths, workflow
+from .. import inbox, paths, subagent_install, workflow
 from . import spawn_agent as spawn_agent_tool
 
 #: MCP tool name. Coordinator-only per SPEC §7.1.
@@ -311,6 +311,73 @@ async def _do_advance() -> dict[str, Any]:
             "reason": (
                 f"Current phase {current_phase!r} is the last phase in "
                 f"workflow {workflow_id!r}; no advance possible."
+            ),
+        }
+
+    # 2026-05-23 (Boaz directive): fail-loud if ANY member of the
+    # active team config carries an agentType that is not a defined
+    # role in the active workflow. The manual walkthrough surfaced
+    # that TeamCreate's default lead agentType ("team-lead") does
+    # NOT match the project_team workflow's "coordinator" role:
+    # operon's broadcast looks up
+    # ``workflows/<wf>/team-lead/<phase>.md``, finds nothing, and
+    # silently degrades the lead's brief. We refuse to advance
+    # rather than degrade silently; the user (or LLM) must
+    # recreate the team with TeamCreate(agent_type=<valid role>).
+    # Operon itself ("operon" member; synthetic external slot) is
+    # NEVER an offender -- it is not a workflow participant. The
+    # check runs BEFORE advance_checks so an invalid roster does
+    # not pester the user with manual-confirm elicitations only to
+    # then refuse the commit anyway.
+    try:
+        team_name = paths.active_run_dir().name
+    except paths.OperonPathError as exc:
+        raise AdvancePhaseError(
+            f"Cannot resolve active operon run for roster check: {exc}"
+        ) from exc
+    try:
+        valid_roles = subagent_install.discover_role_names(workflow_id)
+    except subagent_install.SubagentInstallError as exc:
+        raise AdvancePhaseError(
+            f"Cannot enumerate workflow {workflow_id!r} role set: {exc}"
+        ) from exc
+    valid_role_set = set(valid_roles)
+    members = inbox.read_team_members(team_name)
+    offenders: list[dict[str, Any]] = []
+    for m in members:
+        name = m.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        # `operon` is a synthetic external member, not a workflow
+        # participant. Its agentType is intentionally the
+        # `operon-stub` placeholder; do not flag it.
+        if name == "operon":
+            continue
+        agent_type = m.get("agentType")
+        if isinstance(agent_type, str) and agent_type in valid_role_set:
+            continue
+        offenders.append(
+            {
+                "name": name,
+                "agentType": agent_type if isinstance(agent_type, str) else None,
+            }
+        )
+    if offenders:
+        return {
+            "advanced": False,
+            "error": "members_not_in_workflow_roster",
+            "offenders": offenders,
+            "valid_roles": sorted(valid_role_set),
+            "active_workflow": workflow_id,
+            "team_name": team_name,
+            "suggested_action": (
+                "Recreate the team with "
+                f"TeamCreate(team_name={team_name!r}, "
+                "agent_type=<one of valid_roles>) for the offending "
+                "member. The team config is currently misaligned "
+                "with the active workflow's role definitions; no "
+                "per-(role, phase) brief lookup will match for the "
+                "offending member."
             ),
         }
 

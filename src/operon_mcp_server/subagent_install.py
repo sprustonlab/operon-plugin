@@ -289,6 +289,21 @@ def _atomic_write_text(path: Path, content: str) -> None:
 # -- role discovery ------------------------------------------------------
 
 
+def discover_role_names(workflow_id: str) -> list[str]:
+    """Return the workflow's defined role names (sorted).
+
+    Public thin wrapper over :func:`_discover_role_identity_files`
+    used by ``tools/advance_phase.py`` (and any future caller) to
+    validate a team roster against the active workflow's role set
+    without re-doing the workflow-root discovery + directory walk.
+
+    Raises :class:`SubagentInstallError` if the workflow does not
+    load or its root directory is missing -- same conditions as
+    the underlying helper.
+    """
+    return [name for name, _path in _discover_role_identity_files(workflow_id)]
+
+
 def _discover_role_identity_files(workflow_id: str) -> list[tuple[str, Path]]:
     """Find every ``<role>/identity.md`` under the workflow's root
     directory (the directory containing the workflow's manifest YAML).
