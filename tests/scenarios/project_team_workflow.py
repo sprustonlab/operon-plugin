@@ -118,6 +118,94 @@ def gate_check(label: str, *, must_hold: list[tuple[str, bool]]) -> None:
         raise GateFailure(msg)
 
 
+def _last_advance_failed_check(records: list[dict]) -> dict | None:
+    """Find the most recent advance_phase tool_result and parse the failed
+    check it reports.
+
+    Looks for the latest tool_use_result for
+    ``mcp__plugin_operon-plugin_operon__advance_phase``, then parses the
+    response body for a failed check.
+
+    Returns a dict ``{check_type, missing_path?}`` or None if no
+    advance_phase result found or none failed.
+
+    Operon's advance_phase response shape (per the activate / advance
+    tool docstrings): ``{"status": "blocked", "outcomes": [
+    {"check_type": "<type>", "passed": false, "evidence": "...",
+    "missing_path": "..."}, ...], ...}``. We pluck the first failed
+    outcome.
+    """
+    # Walk records in reverse to find the latest tool_use_result for
+    # advance_phase.
+    for rec in reversed(records):
+        # The tool_result lives in a user-type record whose message
+        # content includes a tool_use_id; we don't need to correlate
+        # to the original tool_use, only to find an advance_phase
+        # response.
+        if rec.get("type") != "user":
+            continue
+        msg = rec.get("message") or {}
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "tool_result":
+                continue
+            body = item.get("content")
+            if isinstance(body, list):
+                body_text = "".join(
+                    str(sub.get("text", ""))
+                    if isinstance(sub, dict) else str(sub)
+                    for sub in body
+                )
+            else:
+                body_text = str(body or "")
+            if "advance_phase" not in body_text and "check_type" not in body_text:
+                # heuristic: most advance_phase responses mention
+                # one of these.
+                continue
+            # Try to parse a JSON object out of the body. The model
+            # may have already JSON-stringified the response.
+            try:
+                parsed = json.loads(body_text)
+            except json.JSONDecodeError:
+                continue
+            outcomes = parsed.get("outcomes") if isinstance(parsed, dict) else None
+            if not isinstance(outcomes, list):
+                continue
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+                if outcome.get("passed") is True:
+                    continue
+                ct = outcome.get("check_type")
+                if not ct:
+                    continue
+                report: dict = {"check_type": ct, "raw_outcome": outcome}
+                # For file-exists-check, the missing path is often
+                # in the outcome as `missing_path`, `path`, or
+                # mentioned in `evidence`.
+                missing = (
+                    outcome.get("missing_path")
+                    or outcome.get("path")
+                )
+                if not missing:
+                    ev = outcome.get("evidence") or outcome.get("message") or ""
+                    # Look for a quoted path or trailing absolute path.
+                    import re as _re
+                    m = _re.search(r"['\"]([^'\"]+\.(?:md|txt|json))['\"]", str(ev))
+                    if not m:
+                        m = _re.search(r"(/[\w./_-]+\.(?:md|txt|json))", str(ev))
+                    if m:
+                        missing = m.group(1)
+                if missing:
+                    report["missing_path"] = missing
+                return report
+    return None
+
+
 # --- fixture-seed copier -----------------------------------------------------
 
 def _seed_fixture(tmp_cwd: Path) -> None:
@@ -708,12 +796,18 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
         )
         # 2.1: activate the workflow.
         marker_2a = idle.latest_stop_uuid(observer)
+        # Two-call sequence (per Boaz's empirical walkthrough):
+        # first TeamCreate with agent_type="coordinator" so the
+        # lead's roster row has agentType="coordinator" -- this
+        # is what operon's per-(role, phase).md brief lookup uses;
+        # without it the lookup falls back. Then activate_workflow.
         driver.send(
-            "Use the mcp__operon__activate_workflow tool to "
-            f"activate workflow_id=project_team with "
-            f"run_name={RUN_NAME}. Once it returns, report only "
-            "the activation status and the current phase, nothing "
-            "else."
+            "Two-step setup. Step 1: call TeamCreate with "
+            f"team_name='{RUN_NAME}' AND agent_type='coordinator'. "
+            "Step 2: call mcp__operon__activate_workflow with "
+            f"workflow_id='project_team' and run_name='{RUN_NAME}'. "
+            "After both return, report ONLY the activation status "
+            "and the current phase, nothing else."
         )
         ok = idle.wait_idle_pre_kill(
             observer=observer,
@@ -1577,11 +1671,794 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
             # needed; sub-act 8 (advance_phase) is a lead action.
             driver.focus_main_thread()
 
-        # TODO sub_act_6_teammate_cross_talk
-        # TODO sub_act_7_operon_query_whoami
-        # TODO sub_act_8_advance_setup_to_leadership
-        # TODO sub_act_9_halt_session
-        # TODO sub_act_10_restore_and_recall
+        # =============== SUB-ACT 6: teammate cross-talk ===============
+        # Empirical envelope per Boaz's walk: focus into a
+        # teammate, ask it to SendMessage to another teammate /
+        # the lead. The runtime stamps the `from` field; the
+        # recipient's inbox file at
+        # ~/.claude/teams/<RUN_NAME>/inboxes/<recipient>.json
+        # carries the entry.
+        recorder.set_sub_act("sub_act_6_teammate_cross_talk")
+        recorder.record(
+            user_observable=(
+                "Teammates can exchange messages with each "
+                "other and with the lead via the inbox surface. "
+                "composability sends 'hi' to implementer and "
+                "'reporting in' to the lead."
+            ),
+            precise_state={
+                "from": "composability",
+                "to_teammate": "implementer",
+                "to_lead": "team-lead",
+            },
+        )
+
+        # 6.1: composability -> implementer
+        focused_6a = driver.focus_teammate_thread(
+            "composability", max_hops=4
+        )
+        assert focused_6a, (
+            "sub-act 6.1 pre-step: could not focus composability "
+            f"via Shift+Down. current_focus="
+            f"{driver.current_focus()!r}.\n"
+            f"Pane:\n{driver.capture_pane()}"
+        )
+        marker_6a = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Send a SendMessage to teammate 'implementer' with "
+            "text exactly 'hi from composability'. After it "
+            "returns, reply with the literal string 'SENT-6a' "
+            "and stop."
+        )
+        ok_6a = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=inbox_tracker,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_6a,
+        )
+        assert ok_6a, (
+            f"sub-act 6.1: timeout. Pane:\n{driver.capture_pane()}"
+        )
+
+        # 6.2: still in composability's channel, send to lead
+        marker_6b = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Now send a SendMessage to teammate 'team-lead' "
+            "with text exactly 'reporting in'. After it "
+            "returns, reply with 'SENT-6b' and stop."
+        )
+        ok_6b = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=inbox_tracker,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_6b,
+        )
+        assert ok_6b, (
+            f"sub-act 6.2: timeout. Pane:\n{driver.capture_pane()}"
+        )
+
+        # Inspect both inbox files.
+        impl_inbox_path = teams_dir / RUN_NAME / "inboxes" / "implementer.json"
+        lead_inbox_path = teams_dir / RUN_NAME / "inboxes" / "team-lead.json"
+        impl_inbox = []
+        if impl_inbox_path.is_file():
+            try:
+                impl_inbox = json.loads(impl_inbox_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                impl_inbox = []
+        lead_inbox = []
+        if lead_inbox_path.is_file():
+            try:
+                lead_inbox = json.loads(lead_inbox_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                lead_inbox = []
+        impl_from_comp = [
+            m for m in impl_inbox
+            if isinstance(m, dict)
+            and m.get("from") == "composability"
+            and "hi from composability" in (m.get("text") or "")
+        ]
+        lead_from_comp = [
+            m for m in lead_inbox
+            if isinstance(m, dict)
+            and m.get("from") == "composability"
+            and "reporting in" in (m.get("text") or "")
+        ]
+        assert impl_from_comp, (
+            "MUST-see: implementer's inbox did not receive a "
+            "from=composability entry with text 'hi from "
+            "composability'."
+        )
+        assert lead_from_comp, (
+            "MUST-see: team-lead's inbox did not receive a "
+            "from=composability entry with text 'reporting in'."
+        )
+        # MUST NOT see: operon receiving the cross-talk.
+        operon_inbox_path_6 = teams_dir / RUN_NAME / "inboxes" / "operon.json"
+        operon_inbox_6 = []
+        if operon_inbox_path_6.is_file():
+            try:
+                operon_inbox_6 = json.loads(operon_inbox_path_6.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                operon_inbox_6 = []
+        operon_got_crosstalk = any(
+            isinstance(m, dict)
+            and ("hi from composability" in (m.get("text") or "")
+                 or "reporting in" in (m.get("text") or ""))
+            for m in operon_inbox_6
+        )
+        assert not operon_got_crosstalk, (
+            "MUST-NOT-see: operon's inbox received cross-talk "
+            "messages meant for implementer/team-lead."
+        )
+
+        meter.checkpoint("sub_act_6")
+        meter.assert_under_cap("sub_act_6")
+        bundle.snapshot(
+            "sub_act_6_teammate_cross_talk",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "impl_inbox_entries": len(impl_inbox),
+                "lead_inbox_entries": len(lead_inbox),
+                "impl_from_comp_matches": len(impl_from_comp),
+                "lead_from_comp_matches": len(lead_from_comp),
+            },
+        )
+        gate_check(
+            "sub_act_6",
+            must_hold=[
+                ("implementer got hi from composability", bool(impl_from_comp)),
+                ("team-lead got reporting in from composability", bool(lead_from_comp)),
+                ("operon did NOT receive cross-talk", not operon_got_crosstalk),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+            ],
+        )
+
+        # =============== SUB-ACT 7: OPERON_QUERY whoami ===============
+        # Still in composability's channel. Ask composability to
+        # SendMessage to operon with text "[OPERON_QUERY] whoami".
+        # operon's inbox_reader polls scenario-run/inboxes/operon.json
+        # and dispatches; operon replies via SendMessage back to
+        # composability's inbox with "[OPERON_REPLY] whoami {...}".
+        recorder.set_sub_act("sub_act_7_operon_query_whoami")
+        recorder.record(
+            user_observable=(
+                "A teammate (composability) can introspect its "
+                "identity by asking operon over the inbox channel. "
+                "Operon replies with a verified-identity payload."
+            ),
+            precise_state={
+                "querier": "composability",
+                "query": "[OPERON_QUERY] whoami",
+            },
+        )
+
+        focused_7 = driver.focus_teammate_thread(
+            "composability", max_hops=3
+        )
+        assert focused_7, (
+            "sub-act 7: could not focus composability."
+        )
+        marker_7 = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Send a SendMessage to teammate 'operon' with text "
+            "exactly '[OPERON_QUERY] whoami'. Wait for operon's "
+            "[OPERON_REPLY] whoami response to land in YOUR inbox "
+            "(it may take a few seconds because operon polls "
+            "every ~1s). When you see it, reply ONLY with the "
+            "verbatim text of operon's [OPERON_REPLY] line and "
+            "stop. Do NOT do anything else."
+        )
+        ok_7 = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=inbox_tracker,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_7,
+        )
+        assert ok_7, (
+            f"sub-act 7: timeout. Pane:\n{driver.capture_pane()}"
+        )
+
+        # Inspect composability's inbox for [OPERON_REPLY] whoami.
+        comp_inbox_path = teams_dir / RUN_NAME / "inboxes" / "composability.json"
+        comp_inbox = []
+        if comp_inbox_path.is_file():
+            try:
+                comp_inbox = json.loads(comp_inbox_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                comp_inbox = []
+        operon_replies = [
+            m for m in comp_inbox
+            if isinstance(m, dict)
+            and m.get("from") == "operon"
+            and "[OPERON_REPLY] whoami" in (m.get("text") or "")
+        ]
+        whoami_payload_ok = False
+        if operon_replies:
+            txt = operon_replies[-1].get("text") or ""
+            whoami_payload_ok = (
+                "composability" in txt
+                and ("source" in txt or "team_roster" in txt)
+            )
+        assert operon_replies, (
+            "MUST-see: composability's inbox did not receive "
+            "any [OPERON_REPLY] whoami entry from operon."
+        )
+        assert whoami_payload_ok, (
+            "MUST-see: the [OPERON_REPLY] whoami payload did "
+            "not contain expected identity fields "
+            f"(composability + source/team_roster). Body: "
+            f"{(operon_replies[-1].get('text') or '')[:400]}"
+        )
+
+        meter.checkpoint("sub_act_7")
+        meter.assert_under_cap("sub_act_7")
+        bundle.snapshot(
+            "sub_act_7_operon_query_whoami",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "operon_reply_count": len(operon_replies),
+                "last_reply_excerpt": (
+                    (operon_replies[-1].get("text") or "")[:500]
+                    if operon_replies else ""
+                ),
+            },
+        )
+        gate_check(
+            "sub_act_7",
+            must_hold=[
+                ("[OPERON_REPLY] whoami received", bool(operon_replies)),
+                ("payload has expected identity fields", whoami_payload_ok),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+            ],
+        )
+
+        # =============== SUB-ACT 8: advance setup -> leadership ===============
+        # Cascading-failure advance (per Boaz's walkthrough):
+        #   1. advance_phase fails: artifact-dir-ready-check
+        #   2. set_artifact_dir
+        #   3. advance_phase fails: file-exists-check (STATUS.md)
+        #   4. create STATUS.md
+        #   5. advance_phase fails: file-exists-check (userprompt.md)
+        #   6. create userprompt.md
+        #   7. advance_phase succeeds
+        # The advance-check coverage gate (manual-confirm +
+        # artifact-dir-ready-check + file-exists-check) is met
+        # across sub-acts 3 + 8.
+        recorder.set_sub_act("sub_act_8_advance_setup_to_leadership")
+        recorder.record(
+            user_observable=(
+                "Advancing setup -> leadership requires "
+                "discovering and satisfying prerequisites: "
+                "an artifact dir, then setup files. Once all "
+                "checks pass, the workflow advances and operon "
+                "broadcasts the new-phase brief to teammates."
+            ),
+            precise_state={
+                "from_phase": "setup",
+                "to_phase": "leadership",
+            },
+        )
+
+        # Return to team-lead for the advance flow.
+        focused_8 = driver.focus_main_thread(max_hops=4)
+        assert focused_8, (
+            f"sub-act 8 pre-step: could not return focus to "
+            f"team-lead. current_focus={driver.current_focus()!r}.\n"
+            f"Pane:\n{driver.capture_pane()}"
+        )
+
+        artifact_dir = tmp_cwd / ".project_team" / RUN_NAME
+        # Cascading-failure loop with hard cap.
+        MAX_ADVANCE_RETRIES = 6
+        advance_attempts = 0
+        observed_check_types: list[str] = []
+        for attempt in range(MAX_ADVANCE_RETRIES):
+            marker_8 = idle.latest_stop_uuid(observer)
+            if attempt == 0:
+                msg = (
+                    "Call mcp__operon__advance_phase now. After "
+                    "it returns, report the JSON response verbatim "
+                    "(if multi-line, just the outcomes list and "
+                    "the status). Stop."
+                )
+            else:
+                msg = (
+                    "Call mcp__operon__advance_phase AGAIN. After "
+                    "it returns, report the JSON response. Stop. "
+                    "Do not analyse or propose -- just report."
+                )
+            driver.send(msg)
+            ok_8 = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=inbox_tracker,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_8,
+            )
+            assert ok_8, (
+                f"sub-act 8 attempt {attempt+1}: advance_phase "
+                f"timed out. Pane:\n{driver.capture_pane()}"
+            )
+            advance_attempts += 1
+
+            # Read current phase from disk.
+            ps = json.loads(
+                phase_state_path.read_text(encoding="utf-8")
+            )
+            if ps.get("current_phase") != "setup":
+                # Advance succeeded.
+                break
+
+            # Still on setup. Parse latest advance_phase response to
+            # discover which check failed.
+            recs_8 = observer.all_records()
+            failed_check = _last_advance_failed_check(recs_8)
+            if not failed_check:
+                # Couldn't parse; abort.
+                raise AssertionError(
+                    f"sub-act 8 attempt {attempt+1}: advance_phase "
+                    "did not advance and we couldn't determine the "
+                    "failing check from the JSONL. Pane:\n"
+                    + driver.capture_pane()
+                )
+            observed_check_types.append(failed_check["check_type"])
+
+            ct = failed_check["check_type"]
+            if ct == "artifact-dir-ready-check":
+                # Set the artifact dir.
+                marker_8s = idle.latest_stop_uuid(observer)
+                driver.send(
+                    f"Call mcp__operon__set_artifact_dir with "
+                    f"path='{artifact_dir}'. After it returns, "
+                    "reply 'ARTIFACT-DIR-SET' and stop."
+                )
+                ok_8s = idle.wait_idle_pre_kill(
+                    observer=observer,
+                    inboxes_tracker=inbox_tracker,
+                    timeout_s=SUB_ACT_TIMEOUT_S,
+                    k_ms=IDLE_K_MS,
+                    after_marker_uuid=marker_8s,
+                )
+                assert ok_8s, (
+                    "sub-act 8: set_artifact_dir timed out.\n"
+                    + driver.capture_pane()
+                )
+            elif ct == "file-exists-check":
+                # Create the missing file. Use a .md placeholder
+                # path under the artifact dir.
+                missing = failed_check.get("missing_path") or ""
+                if not missing:
+                    raise AssertionError(
+                        f"file-exists-check failed but no path was "
+                        f"parsed from the response. Full failed_check: "
+                        f"{failed_check}"
+                    )
+                missing_path = Path(missing)
+                missing_path.parent.mkdir(parents=True, exist_ok=True)
+                # .md content is exempt from no_direct_code_coordinator's
+                # exclude_if_matches; we can write it directly. Use a
+                # Bash echo via the harness (no token cost) rather than
+                # asking the lead.
+                missing_path.write_text(
+                    f"# Placeholder for {missing_path.name}\n\n"
+                    f"Created by sub-act 8 cascade.\n",
+                    encoding="utf-8",
+                )
+
+        # After the loop: verify advance succeeded.
+        final_phase_state = json.loads(
+            phase_state_path.read_text(encoding="utf-8")
+        )
+        new_phase_8 = final_phase_state.get("current_phase")
+        assert new_phase_8 != "setup", (
+            f"sub-act 8: advance_phase never escaped 'setup' "
+            f"after {advance_attempts} attempts. Observed check "
+            f"types: {observed_check_types}.\n"
+            f"phase_state: {final_phase_state}"
+        )
+
+        # Coverage gate across the journey:
+        all_observed_check_types = set(observed_check_types) | {
+            "manual-confirm",  # from sub-act 3
+        }
+        coverage_required = {
+            "manual-confirm",
+            "artifact-dir-ready-check",
+            "file-exists-check",
+        }
+        coverage_met = coverage_required.issubset(all_observed_check_types)
+
+        # Team broadcast inspection. Per Boaz: each active
+        # teammate's inbox gets a `[operon:phase-advance
+        # <new_phase>]` entry. operon receives no broadcast
+        # (it's the writer, not a recipient).
+        comp_inbox_8 = []
+        impl_inbox_8 = []
+        lead_inbox_8 = []
+        operon_inbox_8 = []
+        if comp_inbox_path.is_file():
+            try:
+                comp_inbox_8 = json.loads(comp_inbox_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+        if impl_inbox_path.is_file():
+            try:
+                impl_inbox_8 = json.loads(impl_inbox_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+        if lead_inbox_path.is_file():
+            try:
+                lead_inbox_8 = json.loads(lead_inbox_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+        if operon_inbox_path_6.is_file():
+            try:
+                operon_inbox_8 = json.loads(operon_inbox_path_6.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+
+        def _has_brief(inbox: list, phase: str) -> bool:
+            tok = f"[operon:phase-advance {phase}]"
+            return any(
+                isinstance(m, dict) and tok in (m.get("text") or "")
+                for m in inbox
+            )
+
+        comp_got_brief = _has_brief(comp_inbox_8, new_phase_8)
+        impl_got_brief = _has_brief(impl_inbox_8, new_phase_8)
+        lead_got_brief = _has_brief(lead_inbox_8, new_phase_8)
+        operon_got_brief = _has_brief(operon_inbox_8, new_phase_8)
+
+        # Lead's brief should be the REAL content (coordinator/
+        # <new_phase>.md exists in the workflow tree). Composability
+        # and implementer get the fallback line (by workflow design).
+        lead_brief_text = ""
+        for m in lead_inbox_8:
+            if not isinstance(m, dict):
+                continue
+            t = m.get("text") or ""
+            if f"[operon:phase-advance {new_phase_8}]" in t:
+                lead_brief_text = t
+        fallback_marker = "no brief content found"
+        lead_brief_is_fallback = fallback_marker in lead_brief_text
+
+        assert comp_got_brief, "MUST-see: composability didn't get phase-advance brief."
+        assert impl_got_brief, "MUST-see: implementer didn't get phase-advance brief."
+        assert lead_got_brief, "MUST-see: team-lead didn't get phase-advance brief."
+        assert not operon_got_brief, (
+            "MUST-NOT-see: operon's inbox received a "
+            "phase-advance brief (operon is the writer, not a "
+            "recipient)."
+        )
+        assert not lead_brief_is_fallback, (
+            "MUST-see: team-lead's brief should carry the real "
+            "coordinator/<new_phase>.md content (the agent_type="
+            "coordinator fixture wiring should resolve the brief "
+            "lookup). Got fallback marker in:\n"
+            + lead_brief_text[:500]
+        )
+        assert coverage_met, (
+            f"MUST-see: all advance-check types covered across "
+            f"the journey. Observed: {sorted(all_observed_check_types)}. "
+            f"Required: {sorted(coverage_required)}."
+        )
+
+        meter.checkpoint("sub_act_8")
+        meter.assert_under_cap("sub_act_8")
+        bundle.snapshot(
+            "sub_act_8_advance_setup_to_leadership",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "new_phase": new_phase_8,
+                "advance_attempts": advance_attempts,
+                "observed_check_types": observed_check_types,
+                "coverage_met": coverage_met,
+                "lead_brief_excerpt": lead_brief_text[:400],
+                "comp_got_brief": comp_got_brief,
+                "impl_got_brief": impl_got_brief,
+                "lead_got_brief": lead_got_brief,
+                "operon_got_brief": operon_got_brief,
+            },
+        )
+        gate_check(
+            "sub_act_8",
+            must_hold=[
+                ("phase advanced past setup", new_phase_8 != "setup"),
+                ("composability got brief", comp_got_brief),
+                ("implementer got brief", impl_got_brief),
+                ("team-lead got brief", lead_got_brief),
+                ("operon did NOT get brief", not operon_got_brief),
+                ("team-lead brief is NOT fallback", not lead_brief_is_fallback),
+                ("advance-check coverage met", coverage_met),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+            ],
+        )
+
+        # =============== SUB-ACT 9: halt session ===============
+        # User ends the session via /exit. Operon's run-dir state
+        # (.operon/<run>/) and the sidechain transcripts under
+        # ~/.claude/projects/<cwd-mangled>/ must SURVIVE the exit.
+        # CC v2.1.150 empirically cleans ~/.claude/teams/<run>/ on
+        # exit (per Boaz) -- that's EXPECTED and not a failure;
+        # operon-side state is what matters for the restore in
+        # sub-act 10.
+        recorder.set_sub_act("sub_act_9_halt_session")
+        recorder.record(
+            user_observable=(
+                "The user exits the session. Operon state and "
+                "sidechain transcripts persist so restore can "
+                "re-attach."
+            ),
+            precise_state={
+                "operon_run_dir": str(run_dir),
+                "project_dir": str(transcript_path.parent),
+            },
+        )
+
+        # Capture pre-halt state to verify it survives.
+        operon_run_dir_pre = run_dir.is_dir()
+        sidechain_jsonls_pre = list(transcript_path.parent.glob("*.jsonl"))
+        sidechain_jsonl_count_pre = len(sidechain_jsonls_pre)
+
+        # Send /exit. Then wait for tmux session pid to disappear.
+        marker_9 = idle.latest_stop_uuid(observer)
+        driver.send("/exit")
+        # Don't wait_idle (the lead is exiting, not replying).
+        # Use during-kill predicate: wait until tmux pid is gone.
+        ok_9 = idle.wait_idle_during_kill(
+            pid_check=lambda: driver.session_pid(),
+            timeout_s=30.0,
+            poll_s=0.5,
+        )
+        # Belt-and-braces: if /exit didn't work cleanly, kill the
+        # tmux session to ensure we proceed.
+        if not ok_9:
+            driver.kill()
+        # Capture post-halt state.
+        operon_run_dir_post = run_dir.is_dir()
+        sidechain_jsonls_post = list(transcript_path.parent.glob("*.jsonl"))
+
+        assert operon_run_dir_post, (
+            "MUST-see: operon run-dir at "
+            f"{run_dir} did NOT survive the halt."
+        )
+        assert sidechain_jsonls_post, (
+            "MUST-see: sidechain JSONL transcripts at "
+            f"{transcript_path.parent} did NOT survive the halt."
+        )
+        # MUST-NOT-see: team config dir survives. (Per Boaz, it
+        # gets cleaned on exit; if it lingers, something changed.)
+        team_dir_post = (teams_dir / RUN_NAME).is_dir()
+
+        meter.checkpoint("sub_act_9")
+        meter.assert_under_cap("sub_act_9")
+        bundle.snapshot(
+            "sub_act_9_halt_session",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "operon_run_dir_pre": operon_run_dir_pre,
+                "operon_run_dir_post": operon_run_dir_post,
+                "sidechain_jsonls_pre": sidechain_jsonl_count_pre,
+                "sidechain_jsonls_post": len(sidechain_jsonls_post),
+                "team_dir_post": team_dir_post,
+            },
+        )
+        gate_check(
+            "sub_act_9",
+            must_hold=[
+                ("operon run-dir survived halt", operon_run_dir_post),
+                ("sidechain JSONLs survived halt", bool(sidechain_jsonls_post)),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+            ],
+        )
+
+        # =============== SUB-ACT 10: restore + first-person recall ===============
+        # Launch a NEW CC session in the same cwd. Call
+        # restore_operon_session(run_name). Follow the returned
+        # lead_instructions: TeamCreate(agent_type="coordinator")
+        # to recreate the team scaffold; Agent-spawn composability;
+        # the operon PreToolUse hook (WA1) walks the sidechain
+        # transcripts and prepends them into the spawn prompt so
+        # composability has first-person recall on its first turn.
+        recorder.set_sub_act("sub_act_10_restore_and_recall")
+        recorder.record(
+            user_observable=(
+                "After exiting, the user resumes work later. "
+                "Operon restores the team config; the WA1 hook "
+                "feeds prior sidechain transcripts into the "
+                "respawned teammate; composability recalls "
+                "verbatim what it discussed in the prior "
+                "session."
+            ),
+            precise_state={
+                "restore_run_name": RUN_NAME,
+                "halted_phase": new_phase_8,
+            },
+        )
+
+        # New session. Reuse the tmp_cwd; new session_uuid; new
+        # tmux session_name. Re-bind the observer to the new
+        # transcript path.
+        session_id_10 = str(uuid.uuid4())
+        session_name_10 = f"ptw10-{session_id_10[:8]}"
+        transcript_path_10 = transcript_observer.find_transcript(
+            tmp_cwd, session_id_10
+        )
+        driver_10 = tmux_driver.TmuxClaudeDriver(
+            session_name=session_name_10,
+            cwd=tmp_cwd,
+            plugin_dir=operon_plugin_dir,
+            session_uuid=session_id_10,
+            extra_env={"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+            model="sonnet",
+        )
+
+        try:
+            driver_10.start()
+
+            # Rebind observer + meter to the new transcript.
+            observer.rebind(transcript_path_10)
+            meter.transcript_path = transcript_path_10
+            meter.seen_uuids.clear()
+
+            # Wait briefly for first turn so transcript exists.
+            time.sleep(3.0)
+
+            # Step A: call restore_operon_session.
+            marker_10a = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "Call mcp__operon__restore_operon_session with "
+                f"run_name='{RUN_NAME}'. After it returns, report "
+                "ONLY the JSON response and stop."
+            )
+            ok_10a = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_10a,
+            )
+            assert ok_10a, (
+                "sub-act 10A: restore_operon_session timed out.\n"
+                + driver_10.capture_pane()
+            )
+
+            # Step B: re-establish team. TeamCreate(coordinator)
+            # then Agent spawn composability.
+            marker_10b = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "Follow the lead_instructions returned by "
+                "restore_operon_session. Specifically: (1) call "
+                f"TeamCreate with team_name='{RUN_NAME}' and "
+                "agent_type='coordinator'; (2) use the Agent tool "
+                "to spawn composability with run_in_background=true, "
+                "name='composability', subagent_type='composability', "
+                f"team_name='{RUN_NAME}', and a brief 'You are "
+                "composability; the operon WA1 hook will feed "
+                "prior transcripts.' prompt. After both return, "
+                "reply 'RESTORED' and stop."
+            )
+            ok_10b = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_10b,
+            )
+            assert ok_10b, (
+                "sub-act 10B: TeamCreate + Agent spawn timed out.\n"
+                + driver_10.capture_pane()
+            )
+
+            # Step C: focus composability, ask for first-person
+            # recall of the prior session's content.
+            focused_10 = driver_10.focus_teammate_thread(
+                "composability", max_hops=4
+            )
+            assert focused_10, (
+                "sub-act 10C: could not focus composability "
+                "after respawn. current_focus="
+                f"{driver_10.current_focus()!r}.\n"
+                + driver_10.capture_pane()
+            )
+            marker_10c = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "What did we discuss before this session? Be "
+                "specific. List in plain prose: (1) any messages "
+                "you sent to implementer or to team-lead, (2) any "
+                "[OPERON_REPLY] payload you received from operon, "
+                "(3) any phase-advance brief you got. Reply with "
+                "the recall content and stop -- no commentary on "
+                "the format."
+            )
+            ok_10c = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_10c,
+            )
+            assert ok_10c, (
+                "sub-act 10C: recall query timed out.\n"
+                + driver_10.capture_pane()
+            )
+
+            # Assert concrete-fact recall.
+            recs_10 = observer.all_records()
+            recs_10_blob = json.dumps(recs_10, ensure_ascii=False)
+            recall_concrete_facts = [
+                ("hi from composability", "hi from composability" in recs_10_blob),
+                ("reporting in", "reporting in" in recs_10_blob),
+                ("OPERON_REPLY whoami", "OPERON_REPLY" in recs_10_blob
+                 and "whoami" in recs_10_blob),
+                ("phase-advance leadership", "phase-advance" in recs_10_blob
+                 and "leadership" in recs_10_blob),
+            ]
+            recall_hits = [name for name, hit in recall_concrete_facts if hit]
+            # MUST-see: at least 2 of the 4 concrete facts recalled.
+            assert len(recall_hits) >= 2, (
+                f"MUST-see: composability's recall after restore "
+                f"hit fewer than 2 of the 4 expected concrete "
+                f"facts. Hits: {recall_hits}. Expected at least "
+                f"two of: {[n for n,_ in recall_concrete_facts]}."
+            )
+            # MUST-NOT-see: composability claims it has no prior
+            # memory (a known failure mode of WA1-not-firing).
+            recall_no_memory = any(
+                phrase in recs_10_blob.lower()
+                for phrase in (
+                    "i don't have any prior",
+                    "no prior session",
+                    "fresh session",
+                    "i have no memory of",
+                )
+            )
+            assert not recall_no_memory, (
+                "MUST-NOT-see: composability claimed it has no "
+                "prior memory -- WA1 transcript injection did not "
+                "fire."
+            )
+
+            meter.checkpoint("sub_act_10")
+            meter.assert_under_cap("sub_act_10")
+            bundle.snapshot(
+                "sub_act_10_restore_and_recall",
+                token_state={
+                    "cumulative": meter.cumulative.__dict__,
+                    "billable": meter.cumulative.billable,
+                },
+                notes={
+                    "restore_session_id": session_id_10,
+                    "recall_hits": recall_hits,
+                    "concrete_facts": [n for n, _ in recall_concrete_facts],
+                },
+            )
+            gate_check(
+                "sub_act_10",
+                must_hold=[
+                    ("at least 2 concrete facts recalled", len(recall_hits) >= 2),
+                    ("no 'no prior memory' disclaimer", not recall_no_memory),
+                    ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
+                ],
+            )
+        finally:
+            driver_10.kill()
 
         # Until sub-acts 2-10 land, the test exits cleanly after
         # sub-act 1's gate_check passes. This is intentional: each
