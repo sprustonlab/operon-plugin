@@ -28,12 +28,14 @@ import time
 from pathlib import Path
 
 #: Pinned Claude Code version. Q1 originally pinned 2.1.144; the
-#: local install auto-updated mid-implementation. Re-pin to 2.1.148
-#: (the version on PATH at implementation time) per Q1-update
-#: option (a). The pin's purpose is drift visibility, not eternal
-#: freezing -- a CC auto-update fires this gate, prompting a re-pin
-#: decision.
-PINNED_CC_VERSION = "2.1.148"
+#: local install auto-updates. Per Q1-update option (a), the pin
+#: tracks whatever is on PATH at deliberate re-pin time. Update
+#: history:
+#:   2.1.144 -> 2.1.148  (CC auto-update during milestone 1)
+#:   2.1.148 -> 2.1.150  (CC auto-update at start of post-fix chain run)
+#: The pin's purpose is drift visibility, not eternal freezing --
+#: a CC auto-update fires this gate, prompting a re-pin decision.
+PINNED_CC_VERSION = "2.1.150"
 
 #: Required keys an inbox entry MUST carry. Optional keys (``summary``,
 #: ``color``) are not required. Derived from operon's ``inbox.py``

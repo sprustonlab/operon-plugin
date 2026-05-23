@@ -254,6 +254,60 @@ class TmuxClaudeDriver:
         r = self._tmux("capture-pane", "-t", self.session_name, "-p", "-J", "-S", "-2000")
         return r.stdout or ""
 
+    def focus_main_thread(self, settle_s: float = 0.5, hops: int = 6) -> None:
+        """Return TUI focus to the lead's main conversation thread.
+
+        Empirically in CC v2.1.150: after the lead spawns a
+        teammate via Agent(run_in_background=true), the TUI's
+        input cursor jumps into the new teammate's conversation
+        thread (footer shows e.g. ``@composability``). Subsequent
+        driver.send() lands in that teammate's channel; teammates
+        cannot spawn other named teammates ("the team roster is
+        flat"), so the harness must return focus to main between
+        sequential spawn turns.
+
+        The CC keybinding is Shift+Up to cycle towards main
+        (counterpart of Shift+Down to enter a teammate). Sending
+        Shift+Up multiple times eventually lands on main
+        regardless of the starting position. ``hops`` controls
+        how many Shift+Up presses to send; 6 is enough to step
+        past several teammates back to the top.
+        """
+        for _ in range(hops):
+            # tmux's named keysym for Shift+Up is `S-Up`. Send
+            # it and check the pane after each press to detect
+            # when the @teammate decoration has cleared.
+            self.send_special("S-Up")
+            time.sleep(0.3)
+            buf = self.capture_pane()
+            # The footer shows `── @<teammate-name> ──` when
+            # focused on a teammate. Absence of that decoration
+            # means we're on main.
+            if "── @" not in buf and "@composability" not in buf and "@implementer" not in buf and "@skeptic" not in buf:
+                break
+        time.sleep(settle_s)
+
+    def focus_teammate_thread(
+        self, teammate_name: str, settle_s: float = 0.5, max_hops: int = 8
+    ) -> bool:
+        """Move TUI focus into a specific teammate's conversation.
+
+        Used by sub-acts 6+7 where the harness needs to direct
+        a message from a specific teammate. Sends Shift+Down
+        repeatedly and checks the pane footer after each step;
+        stops when the footer mentions ``@<teammate_name>``.
+        Returns True if the teammate was reached.
+        """
+        for _ in range(max_hops):
+            self.send_special("S-Down")
+            time.sleep(0.15)
+            buf = self.capture_pane()
+            if f"@{teammate_name}" in buf:
+                time.sleep(settle_s)
+                return True
+        time.sleep(settle_s)
+        return False
+
     def accept_elicit_form(
         self,
         wait_for_substring: str,

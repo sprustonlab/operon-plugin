@@ -148,24 +148,35 @@ class TranscriptObserver:
         return None
 
     def last_assistant_stop(
-        self, terminal_only: bool = True
+        self,
+        terminal_only: bool = True,
+        lead_only: bool = True,
     ) -> dict | None:
-        """Return the most recent assistant record with a stop_reason.
+        """Return the most recent LEAD assistant record with a stop_reason.
 
-        ``terminal_only=True`` (default) restricts to records whose
-        ``stop_reason`` indicates the END of a user-turn-handling
-        sequence (i.e. ``end_turn`` or ``max_tokens``). Intermediate
-        ``stop_reason: tool_use`` records, which occur when the
-        assistant pauses to invoke a tool but will continue, are
-        skipped. This is what callers want when waiting for an idle
-        session.
+        ``terminal_only=True`` (default): restrict to ``stop_reason``
+        in {end_turn, max_tokens}. Intermediate ``stop_reason:
+        tool_use`` records, which mean the assistant paused mid-turn
+        to invoke a tool, are skipped.
 
-        Set ``terminal_only=False`` to get any assistant message with
-        any stop_reason (legacy/debug behavior).
+        ``lead_only=True`` (default): restrict to records that are NOT
+        sidechain (i.e. the lead's own messages, not an in-process
+        teammate sub-agent). Empirically in CC v2.1.150 in-process
+        teammates share the lead's session JSONL but carry
+        ``isSidechain: true``; treating a teammate's end_turn as the
+        lead's idle signal makes the harness return early before the
+        lead has actually processed the new user prompt (observed
+        symptom: third teammate spawn turn drops because the second
+        teammate's reply triggers wait_idle to return).
+
+        Set either flag to False to widen the filter for
+        legacy/debug introspection.
         """
         terminal = {"end_turn", "max_tokens"}
         for rec in reversed(self._records):
             if rec.get("type") != "assistant":
+                continue
+            if lead_only and rec.get("isSidechain") is True:
                 continue
             msg = rec.get("message") or {}
             sr = msg.get("stop_reason")
