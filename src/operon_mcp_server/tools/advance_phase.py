@@ -128,14 +128,20 @@ def _read_phase_brief(
 ) -> tuple[str, str] | None:
     """Resolve the per-role phase brief for ``new_phase``.
 
+    ``role`` must be a WORKFLOW ROLE id (matches a top-level role
+    folder under ``workflow_root``), NOT the team-member ``name``
+    -- callers in :func:`_build_brief_map` are responsible for
+    resolving ``name -> agentType -> role`` before calling.
+
     Lookup order (matches Land 3 dispatch's priority rules):
 
       1. ``<workflow_root>/<role>/<new_phase>.md`` -- role-specific
          brief for the destination phase.
       2. ``<workflow_root>/<new_phase>.md`` -- a phase-level brief
          shared across roles (used as the fallback for members
-         whose name does not match a role directory, e.g. the
-         lead with name ``"team-lead"``).
+         whose agentType is not represented by a role directory
+         in the workflow -- e.g. a future operon-stub-style
+         placeholder).
 
     Returns ``(body_text, source_path_str)`` on first hit, or
     ``None`` if neither file exists. Bodies are returned verbatim
@@ -170,6 +176,17 @@ def _build_brief_map(
 
     For each non-excluded member with a non-empty name:
 
+      * Resolve the member's WORKFLOW ROLE from its ``agentType``
+        field (the team-config slot that
+        :func:`_do_advance`'s roster-enforcement check requires
+        to match a valid role in the active workflow per
+        commit eee38a6). Fall back to the member ``name`` only
+        when ``agentType`` is missing or empty -- under the
+        Land 1 convention name == agentType for operon-
+        installed roles, but TeamCreate allows a distinct lead
+        ``name`` (e.g. ``"team-lead"``) over ``agentType``
+        (e.g. ``"coordinator"``), so keying on name silently
+        misses the role's brief folder.
       * Try the role-specific then phase-level lookup via
         :func:`_read_phase_brief`. If a body is found, that
         ``(body, source)`` pair is the recipient's brief.
@@ -195,7 +212,9 @@ def _build_brief_map(
             continue
         if name in excluded:
             continue
-        looked_up = _read_phase_brief(workflow_root, name, new_phase)
+        agent_type = m.get("agentType")
+        role = agent_type if isinstance(agent_type, str) and agent_type else name
+        looked_up = _read_phase_brief(workflow_root, role, new_phase)
         if looked_up is None:
             body, source = fallback_body, fallback_source
         else:
