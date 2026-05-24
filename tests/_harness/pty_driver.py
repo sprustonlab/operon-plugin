@@ -338,18 +338,50 @@ class PtyClaudeDriver:
 
     # ----- focus navigation (mirrors tmux_driver helpers) -----
 
+    #: CC v2.1.150's team-panel widget uses TWO distinct row
+    #: decorations on the LEFT margin:
+    #:   ``╒═ team-lead``        -- the team-lead row anchor
+    #:   ``╞═ @<teammate-name>`` -- the SELECTED teammate row
+    #: The cursor ``❯`` then indicates which row is currently
+    #: navigable (always next to one of these markers). The
+    #: harness considers EITHER marker as "focus" for parsing
+    #: purposes.
+    TEAMMATE_MARKER = "╞═"
+
     def current_focus(self) -> str | None:
-        """Return the row name currently in focus (carrying ``╒═``)."""
+        """Return the row name currently in focus.
+
+        Looks for the cursor ``❯`` on a row carrying ``╒═`` or
+        ``╞═``. Returns the row name (``team-lead`` or
+        ``<teammate-name>`` without the ``@`` prefix). Falls back
+        to the most-recent marker line if no cursor is found.
+        """
         buf = self.screen_text()
+        # First pass: find the cursored row.
         for line in buf.splitlines():
-            idx = line.find(self.FOCUS_MARKER)
-            if idx < 0:
+            if "❯" not in line:  # ❯
                 continue
-            tail = line[idx + len(self.FOCUS_MARKER):].strip()
-            if not tail:
-                continue
-            return tail.split()[0].strip(".·")
-        return None
+            for marker in (self.FOCUS_MARKER, self.TEAMMATE_MARKER):
+                idx = line.find(marker)
+                if idx < 0:
+                    continue
+                tail = line[idx + len(marker):].strip()
+                if not tail:
+                    continue
+                name = tail.split()[0].strip(".·@:")
+                return name
+        # Fallback: most recent ╞═ marker (e.g. teammate selected
+        # but cursor parked elsewhere).
+        latest = None
+        for line in buf.splitlines():
+            for marker in (self.FOCUS_MARKER, self.TEAMMATE_MARKER):
+                idx = line.find(marker)
+                if idx < 0:
+                    continue
+                tail = line[idx + len(marker):].strip()
+                if tail:
+                    latest = tail.split()[0].strip(".·@:")
+        return latest
 
     def wait_for_team_panel(
         self, timeout_s: float = 30.0, poll_s: float = 0.5
@@ -357,44 +389,98 @@ class PtyClaudeDriver:
         """Block until the lead's team-panel widget appears."""
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if self.FOCUS_MARKER in self.screen_text():
+            buf = self.screen_text()
+            if self.FOCUS_MARKER in buf or self.TEAMMATE_MARKER in buf:
                 return True
             time.sleep(poll_s)
+        return False
+
+    def _enter_team_panel(self, hops: int = 6, poll_s: float = 0.3) -> bool:
+        """Move TUI focus from the input field into the team-panel widget.
+
+        Empirically (M2j keynav diag): plain ``Up`` in the input
+        field scrolls input history (or moves to a channel view);
+        ``Shift+Up`` is what actually enters the team-panel widget.
+        Once inside the panel, plain ``Down`` / ``Up`` navigates
+        rows.
+
+        Send Shift+Up until the cursor (``❯``) lands next to a
+        ``╒═`` or ``╞═`` marker. Returns True if the panel is
+        entered.
+        """
+        for _ in range(hops):
+            buf = self.screen_text()
+            for line in buf.splitlines():
+                if "❯" in line and (
+                    self.FOCUS_MARKER in line
+                    or self.TEAMMATE_MARKER in line
+                ):
+                    return True
+            self.send_special("S-Up")
+            time.sleep(poll_s)
+        buf = self.screen_text()
+        for line in buf.splitlines():
+            if "❯" in line and (
+                self.FOCUS_MARKER in line
+                or self.TEAMMATE_MARKER in line
+            ):
+                return True
         return False
 
     def focus_main_thread(
         self, settle_s: float = 0.5, max_hops: int = 6
     ) -> bool:
-        """Move focus to the lead's team-lead row."""
+        """Move focus to the lead's team-lead row.
+
+        Empirically (M2j keynav diag, /tmp/operon-tui-investigation/
+        keynav/): plain ``Up`` (``\\x1b[A``) navigates the team-panel
+        up. Shift+Up (``\\x1b[1;2A``) does NOT. Send Up enough to
+        first leave the input field, then verify the cursor lands
+        on team-lead.
+        """
         if not self.wait_for_team_panel(timeout_s=30.0):
             return False
         for _ in range(max_hops + 1):
             if self.current_focus() == "team-lead":
                 time.sleep(settle_s)
                 return True
-            self.send_special("S-Up")
-            time.sleep(0.25)
+            self.send_special("Up")
+            time.sleep(0.3)
         time.sleep(settle_s)
         return self.current_focus() == "team-lead"
 
     def focus_teammate_thread(
         self, teammate_name: str, settle_s: float = 0.5, max_hops: int = 8
     ) -> bool:
-        """Move focus into ``teammate_name``'s channel."""
+        """Move focus into ``teammate_name``'s channel.
+
+        Phase 1: move cursor out of the input field and onto the
+        team panel by sending Up until the cursor is on a marker
+        row. Phase 2: send Down N times to navigate within the
+        panel to the target row.
+        """
         if not self.wait_for_team_panel(timeout_s=30.0):
             return False
         if self.current_focus() == teammate_name:
             time.sleep(settle_s)
             return True
+        # Phase 1: exit input field, anchor on the panel (lands on
+        # team-lead, the topmost row).
+        self._enter_team_panel(hops=max_hops)
+        if self.current_focus() == teammate_name:
+            time.sleep(settle_s)
+            return True
+        # Phase 2: navigate Down to find the target.
         for _ in range(max_hops):
-            self.send_special("S-Down")
-            time.sleep(0.25)
+            self.send_special("Down")
+            time.sleep(0.3)
             if self.current_focus() == teammate_name:
                 time.sleep(settle_s)
                 return True
+        # Recovery: maybe overshot; try Up.
         for _ in range(max_hops):
-            self.send_special("S-Up")
-            time.sleep(0.25)
+            self.send_special("Up")
+            time.sleep(0.3)
             if self.current_focus() == teammate_name:
                 time.sleep(settle_s)
                 return True
