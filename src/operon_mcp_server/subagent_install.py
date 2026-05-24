@@ -151,6 +151,30 @@ subsequent turn, prefixed with `[OPERON_REPLY] <command>`.
 
 This is a verified-identity channel: the response is guaranteed
 to be scoped to your team-member identity, not the lead's.
+
+Wait-then-forward semantics. If a task asks you to query operon
+AND THEN forward the reply somewhere (e.g. to another teammate
+or back to the lead), follow this sequence STRICTLY:
+
+  1. Send the `[OPERON_QUERY] <command>` SendMessage to operon.
+  2. Stop. End your turn. Do NOTHING else this turn.
+  3. On each subsequent turn, check your inbox. If the actual
+     `[OPERON_REPLY] <command> {...}` line from operon is NOT
+     yet present, end the turn silently again. Silence while
+     awaiting the reply is the correct behavior.
+  4. Only AFTER the real `[OPERON_REPLY] <command> {...}` line
+     (with a JSON payload body) appears in your inbox, send the
+     forward. The forward MUST contain the verbatim `[OPERON_REPLY]`
+     line you actually received, including its JSON payload --
+     not a paraphrase, not a status update.
+
+Do NOT send placeholder forwards such as
+`FORWARD: [OPERON_REPLY] whoami - waiting for response, will
+forward once received`. A "waiting" or "pending" forward is
+WRONG: it pollutes the recipient's inbox with a non-answer and
+makes the downstream test/observer think the reply has arrived
+when it has not. If you have no real `[OPERON_REPLY]` line to
+forward yet, send nothing.
 """
 
 #: Frontmatter delimiter regex (mirrors spawn_agent.py's parser but
