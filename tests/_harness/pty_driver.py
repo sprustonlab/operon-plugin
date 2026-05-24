@@ -461,31 +461,36 @@ class PtyClaudeDriver:
         """
         if not self.wait_for_team_panel(timeout_s=30.0):
             return False
-        if self.current_focus() == teammate_name:
-            time.sleep(settle_s)
-            return True
-        # Phase 1: exit input field, anchor on the panel (lands on
-        # team-lead, the topmost row).
+        # Phase 1: exit input field, anchor on the panel.
         self._enter_team_panel(hops=max_hops)
-        if self.current_focus() == teammate_name:
+        # Phase 2: navigate Down to find the target's ╞═ marker.
+        landed = self.current_focus() == teammate_name
+        if not landed:
+            for _ in range(max_hops):
+                self.send_special("Down")
+                time.sleep(0.3)
+                if self.current_focus() == teammate_name:
+                    landed = True
+                    break
+        if not landed:
+            for _ in range(max_hops):
+                self.send_special("Up")
+                time.sleep(0.3)
+                if self.current_focus() == teammate_name:
+                    landed = True
+                    break
+        if not landed:
             time.sleep(settle_s)
-            return True
-        # Phase 2: navigate Down to find the target.
-        for _ in range(max_hops):
-            self.send_special("Down")
-            time.sleep(0.3)
-            if self.current_focus() == teammate_name:
-                time.sleep(settle_s)
-                return True
-        # Recovery: maybe overshot; try Up.
-        for _ in range(max_hops):
-            self.send_special("Up")
-            time.sleep(0.3)
-            if self.current_focus() == teammate_name:
-                time.sleep(settle_s)
-                return True
-        time.sleep(settle_s)
-        return self.current_focus() == teammate_name
+            return False
+        # Phase 3: press Enter to SWITCH into the teammate's
+        # channel view (footer hint observed empirically:
+        # "enter to view"). Without this, the panel is just
+        # highlighted; the channel-input cursor stays in the
+        # lead's pane and subsequent driver.send() goes to the
+        # wrong place.
+        self.send_special("Enter")
+        time.sleep(settle_s + 0.3)
+        return True
 
     def accept_elicit_form(
         self,
