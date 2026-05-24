@@ -1,28 +1,51 @@
 """E2E scenario: a user walks the `project_team` workflow end-to-end.
 
-Dimensions covered (per the testing vision):
+Originally one E2E test function (`test_project_team_workflow`)
+spanning all 10 sub-acts. Split per Land 13 into two tests after
+the Land 12 + Group B diagnostic (commit a9ed0ae) empirically
+confirmed (3/3 PASS isolated, 1/3 PASS chain) that LLM context
+saturation across sub-acts 5/6/7 caused sub-act 8's advance_phase
+prompt to be interpreted as a summary directive at a 67% rate.
 
-- Lifecycle: fresh -> restored (sub-acts 1-9 fresh; sub-act 10 restore).
-- Cardinality: zero (sub-acts 1-3) -> many teammates (sub-acts 4-10:
-  composability + implementer + skeptic = 3 teammates).
-- Phase trajectory: stays (sub-acts 1-2, 4-7) -> advances (sub-acts 3, 8).
-- Inbound traffic: none (1-3) -> mixed cross-talk + queries (4-7).
-- Guardrail surface: silent (1-2, 4) -> firing (3, 5, 8).
-- Workflow longevity: multi-phase (vision -> setup -> leadership at
-  minimum; further if check-type coverage requires).
+The two tests are:
 
-This scenario is the operon-plugin port of claudechic's project_team
-testing intent. The test bed is real subscription-path Claude Code
-v2.1.148 driven via tmux, observed via JSONL transcript.
+- ``test_project_team_coordination_chain`` (sub-acts 1-7):
+  pre-activation guardrail through teammate cross-talk + whoami.
+  Stops cleanly at sub-act 7's gate. ~50K cumulative tokens.
+
+- ``test_project_team_advance_lifecycle`` (sub-acts 8, 9, 10) from
+  a fresh state with minimal scaffolding (activate workflow +
+  vision->setup advance + spawn). The lead sees NO send_to_member,
+  NO Monitor flushes, NO teammate coordination before sub-act 8's
+  advance_phase call -- a "clean-room" advance lifecycle. ~80-120K
+  cumulative tokens.
+
+Together the two tests preserve coverage of all originally-tested
+behaviors. The dimensions matrix below is now split across them:
+
+- Lifecycle: chain test = fresh; lifecycle test = fresh -> restored.
+- Cardinality: zero (1-3) -> 2 teammates (composability + implementer
+  per Q3 path b). Both tests reach "many".
+- Phase trajectory: stays + 1 advance (chain test); 2 advances + halt
+  + restore (lifecycle test).
+- Inbound traffic: none (1-3) -> mixed cross-talk + queries (4-7) in
+  chain; none in lifecycle (no coordination).
+- Guardrail surface: silent (1-2, 4) -> firing (3, 5) in chain;
+  silent in lifecycle.
+- Workflow longevity: vision -> setup (chain test); vision -> setup
+  -> leadership + restore (lifecycle test).
+
+Test bed: real subscription-path Claude Code v2.1.150 driven via
+pty driver (`tests/_harness/pty_driver.py`), observed via JSONL
+transcript. Filesystem-only fixtures.
 
 Per the TEST_SPECIFICATION compliance checklist:
-- File + function name match the scenario name (`project_team_workflow`).
-- TOKEN_CAP declared at module level (250000 per Q2 coordinator answer).
+- TOKEN_CAP / TOKEN_CAP_ADVANCE_LIFECYCLE declared at module level.
 - Each sub-act has at least one "MUST NOT see" assertion.
 - Each sub-act emits a snapshot waypoint.
 - Each sub-act ends with a `gate_check`.
-- Idle waits use the harness `wait_idle_pre_kill`; no time.sleep on
-  wall-clock-only.
+- Idle waits use the harness `wait_idle_pre_kill`; no time.sleep
+  for wall-clock-only synchronization.
 - Fixture pins bundled `project_team` workflow (workflow_id:
   project_team).
 """
@@ -210,12 +233,27 @@ def _seed_fixture(tmp_cwd: Path) -> None:
 
 # --- scenario ---------------------------------------------------------------
 
-def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
-    """Walk the 10-sub-act journey end-to-end against real Claude Code.
+def test_project_team_coordination_chain(tmp_cwd, operon_plugin_dir, claude_driver_cls):
+    """Walk the project_team coordination chain (sub-acts 1-7).
 
-    This single test function is the scenario. Each sub-act is a
-    block within it; each block records a step, runs assertions,
-    snapshots, and gate-checks.
+    Originally one E2E test spanning all 10 sub-acts; split per the
+    Land 12 + Group B diagnostic (commit a9ed0ae) which empirically
+    confirmed (3/3 PASS isolated, 1/3 PASS chain) that LLM context
+    saturation across sub-acts 5/6/7 caused sub-act 8's
+    advance_phase prompt to be interpreted as a summary directive
+    at a 67% rate. Sub-acts 8, 9, 10 now live in
+    ``test_project_team_advance_lifecycle``. The two tests together
+    preserve coverage of all originally-tested behaviors.
+
+    This test covers:
+      Sub-act 1     -- pre-activation guardrail
+      Sub-act 1-ext -- fire -> ack -> retry envelope
+      Sub-act 2     -- TeamCreate(coordinator) + activate_workflow
+      Sub-act 3     -- advance vision -> setup (manual-confirm)
+      Sub-act 4     -- parallel spawn of composability + implementer
+      Sub-act 5     -- implementer deny + request_override + retry
+      Sub-act 6     -- teammate cross-talk (composability -> impl + lead)
+      Sub-act 7     -- composability runs [OPERON_QUERY] whoami
     """
     cc_version_gate.assert_cc_version()
     _seed_fixture(tmp_cwd)
@@ -1914,614 +1952,62 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
             ],
         )
-        # Monitor-leak guard (Land 12) at the 7 -> 8 boundary.
-        # Critical site: empirically the most common failure mode
-        # without this guard is the lead being blocked on its 4th
-        # Monitor task when sub-act 8 sends the advance_phase prompt.
-        idle.flush_lead_background_tasks(driver, observer)
 
-        # =============== SUB-ACT 8: advance setup -> leadership ===============
-        # Cascading-failure advance (per Boaz's walkthrough):
-        #   1. advance_phase fails: artifact-dir-ready-check
-        #   2. set_artifact_dir
-        #   3. advance_phase fails: file-exists-check (STATUS.md)
-        #   4. create STATUS.md
-        #   5. advance_phase fails: file-exists-check (userprompt.md)
-        #   6. create userprompt.md
-        #   7. advance_phase succeeds
-        # The advance-check coverage gate (manual-confirm +
-        # artifact-dir-ready-check + file-exists-check) is met
-        # across sub-acts 3 + 8.
-        recorder.set_sub_act("sub_act_8_advance_setup_to_leadership")
-        recorder.record(
-            user_observable=(
-                "Advancing setup -> leadership requires "
-                "discovering and satisfying prerequisites: "
-                "an artifact dir, then setup files. Once all "
-                "checks pass, the workflow advances and operon "
-                "broadcasts the new-phase brief to teammates."
-            ),
-            precise_state={
-                "from_phase": "setup",
-                "to_phase": "leadership",
-            },
-        )
-
-        # Return to team-lead for the advance flow.
-        focused_8 = driver.focus_main_thread(max_hops=4)
-        assert focused_8, (
-            f"sub-act 8 pre-step: could not return focus to "
-            f"team-lead. current_focus={driver.current_focus()!r}.\n"
-            f"Pane:\n{driver.capture_pane()}"
-        )
-
-        artifact_dir = tmp_cwd / ".project_team" / RUN_NAME
-        # Cascading-failure loop with hard cap.
-        MAX_ADVANCE_RETRIES = 6
-        advance_attempts = 0
-        observed_check_types: list[str] = []
-        for attempt in range(MAX_ADVANCE_RETRIES):
-            marker_8 = idle.latest_stop_uuid(observer)
-            if attempt == 0:
-                msg = (
-                    "Call mcp__operon__advance_phase now. After "
-                    "it returns, report the JSON response verbatim "
-                    "(if multi-line, just the outcomes list and "
-                    "the status). Stop."
-                )
-            else:
-                msg = (
-                    "Call mcp__operon__advance_phase AGAIN. After "
-                    "it returns, report the JSON response. Stop. "
-                    "Do not analyse or propose -- just report."
-                )
-            driver.send(msg)
-            ok_8 = idle.wait_idle_pre_kill(
-                observer=observer,
-                inboxes_tracker=inbox_tracker,
-                timeout_s=SUB_ACT_TIMEOUT_S,
-                k_ms=IDLE_K_MS,
-                after_marker_uuid=marker_8,
-            )
-            assert ok_8, (
-                f"sub-act 8 attempt {attempt+1}: advance_phase "
-                f"timed out. Pane:\n{driver.capture_pane()}"
-            )
-            advance_attempts += 1
-
-            # Read current phase from disk.
-            ps = json.loads(
-                phase_state_path.read_text(encoding="utf-8")
-            )
-            if ps.get("current_phase") != "setup":
-                # Advance succeeded.
-                break
-
-            # Still on setup. Parse latest advance_phase response to
-            # discover which check failed.
-            recs_8 = observer.all_records()
-            failed_check = _last_advance_failed_check(recs_8)
-            if not failed_check:
-                # Couldn't parse; abort.
-                raise AssertionError(
-                    f"sub-act 8 attempt {attempt+1}: advance_phase "
-                    "did not advance and we couldn't determine the "
-                    "failing check from the JSONL. Pane:\n"
-                    + driver.capture_pane()
-                )
-            observed_check_types.append(failed_check["check_type"])
-
-            ct = failed_check["check_type"]
-            if ct == "artifact-dir-ready-check":
-                # Set the artifact dir.
-                marker_8s = idle.latest_stop_uuid(observer)
-                driver.send(
-                    f"Call mcp__operon__set_artifact_dir with "
-                    f"path='{artifact_dir}'. After it returns, "
-                    "reply 'ARTIFACT-DIR-SET' and stop."
-                )
-                ok_8s = idle.wait_idle_pre_kill(
-                    observer=observer,
-                    inboxes_tracker=inbox_tracker,
-                    timeout_s=SUB_ACT_TIMEOUT_S,
-                    k_ms=IDLE_K_MS,
-                    after_marker_uuid=marker_8s,
-                )
-                assert ok_8s, (
-                    "sub-act 8: set_artifact_dir timed out.\n"
-                    + driver.capture_pane()
-                )
-            elif ct == "file-exists-check":
-                # Create the missing file. Use a .md placeholder
-                # path under the artifact dir.
-                missing = failed_check.get("missing_path") or ""
-                if not missing:
-                    raise AssertionError(
-                        f"file-exists-check failed but no path was "
-                        f"parsed from the response. Full failed_check: "
-                        f"{failed_check}"
-                    )
-                missing_path = Path(missing)
-                missing_path.parent.mkdir(parents=True, exist_ok=True)
-                # .md content is exempt from no_direct_code_coordinator's
-                # exclude_if_matches; we can write it directly. Use a
-                # Bash echo via the harness (no token cost) rather than
-                # asking the lead.
-                missing_path.write_text(
-                    f"# Placeholder for {missing_path.name}\n\n"
-                    f"Created by sub-act 8 cascade.\n",
-                    encoding="utf-8",
-                )
-
-        # After the loop: verify advance succeeded.
-        final_phase_state = json.loads(
-            phase_state_path.read_text(encoding="utf-8")
-        )
-        new_phase_8 = final_phase_state.get("current_phase")
-        assert new_phase_8 != "setup", (
-            f"sub-act 8: advance_phase never escaped 'setup' "
-            f"after {advance_attempts} attempts. Observed check "
-            f"types: {observed_check_types}.\n"
-            f"phase_state: {final_phase_state}"
-        )
-
-        # Coverage gate across the journey:
-        all_observed_check_types = set(observed_check_types) | {
-            "manual-confirm",  # from sub-act 3
-        }
-        coverage_required = {
-            "manual-confirm",
-            "artifact-dir-ready-check",
-            "file-exists-check",
-        }
-        coverage_met = coverage_required.issubset(all_observed_check_types)
-
-        # Team broadcast inspection. Per Boaz: each active
-        # teammate's inbox gets a `[operon:phase-advance
-        # <new_phase>]` entry. operon receives no broadcast
-        # (it's the writer, not a recipient).
-        comp_inbox_8 = []
-        impl_inbox_8 = []
-        lead_inbox_8 = []
-        operon_inbox_8 = []
-        if comp_inbox_path.is_file():
-            try:
-                comp_inbox_8 = json.loads(comp_inbox_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                pass
-        if impl_inbox_path.is_file():
-            try:
-                impl_inbox_8 = json.loads(impl_inbox_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                pass
-        if lead_inbox_path.is_file():
-            try:
-                lead_inbox_8 = json.loads(lead_inbox_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                pass
-        if operon_inbox_path_6.is_file():
-            try:
-                operon_inbox_8 = json.loads(operon_inbox_path_6.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                pass
-
-        def _has_brief(inbox: list, phase: str) -> bool:
-            tok = f"[operon:phase-advance {phase}]"
-            return any(
-                isinstance(m, dict) and tok in (m.get("text") or "")
-                for m in inbox
-            )
-
-        comp_got_brief = _has_brief(comp_inbox_8, new_phase_8)
-        impl_got_brief = _has_brief(impl_inbox_8, new_phase_8)
-        lead_got_brief = _has_brief(lead_inbox_8, new_phase_8)
-        operon_got_brief = _has_brief(operon_inbox_8, new_phase_8)
-
-        # Lead's brief should be the REAL content (coordinator/
-        # <new_phase>.md exists in the workflow tree). Composability
-        # and implementer get the fallback line (by workflow design).
-        lead_brief_text = ""
-        for m in lead_inbox_8:
-            if not isinstance(m, dict):
-                continue
-            t = m.get("text") or ""
-            if f"[operon:phase-advance {new_phase_8}]" in t:
-                lead_brief_text = t
-        fallback_marker = "no brief content found"
-        lead_brief_is_fallback = fallback_marker in lead_brief_text
-
-        assert comp_got_brief, "MUST-see: composability didn't get phase-advance brief."
-        assert impl_got_brief, "MUST-see: implementer didn't get phase-advance brief."
-        assert lead_got_brief, "MUST-see: team-lead didn't get phase-advance brief."
-        assert not operon_got_brief, (
-            "MUST-NOT-see: operon's inbox received a "
-            "phase-advance brief (operon is the writer, not a "
-            "recipient)."
-        )
-        assert not lead_brief_is_fallback, (
-            "MUST-see: team-lead's brief should carry the real "
-            "coordinator/<new_phase>.md content (the agent_type="
-            "coordinator fixture wiring should resolve the brief "
-            "lookup). Got fallback marker in:\n"
-            + lead_brief_text[:500]
-        )
-        assert coverage_met, (
-            f"MUST-see: all advance-check types covered across "
-            f"the journey. Observed: {sorted(all_observed_check_types)}. "
-            f"Required: {sorted(coverage_required)}."
-        )
-
-        meter.checkpoint("sub_act_8")
-        meter.assert_under_cap("sub_act_8")
-        bundle.snapshot(
-            "sub_act_8_advance_setup_to_leadership",
-            token_state={
-                "cumulative": meter.cumulative.__dict__,
-                "billable": meter.cumulative.billable,
-            },
-            notes={
-                "new_phase": new_phase_8,
-                "advance_attempts": advance_attempts,
-                "observed_check_types": observed_check_types,
-                "coverage_met": coverage_met,
-                "lead_brief_excerpt": lead_brief_text[:400],
-                "comp_got_brief": comp_got_brief,
-                "impl_got_brief": impl_got_brief,
-                "lead_got_brief": lead_got_brief,
-                "operon_got_brief": operon_got_brief,
-            },
-        )
-        gate_check(
-            "sub_act_8",
-            must_hold=[
-                ("phase advanced past setup", new_phase_8 != "setup"),
-                ("composability got brief", comp_got_brief),
-                ("implementer got brief", impl_got_brief),
-                ("team-lead got brief", lead_got_brief),
-                ("operon did NOT get brief", not operon_got_brief),
-                ("team-lead brief is NOT fallback", not lead_brief_is_fallback),
-                ("advance-check coverage met", coverage_met),
-                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
-            ],
-        )
-
-        # =============== SUB-ACT 9: halt session ===============
-        # User ends the session via /exit. Operon's run-dir state
-        # (.operon/<run>/) and the sidechain transcripts under
-        # ~/.claude/projects/<cwd-mangled>/ must SURVIVE the exit.
-        # CC v2.1.150 empirically cleans ~/.claude/teams/<run>/ on
-        # exit (per Boaz) -- that's EXPECTED and not a failure;
-        # operon-side state is what matters for the restore in
-        # sub-act 10.
-        recorder.set_sub_act("sub_act_9_halt_session")
-        recorder.record(
-            user_observable=(
-                "The user exits the session. Operon state and "
-                "sidechain transcripts persist so restore can "
-                "re-attach."
-            ),
-            precise_state={
-                "operon_run_dir": str(run_dir),
-                "project_dir": str(transcript_path.parent),
-            },
-        )
-
-        # Capture pre-halt state to verify it survives.
-        operon_run_dir_pre = run_dir.is_dir()
-        sidechain_jsonls_pre = list(transcript_path.parent.glob("*.jsonl"))
-        sidechain_jsonl_count_pre = len(sidechain_jsonls_pre)
-
-        # Send /exit. Then wait for tmux session pid to disappear.
-        marker_9 = idle.latest_stop_uuid(observer)
-        driver.send("/exit")
-        # Don't wait_idle (the lead is exiting, not replying).
-        # Use during-kill predicate: wait until tmux pid is gone.
-        ok_9 = idle.wait_idle_during_kill(
-            pid_check=lambda: driver.session_pid(),
-            timeout_s=30.0,
-            poll_s=0.5,
-        )
-        # Belt-and-braces: if /exit didn't work cleanly, kill the
-        # tmux session to ensure we proceed.
-        if not ok_9:
-            driver.kill()
-        # Capture post-halt state.
-        operon_run_dir_post = run_dir.is_dir()
-        sidechain_jsonls_post = list(transcript_path.parent.glob("*.jsonl"))
-
-        assert operon_run_dir_post, (
-            "MUST-see: operon run-dir at "
-            f"{run_dir} did NOT survive the halt."
-        )
-        assert sidechain_jsonls_post, (
-            "MUST-see: sidechain JSONL transcripts at "
-            f"{transcript_path.parent} did NOT survive the halt."
-        )
-        # MUST-NOT-see: team config dir survives. (Per Boaz, it
-        # gets cleaned on exit; if it lingers, something changed.)
-        team_dir_post = (teams_dir / RUN_NAME).is_dir()
-
-        meter.checkpoint("sub_act_9")
-        meter.assert_under_cap("sub_act_9")
-        bundle.snapshot(
-            "sub_act_9_halt_session",
-            token_state={
-                "cumulative": meter.cumulative.__dict__,
-                "billable": meter.cumulative.billable,
-            },
-            notes={
-                "operon_run_dir_pre": operon_run_dir_pre,
-                "operon_run_dir_post": operon_run_dir_post,
-                "sidechain_jsonls_pre": sidechain_jsonl_count_pre,
-                "sidechain_jsonls_post": len(sidechain_jsonls_post),
-                "team_dir_post": team_dir_post,
-            },
-        )
-        gate_check(
-            "sub_act_9",
-            must_hold=[
-                ("operon run-dir survived halt", operon_run_dir_post),
-                ("sidechain JSONLs survived halt", bool(sidechain_jsonls_post)),
-                ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
-            ],
-        )
-
-        # =============== SUB-ACT 10: restore + first-person recall ===============
-        # Launch a NEW CC session in the same cwd. Call
-        # restore_operon_session(run_name). Follow the returned
-        # lead_instructions: TeamCreate(agent_type="coordinator")
-        # to recreate the team scaffold; Agent-spawn composability;
-        # the operon PreToolUse hook (WA1) walks the sidechain
-        # transcripts and prepends them into the spawn prompt so
-        # composability has first-person recall on its first turn.
-        recorder.set_sub_act("sub_act_10_restore_and_recall")
-        recorder.record(
-            user_observable=(
-                "After exiting, the user resumes work later. "
-                "Operon restores the team config; the WA1 hook "
-                "feeds prior sidechain transcripts into the "
-                "respawned teammate; composability recalls "
-                "verbatim what it discussed in the prior "
-                "session."
-            ),
-            precise_state={
-                "restore_run_name": RUN_NAME,
-                "halted_phase": new_phase_8,
-            },
-        )
-
-        # New session. Reuse the tmp_cwd; new session_uuid; new
-        # tmux session_name. Re-bind the observer to the new
-        # transcript path.
-        session_id_10 = str(uuid.uuid4())
-        session_name_10 = f"ptw10-{session_id_10[:8]}"
-        transcript_path_10 = transcript_observer.find_transcript(
-            tmp_cwd, session_id_10
-        )
-        driver_10 = claude_driver_cls(
-            session_name=session_name_10,
-            cwd=tmp_cwd,
-            plugin_dir=operon_plugin_dir,
-            session_uuid=session_id_10,
-            extra_env={"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
-            model="sonnet",
-        )
-
-        try:
-            driver_10.start()
-
-            # Rebind observer + meter to the new transcript.
-            observer.rebind(transcript_path_10)
-            meter.transcript_path = transcript_path_10
-            meter.seen_uuids.clear()
-
-            # Wait briefly for first turn so transcript exists.
-            time.sleep(3.0)
-
-            # Step A: call restore_operon_session.
-            marker_10a = idle.latest_stop_uuid(observer)
-            driver_10.send(
-                "Call mcp__operon__restore_operon_session with "
-                f"run_name='{RUN_NAME}'. After it returns, report "
-                "ONLY the JSON response and stop."
-            )
-            ok_10a = idle.wait_idle_pre_kill(
-                observer=observer,
-                inboxes_tracker=None,
-                timeout_s=SUB_ACT_TIMEOUT_S,
-                k_ms=IDLE_K_MS,
-                after_marker_uuid=marker_10a,
-            )
-            assert ok_10a, (
-                "sub-act 10A: restore_operon_session timed out.\n"
-                + driver_10.capture_pane()
-            )
-
-            # Step B: re-establish team. TeamCreate(coordinator)
-            # then Agent spawn composability.
-            marker_10b = idle.latest_stop_uuid(observer)
-            driver_10.send(
-                "Follow the lead_instructions returned by "
-                "restore_operon_session. Specifically: (1) call "
-                f"TeamCreate with team_name='{RUN_NAME}' and "
-                "agent_type='coordinator'; (2) use the Agent tool "
-                "to spawn composability with run_in_background=true, "
-                "name='composability', subagent_type='composability', "
-                f"team_name='{RUN_NAME}', and a brief 'You are "
-                "composability; the operon WA1 hook will feed "
-                "prior transcripts.' prompt. After both return, "
-                "reply 'RESTORED' and stop."
-            )
-            ok_10b = idle.wait_idle_pre_kill(
-                observer=observer,
-                inboxes_tracker=None,
-                timeout_s=SUB_ACT_TIMEOUT_S,
-                k_ms=IDLE_K_MS,
-                after_marker_uuid=marker_10b,
-            )
-            assert ok_10b, (
-                "sub-act 10B: TeamCreate + Agent spawn timed out.\n"
-                + driver_10.capture_pane()
-            )
-
-            # Step C: lead routes the recall probe to composability
-            # via send_to_member. The composability subagent's first
-            # turn has the WA1-injected transcripts; it replies via
-            # SendMessage back to team-lead with the recall content.
-            # The harness reads the recall from team-lead's inbox
-            # (no need to peek into the teammate's pane).
-            lead_inbox_path_10 = teams_dir / RUN_NAME / "inboxes" / "team-lead.json"
-            baseline_lead_10 = inbox_watcher.inbox_baseline(lead_inbox_path_10)
-            marker_10c = idle.latest_stop_uuid(observer)
-            driver_10.send(
-                "Call mcp__operon__send_to_member now. Parameters:\n"
-                "  name='composability'\n"
-                "  text: 'What did we discuss before this session? "
-                "Be specific. List in plain prose:\\n"
-                "  (1) any messages you sent to implementer or to "
-                "team-lead;\\n"
-                "  (2) any [OPERON_REPLY] payload you received from "
-                "operon;\\n"
-                "  (3) any phase-advance brief you got.\\n"
-                "Send your full recall as a SendMessage to "
-                "team-lead, prefixed by \"RECALL: \". Then stop.'\n\n"
-                "After send_to_member returns, wait for the "
-                "RECALL: message to land in YOUR (team-lead's) "
-                "inbox. Report ONLY whether the recall arrived "
-                "and stop."
-            )
-            ok_10c = idle.wait_idle_pre_kill(
-                observer=observer,
-                inboxes_tracker=None,
-                timeout_s=SUB_ACT_TIMEOUT_S,
-                k_ms=IDLE_K_MS,
-                after_marker_uuid=marker_10c,
-            )
-            assert ok_10c, (
-                "sub-act 10C: lead idle wait timeout.\n"
-                + driver_10.capture_pane()
-            )
-            # Wait for composability's RECALL: message.
-            recall_msg = inbox_watcher.wait_for_inbox_entry(
-                lead_inbox_path_10,
-                predicate=lambda e: (
-                    e.get("from") == "composability"
-                    and "RECALL:" in (e.get("text") or "")
-                ),
-                timeout_s=SUB_ACT_TIMEOUT_S,
-                baseline_count=baseline_lead_10,
-            )
-            assert recall_msg is not None, (
-                "MUST-see: composability did not send a RECALL: "
-                "message to team-lead's inbox within "
-                f"{SUB_ACT_TIMEOUT_S}s."
-            )
-            recs_10_blob = recall_msg.get("text") or ""
-            recall_concrete_facts = [
-                ("hi from composability", "hi from composability" in recs_10_blob),
-                ("reporting in", "reporting in" in recs_10_blob),
-                ("OPERON_REPLY whoami", "OPERON_REPLY" in recs_10_blob
-                 and "whoami" in recs_10_blob),
-                ("phase-advance leadership", "phase-advance" in recs_10_blob
-                 and "leadership" in recs_10_blob),
-            ]
-            recall_hits = [name for name, hit in recall_concrete_facts if hit]
-            # MUST-see: at least 2 of the 4 concrete facts recalled.
-            assert len(recall_hits) >= 2, (
-                f"MUST-see: composability's recall after restore "
-                f"hit fewer than 2 of the 4 expected concrete "
-                f"facts. Hits: {recall_hits}. Expected at least "
-                f"two of: {[n for n,_ in recall_concrete_facts]}."
-            )
-            # MUST-NOT-see: composability claims it has no prior
-            # memory (a known failure mode of WA1-not-firing).
-            recall_no_memory = any(
-                phrase in recs_10_blob.lower()
-                for phrase in (
-                    "i don't have any prior",
-                    "no prior session",
-                    "fresh session",
-                    "i have no memory of",
-                )
-            )
-            assert not recall_no_memory, (
-                "MUST-NOT-see: composability claimed it has no "
-                "prior memory -- WA1 transcript injection did not "
-                "fire."
-            )
-
-            meter.checkpoint("sub_act_10")
-            meter.assert_under_cap("sub_act_10")
-            bundle.snapshot(
-                "sub_act_10_restore_and_recall",
-                token_state={
-                    "cumulative": meter.cumulative.__dict__,
-                    "billable": meter.cumulative.billable,
-                },
-                notes={
-                    "restore_session_id": session_id_10,
-                    "recall_hits": recall_hits,
-                    "concrete_facts": [n for n, _ in recall_concrete_facts],
-                },
-            )
-            gate_check(
-                "sub_act_10",
-                must_hold=[
-                    ("at least 2 concrete facts recalled", len(recall_hits) >= 2),
-                    ("no 'no prior memory' disclaimer", not recall_no_memory),
-                    ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
-                ],
-            )
-        finally:
-            driver_10.kill()
-
-        # Until sub-acts 2-10 land, the test exits cleanly after
-        # sub-act 1's gate_check passes. This is intentional: each
-        # milestone lands sub-acts as we validate them.
+        # Chain test ends at sub-act 7. Sub-acts 8, 9, 10
+        # moved to test_project_team_advance_lifecycle per the
+        # chain-saturation split (Land 13 / Group B diagnostic
+        # commit a9ed0ae).
 
     finally:
         driver.kill()
 
 
 # ============================================================================
-# Group B (Land 12 follow-up diagnostic): isolated sub-act 8 test.
+# Advance lifecycle test (sub-acts 8, 9, 10): isolated from the
+# coordination chain to avoid Land 12's chain-saturation failure mode.
+# Originally landed as the "Group B" diagnostic for the Land 11 R1+R2
+# Monitor-leak investigation (commit a9ed0ae); promoted to canonical
+# at Land 13. See module docstring for the split rationale.
 # ============================================================================
-# Hypothesis (Boaz): the 5/6/7 coordination chain (5 send_to_member rounds,
-# flushes, lots of teammate text replies) saturates the lead's context such
-# that sub-act 8's "Call advance_phase" prompt is mis-interpreted as a
-# summarize request. This test isolates sub-act 8 from a clean state to
-# distinguish chain-induced context drift from a sub-act-8-intrinsic
-# fragility.
-#
-# Sequence:
-#   1. Pre-trust workspace + launch CC via the driver.
-#   2. TeamCreate(agent_type=coordinator) + activate_workflow(project_team).
-#   3. Advance vision -> setup via manual-confirm.
-#   4. Spawn composability + implementer via parallel Agent calls.
-#   5. Run the sub-act-8 cascade unchanged (artifact-dir-ready-check ->
-#      file-exists-check * N -> advance).
-#   6. Assert team_broadcast / brief / coverage gates as in the full
-#      scenario's sub-act 8.
-#
-# The lead sees NO send_to_member, NO Monitor flushes, NO teammate
-# coordination before "Call advance_phase". A "clean-room" sub-act 8.
 
-#: Cap for the isolated test. Empirically (Group B run #2): in
-#: isolation the lead PRE-EMPTIVELY satisfies setup-phase prereqs
-#: (set_artifact_dir, STATUS.md, userprompt.md) by reading
-#: operon's setup-phase brief on phase advance from vision. That
-#: extra proactive work costs ~30-40K tokens beyond the 50K
-#: estimate. Raise cap to 100K for the iso test specifically.
-TOKEN_CAP_ISOLATED = 100_000
+#: Cap for the advance-lifecycle test. Covers: TeamCreate + activate
+#: + vision->setup advance + spawn + setup->leadership cascade + halt
+#: + restore + recall. Empirically (Group B + extension): cumulative
+#: cost ~80-120K. Cap at 200K for headroom without masking
+#: regressions.
+TOKEN_CAP_ADVANCE_LIFECYCLE = 200_000
 
 
-def test_subact_8_isolated_from_chain(tmp_cwd, operon_plugin_dir, claude_driver_cls):
-    """Run sub-act 8's cascade from a fresh state with no prior coordination.
+def test_project_team_advance_lifecycle(tmp_cwd, operon_plugin_dir, claude_driver_cls):
+    """Walk the project_team advance lifecycle (sub-acts 8, 9, 10).
 
-    Mirrors the existing scenario's sub-act 8 logic + only enough scaffolding
-    (workflow activation, phase advance to setup, teammate spawn) to put the
-    system in a state where setup->leadership can be exercised. Skips sub-acts
-    1, 1-ext, 2.2, 4-cross-talk, 5, 6, 7 entirely.
+    Isolated from the coordination chain (sub-acts 1-7) per the
+    Land 13 split (rationale + diagnostic in
+    test_project_team_coordination_chain's docstring). The lead
+    sees NO send_to_member, NO Monitor flushes, NO teammate
+    coordination before sub-act 8's advance_phase call -- a
+    "clean-room" advance.
+
+    Sequence:
+      Step A: TeamCreate(coordinator) + activate_workflow.
+      Step B: Advance vision -> setup via manual-confirm.
+      Step C: Spawn composability + implementer in parallel.
+      Step D: Sub-act 8 -- advance setup -> leadership (cascading
+              file-exists-check satisfaction, or pre-empted by
+              the lead's proactive prereq-creation from operon's
+              setup brief).
+      Step E: Sub-act 9 -- halt session via /exit; verify operon
+              state + sidechain transcripts survive.
+      Step F: Sub-act 10 -- new session, restore_operon_session,
+              respawn composability, WA1 transcript injection,
+              verify first-person recall.
+
+    Recall assertions in sub-act 10 are adapted for the isolated
+    context (composability's prior session had only the spawn
+    handshake, not the rich sub-act-6/7 history). The MUST-see is
+    composability acknowledging its prior identity; the MUST-NOT-see
+    is the "no prior memory" disclaimer that indicates WA1 didn't
+    fire.
     """
     cc_version_gate.assert_cc_version()
     _seed_fixture(tmp_cwd)
@@ -2543,7 +2029,7 @@ def test_subact_8_isolated_from_chain(tmp_cwd, operon_plugin_dir, claude_driver_
         out_path=bundle.bundle_dir / "steps.jsonl"
     )
     meter = token_meter.TokenMeter(
-        transcript_path=transcript_path, cap=TOKEN_CAP_ISOLATED
+        transcript_path=transcript_path, cap=TOKEN_CAP_ADVANCE_LIFECYCLE
     )
     driver = claude_driver_cls(
         session_name=session_name,
@@ -2837,8 +2323,275 @@ def test_subact_8_isolated_from_chain(tmp_cwd, operon_plugin_dir, claude_driver_
                 # advance_phase and did it succeed" -- advance
                 # attempts >= 1 suffices.
                 ("at least one advance_phase attempt", advance_attempts >= 1),
-                ("under token cap", meter.cumulative.billable <= TOKEN_CAP_ISOLATED),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP_ADVANCE_LIFECYCLE),
             ],
         )
+
+        # =============== STEP E (Sub-act 9): halt session ===============
+        # User ends the session via /exit. Operon's run-dir state
+        # (.operon/<run>/) and the sidechain transcripts under
+        # ~/.claude/projects/<cwd-mangled>/ must SURVIVE the exit.
+        # CC v2.1.150 empirically cleans ~/.claude/teams/<run>/ on
+        # exit -- that's EXPECTED and fine; operon-side state is
+        # what matters for the restore in sub-act 10.
+        recorder.set_sub_act("iso_sub_act_9_halt_session")
+        recorder.record(
+            user_observable=(
+                "User exits the session. Operon state + sidechain "
+                "transcripts persist so restore can re-attach."
+            ),
+            precise_state={
+                "operon_run_dir": str(run_dir),
+                "project_dir": str(transcript_path.parent),
+            },
+        )
+        sidechain_jsonls_pre = list(transcript_path.parent.glob("*.jsonl"))
+        driver.send("/exit")
+        ok_9 = idle.wait_idle_during_kill(
+            pid_check=lambda: driver.session_pid(),
+            timeout_s=30.0,
+            poll_s=0.5,
+        )
+        if not ok_9:
+            driver.kill()
+        operon_run_dir_post = run_dir.is_dir()
+        sidechain_jsonls_post = list(transcript_path.parent.glob("*.jsonl"))
+        assert operon_run_dir_post, (
+            f"sub-act 9: operon run-dir at {run_dir} did NOT "
+            "survive the halt."
+        )
+        assert sidechain_jsonls_post, (
+            f"sub-act 9: sidechain JSONL transcripts at "
+            f"{transcript_path.parent} did NOT survive the halt."
+        )
+        meter.checkpoint("iso_sub_act_9")
+        bundle.snapshot(
+            "iso_sub_act_9_halt_session",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "operon_run_dir_post": operon_run_dir_post,
+                "sidechain_jsonls_pre": len(sidechain_jsonls_pre),
+                "sidechain_jsonls_post": len(sidechain_jsonls_post),
+                "team_dir_post": (teams_dir / RUN_NAME).is_dir(),
+            },
+        )
+        gate_check(
+            "iso_sub_act_9",
+            must_hold=[
+                ("operon run-dir survived halt", operon_run_dir_post),
+                ("sidechain JSONLs survived halt", bool(sidechain_jsonls_post)),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP_ADVANCE_LIFECYCLE),
+            ],
+        )
+
+        # =============== STEP F (Sub-act 10): restore + recall ===============
+        # Launch a NEW CC session in the same cwd. Lead calls
+        # restore_operon_session, then TeamCreate + Agent spawn for
+        # composability. Operon's WA1 hook walks the sidechain
+        # transcripts and prepends them into composability's spawn
+        # prompt; composability replies via SendMessage with its
+        # recall content.
+        #
+        # Recall assertion is ADAPTED for the isolated context.
+        # The prior session's composability had only the spawn
+        # handshake (no sub-act-6/7 history), so the concrete-fact
+        # set is leaner than the chain test would use. MUST-see:
+        # composability acknowledges its prior role/identity.
+        # MUST-NOT-see: "no prior memory" disclaimer (WA1 failure).
+        recorder.set_sub_act("iso_sub_act_10_restore_and_recall")
+        recorder.record(
+            user_observable=(
+                "After exiting, the user resumes work later. "
+                "Operon restores the team; WA1 feeds prior "
+                "transcripts into the respawned composability; "
+                "composability recalls its prior identity."
+            ),
+            precise_state={
+                "restore_run_name": RUN_NAME,
+                "halted_phase": new_phase_iso,
+            },
+        )
+        session_id_10 = str(uuid.uuid4())
+        session_name_10 = f"iso-ptw10-{session_id_10[:8]}"
+        transcript_path_10 = transcript_observer.find_transcript(
+            tmp_cwd, session_id_10
+        )
+        driver_10 = claude_driver_cls(
+            session_name=session_name_10,
+            cwd=tmp_cwd,
+            plugin_dir=operon_plugin_dir,
+            session_uuid=session_id_10,
+            extra_env={"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+            model="sonnet",
+        )
+        try:
+            driver_10.start()
+            observer.rebind(transcript_path_10)
+            meter.transcript_path = transcript_path_10
+            meter.seen_uuids.clear()
+            time.sleep(3.0)
+
+            # 10A: restore_operon_session.
+            marker_10a = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "Call mcp__operon__restore_operon_session with "
+                f"run_name='{RUN_NAME}'. After it returns, report "
+                "ONLY the JSON response and stop."
+            )
+            ok_10a = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_10a,
+            )
+            assert ok_10a, (
+                "sub-act 10A: restore_operon_session timed out.\n"
+                + driver_10.capture_pane()
+            )
+
+            # 10B: TeamCreate + Agent spawn composability.
+            marker_10b = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "Follow the lead_instructions from "
+                "restore_operon_session: (1) call TeamCreate with "
+                f"team_name='{RUN_NAME}' and agent_type='coordinator'; "
+                "(2) use the Agent tool to spawn composability with "
+                "run_in_background=true, name='composability', "
+                f"subagent_type='composability', team_name='{RUN_NAME}', "
+                "and prompt='You are composability; the operon WA1 "
+                "hook will feed prior transcripts.'. After both "
+                "return, reply 'RESTORED' and stop."
+            )
+            ok_10b = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_10b,
+            )
+            assert ok_10b, (
+                "sub-act 10B: TeamCreate + Agent spawn timed out.\n"
+                + driver_10.capture_pane()
+            )
+            time.sleep(2.0)
+            observer.read_new()
+
+            # 10C: lead routes recall probe via send_to_member.
+            lead_inbox_path_10 = teams_dir / RUN_NAME / "inboxes" / "team-lead.json"
+            baseline_lead_10 = inbox_watcher.inbox_baseline(lead_inbox_path_10)
+            marker_10c = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "Call mcp__operon__send_to_member now. Parameters:\n"
+                "  name='composability'\n"
+                "  text: 'What did we discuss in the prior session? "
+                "Be specific. Describe in plain prose:\\n"
+                "  (1) who you are and what role you played;\\n"
+                "  (2) any messages you sent or received;\\n"
+                "  (3) anything else you remember from before "
+                "this session.\\nSend your full recall as a "
+                "SendMessage to team-lead, prefixed by "
+                "\"RECALL: \". Then stop.'\n\n"
+                "DO NOT use the Monitor or Task tools to wait. "
+                "Return immediately after send_to_member with a "
+                "brief status line and end the turn."
+            )
+            ok_10c = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_10c,
+            )
+            assert ok_10c, (
+                "sub-act 10C: lead idle wait timeout.\n"
+                + driver_10.capture_pane()
+            )
+
+            recall_msg = inbox_watcher.wait_for_inbox_entry(
+                lead_inbox_path_10,
+                predicate=lambda e: (
+                    e.get("from") == "composability"
+                    and "RECALL:" in (e.get("text") or "")
+                ),
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                baseline_count=baseline_lead_10,
+            )
+            assert recall_msg is not None, (
+                "MUST-see: composability did not send a RECALL: "
+                f"message to team-lead's inbox within "
+                f"{SUB_ACT_TIMEOUT_S}s."
+            )
+            recall_text = recall_msg.get("text") or ""
+            recall_lower = recall_text.lower()
+
+            # Adapted concrete-fact set for the isolated context.
+            # The prior session's composability had only the spawn
+            # handshake -- no rich coordination history. So we
+            # check for prior-identity acknowledgment + spawn
+            # acknowledgment + role acknowledgment.
+            recall_concrete_facts = [
+                ("acknowledges composability identity",
+                 "composability" in recall_lower),
+                ("mentions prior session/spawn/wait",
+                 any(t in recall_lower for t in (
+                     "spawn", "prior", "previous", "earlier",
+                     "ready", "waiting", "wait for"))),
+                ("references role context",
+                 any(t in recall_lower for t in (
+                     "role", "agent", "lead", "team"))),
+            ]
+            recall_hits = [name for name, hit in recall_concrete_facts if hit]
+            recall_no_memory = any(
+                phrase in recall_lower
+                for phrase in (
+                    "i don't have any prior",
+                    "no prior session",
+                    "fresh session",
+                    "i have no memory of",
+                    "no memory of",
+                )
+            )
+            assert len(recall_hits) >= 2, (
+                "MUST-see: composability's recall after restore hit "
+                f"fewer than 2 of the 3 adapted concrete facts. "
+                f"Hits: {recall_hits}. Recall body: "
+                f"{recall_text[:400]!r}"
+            )
+            assert not recall_no_memory, (
+                "MUST-NOT-see: composability claimed it has no "
+                "prior memory -- WA1 transcript injection did not "
+                f"fire. Recall body: {recall_text[:400]!r}"
+            )
+
+            meter.checkpoint("iso_sub_act_10")
+            bundle.snapshot(
+                "iso_sub_act_10_restore_and_recall",
+                token_state={
+                    "cumulative": meter.cumulative.__dict__,
+                    "billable": meter.cumulative.billable,
+                },
+                notes={
+                    "restore_session_id": session_id_10,
+                    "recall_hits": recall_hits,
+                    "recall_excerpt": recall_text[:500],
+                },
+            )
+            gate_check(
+                "iso_sub_act_10",
+                must_hold=[
+                    ("at least 2 adapted concrete facts recalled",
+                     len(recall_hits) >= 2),
+                    ("no 'no prior memory' disclaimer",
+                     not recall_no_memory),
+                    ("under token cap",
+                     meter.cumulative.billable <= TOKEN_CAP_ADVANCE_LIFECYCLE),
+                ],
+            )
+        finally:
+            driver_10.kill()
     finally:
         driver.kill()
