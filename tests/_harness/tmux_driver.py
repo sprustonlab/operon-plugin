@@ -101,8 +101,15 @@ class TmuxClaudeDriver:
     plugin_dir: Path
     session_uuid: str = field(default_factory=lambda: str(_uuid.uuid4()))
     extra_env: dict[str, str] = field(default_factory=dict)
-    width: int = 220
-    height: int = 64
+    # Pane geometry. Empirically (per Boaz's manual walkthrough),
+    # CC's Ink-based TUI team-panel widget renders only when the
+    # terminal is wide enough. His interactive shell was 262x81;
+    # tmux's default detached-session geometry is 80x24 and the
+    # widget collapses below ~80 cols. Default the harness to
+    # Boaz's dimensions so the lead's `╒═` team-panel widget
+    # renders.
+    width: int = 262
+    height: int = 81
     # Use ``--dangerously-skip-permissions`` instead of
     # ``--permission-mode bypassPermissions`` because the latter shows
     # a one-time TUI acceptance prompt on first launch in a session.
@@ -180,6 +187,31 @@ class TmuxClaudeDriver:
             raise TmuxDriverError(
                 f"tmux new-session failed: rc={r.returncode} "
                 f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+        # tmux's `new-session -x/-y` is empirically not always
+        # honored when no client is attached (CC subprocess
+        # inherits a default-sized terminal of e.g. 80x24).
+        # Force the pane geometry with `resize-window` post-
+        # launch. CC's team-panel widget requires ~80+ cols to
+        # render; without this the lead's TUI degrades and the
+        # `╒═` marker doesn't appear.
+        rr = self._tmux(
+            "resize-window",
+            "-t", self.session_name,
+            "-x", str(self.width),
+            "-y", str(self.height),
+        )
+        # Don't fail if resize-window doesn't work; some tmux
+        # builds reject it for detached sessions. The pane just
+        # stays at its initial size.
+        if rr.returncode != 0:
+            # Best-effort: log to stderr so the harness operator
+            # sees it but the test proceeds.
+            import sys as _sys
+            print(
+                f"[tmux_driver] resize-window returned rc="
+                f"{rr.returncode}: {rr.stderr!r}",
+                file=_sys.stderr,
             )
         # Propagate the experimental flag for Agent Teams etc.
         # tmux runs the command in its own shell; env at new-session time is

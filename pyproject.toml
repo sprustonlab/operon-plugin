@@ -43,15 +43,20 @@ Repository = "https://github.com/SprustonLab/operon-plugin"
 packages = ["src/operon_mcp_server"]
 
 [dependency-groups]
-# E2E test infrastructure -- per
-# `.project_team/claude_code_port/specification/TEST_SPECIFICATION.md`,
-# the test bed is real subscription-path Claude Code driven via tmux
-# with JSONL transcripts as observers. The harness lives under
-# `tests/_harness/` and is plain-stdlib (no extra runtime deps); the
-# only dev requirement is pytest + pytest-timeout.
+# E2E test infrastructure. The test bed is real subscription-path
+# Claude Code driven via a controlling pty (see
+# `tests/_harness/pty_driver.py`); the JSONL transcript provides
+# the observer surface. pexpect handles fork/exec/master-pty
+# mechanics; pyte renders the alt-screen ANSI stream so the
+# harness can read CC's team-panel widget. (Legacy
+# `tests/_harness/tmux_driver.py` works for sub-acts 1-4 but does
+# not present the lead's TUI when teammate subprocesses overlay
+# the shared pane -- see milestone 2i artifact dump.)
 dev = [
     "pytest>=8.0",
     "pytest-timeout>=2.0",
+    "pexpect>=4.9",
+    "pyte>=0.8",
 ]
 
 [tool.pytest.ini_options]

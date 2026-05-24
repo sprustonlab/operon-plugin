@@ -230,7 +230,7 @@ def _seed_fixture(tmp_cwd: Path) -> None:
 
 # --- scenario ---------------------------------------------------------------
 
-def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
+def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
     """Walk the 10-sub-act journey end-to-end against real Claude Code.
 
     This single test function is the scenario. Each sub-act is a
@@ -277,7 +277,7 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
         transcript_path=transcript_path, cap=TOKEN_CAP
     )
 
-    driver = tmux_driver.TmuxClaudeDriver(
+    driver = claude_driver_cls(
         session_name=session_name,
         cwd=tmp_cwd,
         plugin_dir=operon_plugin_dir,
@@ -2300,7 +2300,7 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir):
         transcript_path_10 = transcript_observer.find_transcript(
             tmp_cwd, session_id_10
         )
-        driver_10 = tmux_driver.TmuxClaudeDriver(
+        driver_10 = claude_driver_cls(
             session_name=session_name_10,
             cwd=tmp_cwd,
             plugin_dir=operon_plugin_dir,

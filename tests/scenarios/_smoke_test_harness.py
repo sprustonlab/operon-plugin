@@ -22,17 +22,17 @@ from pathlib import Path
 import pytest
 
 # pylint: disable=import-error
-from _harness import cc_version_gate, transcript_observer, tmux_driver  # noqa: E402
+from _harness import cc_version_gate, transcript_observer  # noqa: E402
 
 
-def test_harness_smoke_launch_claude(tmp_cwd, operon_plugin_dir):
-    """Launch claude via tmux, verify a transcript is produced, exit cleanly."""
-    # Version drift gate (Q1 -- pin 2.1.148 per coordinator).
+def test_harness_smoke_launch_claude(tmp_cwd, operon_plugin_dir, claude_driver_cls):
+    """Launch claude (via the selected driver) and verify a transcript appears."""
+    # Version drift gate.
     cc_version_gate.assert_cc_version()
 
     session_id = str(uuid.uuid4())
     session_name = f"smoke-{session_id[:8]}"
-    driver = tmux_driver.TmuxClaudeDriver(
+    driver = claude_driver_cls(
         session_name=session_name,
         cwd=tmp_cwd,
         plugin_dir=operon_plugin_dir,
