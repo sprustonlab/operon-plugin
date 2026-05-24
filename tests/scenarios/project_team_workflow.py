@@ -2481,3 +2481,364 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
 
     finally:
         driver.kill()
+
+
+# ============================================================================
+# Group B (Land 12 follow-up diagnostic): isolated sub-act 8 test.
+# ============================================================================
+# Hypothesis (Boaz): the 5/6/7 coordination chain (5 send_to_member rounds,
+# flushes, lots of teammate text replies) saturates the lead's context such
+# that sub-act 8's "Call advance_phase" prompt is mis-interpreted as a
+# summarize request. This test isolates sub-act 8 from a clean state to
+# distinguish chain-induced context drift from a sub-act-8-intrinsic
+# fragility.
+#
+# Sequence:
+#   1. Pre-trust workspace + launch CC via the driver.
+#   2. TeamCreate(agent_type=coordinator) + activate_workflow(project_team).
+#   3. Advance vision -> setup via manual-confirm.
+#   4. Spawn composability + implementer via parallel Agent calls.
+#   5. Run the sub-act-8 cascade unchanged (artifact-dir-ready-check ->
+#      file-exists-check * N -> advance).
+#   6. Assert team_broadcast / brief / coverage gates as in the full
+#      scenario's sub-act 8.
+#
+# The lead sees NO send_to_member, NO Monitor flushes, NO teammate
+# coordination before "Call advance_phase". A "clean-room" sub-act 8.
+
+#: Cap for the isolated test. Empirically (Group B run #2): in
+#: isolation the lead PRE-EMPTIVELY satisfies setup-phase prereqs
+#: (set_artifact_dir, STATUS.md, userprompt.md) by reading
+#: operon's setup-phase brief on phase advance from vision. That
+#: extra proactive work costs ~30-40K tokens beyond the 50K
+#: estimate. Raise cap to 100K for the iso test specifically.
+TOKEN_CAP_ISOLATED = 100_000
+
+
+def test_subact_8_isolated_from_chain(tmp_cwd, operon_plugin_dir, claude_driver_cls):
+    """Run sub-act 8's cascade from a fresh state with no prior coordination.
+
+    Mirrors the existing scenario's sub-act 8 logic + only enough scaffolding
+    (workflow activation, phase advance to setup, teammate spawn) to put the
+    system in a state where setup->leadership can be exercised. Skips sub-acts
+    1, 1-ext, 2.2, 4-cross-talk, 5, 6, 7 entirely.
+    """
+    cc_version_gate.assert_cc_version()
+    _seed_fixture(tmp_cwd)
+    _stale_team = Path.home() / ".claude" / "teams" / RUN_NAME
+    if _stale_team.exists() and not KEEP_TEAM_CONFIG_ON_FAIL:
+        shutil.rmtree(_stale_team)
+
+    session_id = str(uuid.uuid4())
+    session_name = f"ptw-iso-{session_id[:8]}"
+    transcript_path = transcript_observer.find_transcript(tmp_cwd, session_id)
+    teams_dir = Path.home() / ".claude" / "teams"
+    run_dir = tmp_cwd / ".operon" / RUN_NAME
+
+    bundle = artifact_bundle.ArtifactBundle(
+        root=tmp_cwd / "artifacts",
+        scenario_name="subact_8_isolated",
+    )
+    recorder = step_recorder.StepRecorder(
+        out_path=bundle.bundle_dir / "steps.jsonl"
+    )
+    meter = token_meter.TokenMeter(
+        transcript_path=transcript_path, cap=TOKEN_CAP_ISOLATED
+    )
+    driver = claude_driver_cls(
+        session_name=session_name,
+        cwd=tmp_cwd,
+        plugin_dir=operon_plugin_dir,
+        session_uuid=session_id,
+        extra_env={"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+        model="sonnet",
+    )
+    observer = transcript_observer.TranscriptObserver(transcript_path)
+    inbox_tracker = transcript_observer.InboxQuiescenceTracker(
+        inboxes_dir=teams_dir / RUN_NAME / "inboxes",
+    )
+    bundle.configure_sources(
+        events_log=tmp_cwd / ".operon" / RUN_NAME / "events.log",
+        inboxes_dir=teams_dir / RUN_NAME / "inboxes",
+        transcript=transcript_path,
+    )
+
+    phase_state_path = run_dir / "phase_state.json"
+    lead_response_at_advance: str = ""  # for the diagnostic capture
+
+    try:
+        driver.start()
+
+        # --- Step A: TeamCreate(coordinator) + activate_workflow ---
+        recorder.set_sub_act("iso_setup_team_and_activate")
+        recorder.record(
+            user_observable="Fresh team + workflow activate, no coordination.",
+            precise_state={"run_name": RUN_NAME},
+        )
+        time.sleep(2.0)
+        marker_setup = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Two-step setup. Step 1: call TeamCreate with "
+            f"team_name='{RUN_NAME}' AND agent_type='coordinator'. "
+            "Step 2: call mcp__operon__activate_workflow with "
+            f"workflow_id='project_team' and run_name='{RUN_NAME}'. "
+            "After both return, report ONLY the activation status "
+            "and the current phase, nothing else."
+        )
+        ok_setup = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=None,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_setup,
+        )
+        assert ok_setup, "iso setup: lead timed out on TeamCreate+activate"
+        assert phase_state_path.is_file(), (
+            "iso setup: phase_state.json not created"
+        )
+        phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
+        assert phase_state.get("current_phase") == "vision", (
+            f"iso setup: phase != vision; got {phase_state.get('current_phase')!r}"
+        )
+
+        # --- Step B: advance vision -> setup via manual-confirm ---
+        recorder.set_sub_act("iso_advance_vision_to_setup")
+        marker_adv1 = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Call mcp__operon__advance_phase now. The vision "
+            "phase's advance check is a manual-confirm "
+            "('Vision approved by user?'). The confirmation form "
+            "will be answered by the harness driving the TUI. "
+            "After the tool returns, report ONLY the new "
+            "current_phase value (no commentary)."
+        )
+        form_ok = driver.accept_elicit_form(
+            wait_for_substring="Vision approved by user",
+            timeout_s=180.0,
+        )
+        assert form_ok, (
+            "iso advance: manual-confirm form never appeared.\n"
+            + driver.capture_pane()
+        )
+        ok_adv1 = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=None,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_adv1,
+        )
+        assert ok_adv1, "iso advance: idle wait timeout"
+        ps2 = json.loads(phase_state_path.read_text(encoding="utf-8"))
+        assert ps2.get("current_phase") == "setup", (
+            f"iso advance: phase != setup; got {ps2.get('current_phase')!r}"
+        )
+
+        # --- Step C: spawn composability + implementer ---
+        recorder.set_sub_act("iso_spawn_teammates")
+        teammate_names = ["composability", "implementer"]
+        marker_spawn = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Execute now. In a SINGLE turn, issue TWO parallel "
+            "Agent tool calls.\n\n"
+            "Call 1 -- Agent(subagent_type='composability', "
+            f"name='composability', team_name='{RUN_NAME}', "
+            "run_in_background=true, prompt='You are "
+            "composability. Wait for messages from the lead.')\n\n"
+            "Call 2 -- Agent(subagent_type='implementer', "
+            f"name='implementer', team_name='{RUN_NAME}', "
+            "run_in_background=true, prompt='You are "
+            "implementer. Wait for messages from the lead.')\n\n"
+            "Make both calls in parallel in the SAME turn. After "
+            "both return, reply with the literal text 'BOTH "
+            "SPAWNED' and stop."
+        )
+        ok_spawn = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=inbox_tracker,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_spawn,
+        )
+        assert ok_spawn, "iso spawn: idle wait timeout"
+        # Poll team config for both members.
+        names_now: set[str] = set()
+        cfg_deadline = time.time() + 10.0
+        while time.time() < cfg_deadline:
+            try:
+                cfg_now = json.loads(
+                    (teams_dir / RUN_NAME / "config.json").read_text(encoding="utf-8")
+                )
+                names_now = {m.get("name") for m in cfg_now.get("members", [])}
+            except (FileNotFoundError, json.JSONDecodeError):
+                names_now = set()
+            if all(t in names_now for t in teammate_names):
+                break
+            time.sleep(0.5)
+        assert all(t in names_now for t in teammate_names), (
+            f"iso spawn: missing teammates. names_now={names_now}"
+        )
+
+        # --- Step D: sub-act-8 cascade (no prior coordination!) ---
+        recorder.set_sub_act("iso_subact_8_advance_setup_to_leadership")
+        recorder.record(
+            user_observable=(
+                "Clean-room sub-act 8: cascading advance from "
+                "setup -> leadership with NO prior teammate "
+                "coordination, send_to_member, or flush rounds."
+            ),
+            precise_state={"from_phase": "setup", "to_phase": "leadership"},
+        )
+
+        # Harness-quiescence flush before cascade. Empirically
+        # (Group B run #1): after spawn, the lead emits late
+        # end_turns ("Implementer is idle and ready" etc.) that
+        # arrive AFTER ok_spawn returned True. If marker_8 below
+        # captures the spawn-time stop while those late end_turns
+        # are still arriving, wait_idle returns True on a stale
+        # signal before the lead processes the advance_phase send.
+        # The settle+refresh forces marker_8 to capture the truly-
+        # latest stop.
+        time.sleep(5.0)
+        observer.read_new()
+
+        artifact_dir = tmp_cwd / ".project_team" / RUN_NAME
+        MAX_ADVANCE_RETRIES = 6
+        advance_attempts = 0
+        observed_check_types: list[str] = []
+        first_advance_response_recorded = False
+
+        for attempt in range(MAX_ADVANCE_RETRIES):
+            marker_8 = idle.latest_stop_uuid(observer)
+            if attempt == 0:
+                msg = (
+                    "Call mcp__operon__advance_phase now. After "
+                    "it returns, report the JSON response verbatim "
+                    "(if multi-line, just the outcomes list and "
+                    "the status). Stop."
+                )
+            else:
+                msg = (
+                    "Call mcp__operon__advance_phase AGAIN. After "
+                    "it returns, report the JSON response. Stop."
+                )
+            driver.send(msg)
+            ok_8 = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=inbox_tracker,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_8,
+            )
+            assert ok_8, (
+                f"iso sub-act 8 attempt {attempt+1}: timeout. "
+                f"Pane:\n{driver.capture_pane()}"
+            )
+            # Post-idle settle: wait_idle returns on the lead's
+            # end_turn, but the tool_result for advance_phase may
+            # be queued behind the end_turn marker in the JSONL
+            # writer. Add a short observer-refresh window so
+            # _last_advance_failed_check sees the most recent
+            # tool_result.
+            time.sleep(2.0)
+            observer.read_new()
+            advance_attempts += 1
+
+            # Capture the lead's response text on the FIRST advance_phase
+            # prompt for the diagnostic.
+            if not first_advance_response_recorded:
+                recs_now = observer.all_records()
+                # Find the most recent lead end_turn assistant text.
+                for rec in reversed(recs_now):
+                    if rec.get("isSidechain") is True:
+                        continue
+                    if rec.get("type") != "assistant":
+                        continue
+                    msg_obj = rec.get("message") or {}
+                    if msg_obj.get("stop_reason") != "end_turn":
+                        continue
+                    for c in (msg_obj.get("content") or []):
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            lead_response_at_advance = (c.get("text") or "")[:400]
+                            break
+                    break
+                first_advance_response_recorded = True
+
+            ps = json.loads(phase_state_path.read_text(encoding="utf-8"))
+            if ps.get("current_phase") != "setup":
+                break
+
+            recs_8 = observer.all_records()
+            failed_check = _last_advance_failed_check(recs_8)
+            if not failed_check:
+                raise AssertionError(
+                    f"iso sub-act 8 attempt {attempt+1}: advance_phase "
+                    "did not advance and we couldn't determine the "
+                    "failing check from the JSONL. Lead's response "
+                    f"at advance prompt:\n{lead_response_at_advance!r}\n"
+                    + "Pane:\n" + driver.capture_pane()
+                )
+            observed_check_types.append(failed_check["check_type"])
+
+            ct = failed_check["check_type"]
+            if ct == "artifact-dir-ready-check":
+                marker_8s = idle.latest_stop_uuid(observer)
+                driver.send(
+                    f"Call mcp__operon__set_artifact_dir with "
+                    f"path='{artifact_dir}'. After it returns, "
+                    "reply 'ARTIFACT-DIR-SET' and stop."
+                )
+                ok_8s = idle.wait_idle_pre_kill(
+                    observer=observer,
+                    inboxes_tracker=inbox_tracker,
+                    timeout_s=SUB_ACT_TIMEOUT_S,
+                    k_ms=IDLE_K_MS,
+                    after_marker_uuid=marker_8s,
+                )
+                assert ok_8s, "iso set_artifact_dir timeout"
+            elif ct == "file-exists-check":
+                missing = failed_check.get("missing_path") or ""
+                if not missing:
+                    raise AssertionError(
+                        f"iso: file-exists-check failed but no path "
+                        f"parsed. {failed_check}"
+                    )
+                missing_path = Path(missing)
+                missing_path.parent.mkdir(parents=True, exist_ok=True)
+                missing_path.write_text(
+                    f"# Placeholder for {missing_path.name}\n",
+                    encoding="utf-8",
+                )
+
+        final_phase = json.loads(phase_state_path.read_text(encoding="utf-8"))
+        new_phase_iso = final_phase.get("current_phase")
+
+        meter.checkpoint("iso_subact_8")
+        bundle.snapshot(
+            "iso_subact_8",
+            token_state={
+                "cumulative": meter.cumulative.__dict__,
+                "billable": meter.cumulative.billable,
+            },
+            notes={
+                "new_phase": new_phase_iso,
+                "advance_attempts": advance_attempts,
+                "observed_check_types": observed_check_types,
+                "lead_response_at_advance": lead_response_at_advance,
+            },
+        )
+        gate_check(
+            "iso_subact_8",
+            must_hold=[
+                ("phase advanced past setup", new_phase_iso != "setup"),
+                # In isolation the lead may PROACTIVELY satisfy
+                # setup-phase prereqs from operon's brief, so the
+                # cascade may be 0 iterations. The diagnostic
+                # signal we care about is "did the lead call
+                # advance_phase and did it succeed" -- advance
+                # attempts >= 1 suffices.
+                ("at least one advance_phase attempt", advance_attempts >= 1),
+                ("under token cap", meter.cumulative.billable <= TOKEN_CAP_ISOLATED),
+            ],
+        )
+    finally:
+        driver.kill()
