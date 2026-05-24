@@ -1402,10 +1402,11 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             "with ONLY the rule_id from the deny message. Do "
             "NOT try to work around the deny or use a different "
             "tool.'\n\n"
-            "After send_to_member returns, wait for the "
-            "implementer's reply to land in YOUR (team-lead's) "
-            "inbox. When the reply arrives, report ONLY the "
-            "rule_id verbatim and stop."
+            "DO NOT use the Monitor or Task tools to wait. The "
+            "harness watches the inbox directly via the "
+            "filesystem. Return immediately after send_to_member "
+            "with a brief status line and end the turn -- the "
+            "harness will detect the reply when it lands."
         )
         # Wait for lead idle (send_to_member returned), then
         # for the implementer's reply to land in lead's inbox.
@@ -1449,6 +1450,13 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             "after the deny supposedly fired -- the deny did "
             "not actually block the Write."
         )
+
+        # Monitor-leak guard (Land 12): the lead may have used
+        # Monitor to satisfy the prior "wait for inbox" prompt
+        # despite the prompt-prevention language. Flush any
+        # active background tasks before the next phase of
+        # sub-act 5.
+        idle.flush_lead_background_tasks(driver, observer)
 
         # Step B: lead calls request_override itself; the
         # elicit form renders in the LEAD's pane (which the
@@ -1531,9 +1539,10 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             "content \"probe\". The retry should succeed. After "
             "the Write returns, send a SendMessage back to "
             "team-lead with \"WROTE\" if the file was created.'\n\n"
-            "After send_to_member returns, wait for the "
-            "implementer's WROTE reply in your inbox. Report "
-            "ONLY whether the file was created and stop."
+            "DO NOT use the Monitor or Task tools to wait. The "
+            "harness watches the inbox directly. Return "
+            "immediately after send_to_member with a brief status "
+            "line and end the turn."
         )
         ok_5c = idle.wait_idle_pre_kill(
             observer=observer,
@@ -1644,6 +1653,8 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
         # Post-5: no focus switch needed -- the entire sub-act
         # 5 ran from the lead's pane. Sub-acts 6/7 will also
         # be lead-driven (Q23c design).
+        # Monitor-leak guard (Land 12) at the 5 -> 6 boundary.
+        idle.flush_lead_background_tasks(driver, observer)
 
         # =============== SUB-ACT 6: teammate cross-talk ===============
         # Empirical envelope per Boaz's walk: focus into a
@@ -1688,10 +1699,10 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             "with text exactly \"reporting in\".\\nAfter both "
             "SendMessages return, reply with the literal text "
             "\"SENT-6\" and stop.'\n\n"
-            "After send_to_member returns, wait for composability "
-            "to complete. The completion signal is the 'reporting "
-            "in' message landing in YOUR (team-lead's) inbox. "
-            "Once it lands, reply 'OK' and stop."
+            "DO NOT use the Monitor or Task tools to wait. The "
+            "harness watches the inboxes directly. Return "
+            "immediately after send_to_member with a brief status "
+            "line and end the turn."
         )
         ok_6 = idle.wait_idle_pre_kill(
             observer=observer,
@@ -1780,6 +1791,8 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
             ],
         )
+        # Monitor-leak guard (Land 12) at the 6 -> 7 boundary.
+        idle.flush_lead_background_tasks(driver, observer)
 
         # =============== SUB-ACT 7: OPERON_QUERY whoami ===============
         # Still in composability's channel. Ask composability to
@@ -1823,9 +1836,10 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             "with the VERBATIM text of the [OPERON_REPLY] line, "
             "prefixed by \"FORWARD: \".\\nThen reply WHOAMI-DONE "
             "and stop.'\n\n"
-            "After send_to_member returns, wait for the FORWARD: "
-            "message to land in YOUR (team-lead's) inbox. Report "
-            "ONLY the forwarded text and stop."
+            "DO NOT use the Monitor or Task tools to wait. The "
+            "harness watches the inbox directly. Return "
+            "immediately after send_to_member with a brief status "
+            "line and end the turn."
         )
         ok_7 = idle.wait_idle_pre_kill(
             observer=observer,
@@ -1900,6 +1914,11 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
             ],
         )
+        # Monitor-leak guard (Land 12) at the 7 -> 8 boundary.
+        # Critical site: empirically the most common failure mode
+        # without this guard is the lead being blocked on its 4th
+        # Monitor task when sub-act 8 sends the advance_phase prompt.
+        idle.flush_lead_background_tasks(driver, observer)
 
         # =============== SUB-ACT 8: advance setup -> leadership ===============
         # Cascading-failure advance (per Boaz's walkthrough):
