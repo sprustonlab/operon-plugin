@@ -627,6 +627,90 @@ def main() -> None:
         _emit(_allow_output())
         return
 
+    # ---- DISPOSABLE PROBE (2026-05-23 dispatch) --------------------
+    # Dump the FULL hook_input dict to <cwd>/.operon-pretooluse-probe.log
+    # so we can empirically check whether `transcript_path` (an
+    # unexplored signal from Phase A's static analysis) distinguishes
+    # teammate-originated PreToolUse fires from lead-originated ones.
+    # Phase A noted that under in-process Agent Teams each sidechain
+    # has its own JSONL file under
+    # ``~/.claude/projects/<cwd-mangled>/<parent-session>/subagents/
+    # agent-<hash>.jsonl`` while the lead's transcript is the
+    # parent-session JSONL one level up. If the runtime populates
+    # the hook input's ``transcript_path`` from the SOURCE session
+    # (which would be the natural implementation), a teammate's
+    # tool call would land with ``/subagents/agent-`` in its path
+    # and the lead's call would not.
+    #
+    # B.0 (commits b1571bf + 2b4a7c3, rolled back in Land 6) showed
+    # ``meta.model_extra`` and ``clientInfo`` were lead-uniform across
+    # callers. The pretooluse layer is technically a separate plane
+    # from the MCP layer; whether ``transcript_path`` reflects the
+    # caller-session is the open question.
+    #
+    # Probe contract:
+    #   - Gated on OPERON_DEBUG=1 (mirrors B.0 + matches the
+    #     existing _maybe_enable_debug gate).
+    #   - File-only output (Claude Code captures the hook
+    #     subprocess's stderr ONLY during the initial handshake;
+    #     post-handshake stderr is swallowed -- B.0 fix lesson).
+    #   - Path: <cwd>/.operon-pretooluse-probe.log, mode "a", utf-8.
+    #   - One JSONL line per hook fire: {ts, tool_name, hook_input,
+    #     transcript_path_raw, transcript_classification}.
+    #   - try/except wraps the entire probe; failures must never
+    #     block dispatch.
+    #   - Tagged `[PT-PROBE]` for grep so a future cleanup commit
+    #     can find every emission site.
+    #
+    # Self-revert: this block + the helper above it are removed in
+    # the follow-up commit that lands the actual transcript_path-
+    # based fix (if the data supports the alpha path) or that
+    # closes the question (if data supports the beta / universal-
+    # block path).
+    if os.environ.get(_DEBUG_ENV, "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+    }:
+        try:
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            tp_raw = hook_input.get("transcript_path")
+            tp_class = "unknown"
+            if isinstance(tp_raw, str) and tp_raw:
+                if "/subagents/agent-" in tp_raw and tp_raw.endswith(".jsonl"):
+                    tp_class = "sidechain (teammate)"
+                elif (
+                    "/.claude/projects/" in tp_raw
+                    and tp_raw.endswith(".jsonl")
+                    and "/subagents/" not in tp_raw
+                ):
+                    tp_class = "parent-session (lead)"
+                else:
+                    tp_class = "other"
+            elif tp_raw is None:
+                tp_class = "absent"
+            else:
+                tp_class = f"non-string ({type(tp_raw).__name__})"
+            probe_entry = {
+                "tag": "[PT-PROBE]",
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "tool_name": hook_input.get("tool_name"),
+                "transcript_path_raw": tp_raw,
+                "transcript_classification": tp_class,
+                "hook_input": hook_input,
+            }
+            probe_path = (Path.cwd() / ".operon-pretooluse-probe.log").resolve()
+            with open(probe_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(probe_entry, default=str) + "\n")
+        except Exception as exc:  # noqa: BLE001 -- probe must not block
+            try:
+                sys.stderr.write(f"[PT-PROBE] error: {exc!r}\n")
+            except Exception:
+                pass
+
     tool_name = hook_input.get("tool_name", "")
     if not isinstance(tool_name, str) or not tool_name:
         _log.debug("no tool_name in hook input; fail-open")
