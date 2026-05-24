@@ -42,6 +42,7 @@ from _harness import (  # noqa: E402
     artifact_bundle,
     cc_version_gate,
     idle,
+    inbox_watcher,
     step_recorder,
     tmux_driver,
     token_meter,
@@ -1404,89 +1405,98 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 },
             )
 
-            # Step A: navigate INTO the implementer's channel,
-            # then ask it to attempt the Write. After sub-act 4
-            # focus is on team-lead (Boaz manual walkthrough
-            # confirmed); we Shift+Down to implementer.
-            focused = driver.focus_teammate_thread(
-                "implementer", max_hops=4
-            )
-            assert focused, (
-                "sub-act 5A pre-step: could not focus the "
-                "implementer channel via Shift+Down. "
-                f"current_focus={driver.current_focus()!r}. "
-                f"Pane:\n{driver.capture_pane()}"
-            )
-            marker_5a = idle.latest_stop_uuid(observer)
+            # Q23c lead-driven design: the entire sub-act 5 runs
+            # from the LEAD's pane via mcp__operon__send_to_member.
+            # The lead routes prompts to teammates; the teammates
+            # execute and reply via SendMessage back to the lead;
+            # the lead's inbox file at
+            # ~/.claude/teams/<run>/inboxes/team-lead.json is the
+            # completion signal for each step.
             probe_file_path = tmp_cwd / "SCENARIO_OVERRIDE_PROBE.txt"
+            probe_file = tmp_cwd / "SCENARIO_OVERRIDE_PROBE.txt"
+            lead_inbox_path_5 = teams_dir / RUN_NAME / "inboxes" / "team-lead.json"
+
+            # Step A: lead routes the deny-probe to implementer
+            # via send_to_member. Implementer attempts Write, deny
+            # fires, implementer SendMessage's the rule_id back to
+            # team-lead.
+            baseline_5a = inbox_watcher.inbox_baseline(lead_inbox_path_5)
+            marker_5a = idle.latest_stop_uuid(observer)
             driver.send(
-                "Controlled scenario probe. Please attempt to "
-                f"use the Write tool to create {probe_file_path} "
-                "with content \"probe\".\n\n"
-                "operon's scenario_implementer_deny rule (a "
-                "fixture-added deny scoped to your role) will "
-                "block your Write -- this is the expected "
-                "behavior of this probe.\n\n"
-                "Do NOT try to work around the deny. Do NOT use "
-                "a different tool. Do NOT skip the Write. After "
-                "the deny, reply with ONLY the rule_id from the "
-                "deny message and the verbatim message text, "
-                "then stop."
+                "Call mcp__operon__send_to_member now. Parameters:\n"
+                "  name='implementer'\n"
+                "  text: 'Controlled scenario probe -- please use "
+                f"the Write tool to create the file {probe_file_path} "
+                "with content \"probe\". operon\\'s "
+                "scenario_implementer_deny rule (a fixture-added "
+                "deny scoped to your role) will block your Write -- "
+                "that is the expected behavior of this probe. After "
+                "the deny, send a SendMessage back to team-lead "
+                "with ONLY the rule_id from the deny message. Do "
+                "NOT try to work around the deny or use a different "
+                "tool.'\n\n"
+                "After send_to_member returns, wait for the "
+                "implementer's reply to land in YOUR (team-lead's) "
+                "inbox. When the reply arrives, report ONLY the "
+                "rule_id verbatim and stop."
             )
+            # Wait for lead idle (send_to_member returned), then
+            # for the implementer's reply to land in lead's inbox.
             ok_5a = idle.wait_idle_pre_kill(
                 observer=observer,
-                inboxes_tracker=inbox_tracker,
+                inboxes_tracker=None,  # don't rely on global tracker
                 timeout_s=SUB_ACT_TIMEOUT_S,
                 k_ms=IDLE_K_MS,
                 after_marker_uuid=marker_5a,
             )
             assert ok_5a, (
-                "sub-act 5A: assistant never reached idle after "
-                f"deny-probe within {SUB_ACT_TIMEOUT_S}s. Pane:\n"
-                f"{driver.capture_pane()}"
+                "sub-act 5A: lead never reached idle after "
+                f"send_to_member within {SUB_ACT_TIMEOUT_S}s."
             )
-
-            # MUST-see: deny message text in JSONL.
-            recs_5a = observer.all_records()
-            recs_5a_blob = json.dumps(recs_5a, ensure_ascii=False)
-            deny_fired = (
-                "Scenario sub-act 5 deny rule" in recs_5a_blob
-                or "scenario_implementer_deny" in recs_5a_blob
+            # Wait for implementer's reply.
+            impl_reply_5a = inbox_watcher.wait_for_inbox_entry(
+                lead_inbox_path_5,
+                predicate=lambda e: (
+                    e.get("from") == "implementer"
+                    and not inbox_watcher.is_idle_notification(e)
+                ),
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                baseline_count=baseline_5a,
             )
+            assert impl_reply_5a is not None, (
+                "MUST-see: no reply from implementer landed in "
+                f"team-lead's inbox at {lead_inbox_path_5} within "
+                f"{SUB_ACT_TIMEOUT_S}s."
+            )
+            # MUST-see: the deny rule fired.
+            reply_text_5a = impl_reply_5a.get("text") or ""
+            deny_fired = "scenario_implementer_deny" in reply_text_5a
             assert deny_fired, (
-                "MUST-see: the scenario_implementer_deny rule did "
-                "not fire on the implementer's Write attempt. "
-                "Either the rule was not loaded (fixture issue) "
-                "or the implementer's role was not resolved (the "
-                "Land 4 regression presumed fixed)."
+                "MUST-see: implementer's reply did not mention "
+                "scenario_implementer_deny. Reply text: "
+                f"{reply_text_5a[:500]}"
             )
-            # MUST-NOT-see: the file already exists (deny should
-            # have prevented the write).
-            probe_file = tmp_cwd / "SCENARIO_OVERRIDE_PROBE.txt"
+            # MUST-NOT-see: the file exists yet (deny blocked the Write).
             assert not probe_file.exists(), (
                 "MUST-NOT-see: SCENARIO_OVERRIDE_PROBE.txt exists "
                 "after the deny supposedly fired -- the deny did "
                 "not actually block the Write."
             )
 
-            # Step B: STILL IN THE IMPLEMENTER'S CHANNEL. Ask the
-            # implementer to call request_override itself. CC
-            # routes the resulting elicit/create form to the
-            # originating session, which is the implementer's
-            # channel. The harness drives the form in-place (no
-            # channel switch -- accept_elicit_form just polls the
-            # current pane for the form text and sends Space +
-            # Down + Enter).
+            # Step B: lead calls request_override itself; the
+            # elicit form renders in the LEAD's pane (which the
+            # pty driver displays cleanly -- no overlay). Harness
+            # drives Space+Down+Enter via accept_elicit_form.
             marker_5b = idle.latest_stop_uuid(observer)
             driver.send(
-                "Now call mcp__operon__request_override directly. "
-                "Parameters: rule_id=\"scenario_implementer_deny\", "
-                "tool_name=\"Write\", tool_input={\"file_path\": "
-                f"\"{probe_file_path}\", \"content\": \"probe\"}}. "
-                "An override confirmation form will appear here "
-                "in your channel -- the harness will accept it. "
-                "After the tool returns, reply with ONLY the "
-                "override response JSON and stop."
+                "Now call mcp__operon__request_override yourself. "
+                "Parameters: rule_id='scenario_implementer_deny', "
+                "tool_name='Write', tool_input="
+                f"{{\"file_path\": \"{probe_file_path}\", "
+                "\"content\": \"probe\"}}. An override confirmation "
+                "form will appear in your pane -- the harness will "
+                "accept it. After the tool returns, report ONLY the "
+                "override response and stop."
             )
             form_accepted_5 = driver.accept_elicit_form(
                 wait_for_substring="override",
@@ -1494,20 +1504,19 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             )
             assert form_accepted_5, (
                 "sub-act 5B: override confirmation form never "
-                "appeared in the implementer's channel. Pane:\n"
+                "appeared in the lead's pane within 180s. Pane:\n"
                 + driver.capture_pane()
             )
             ok_5b = idle.wait_idle_pre_kill(
                 observer=observer,
-                inboxes_tracker=inbox_tracker,
+                inboxes_tracker=None,
                 timeout_s=SUB_ACT_TIMEOUT_S,
                 k_ms=IDLE_K_MS,
                 after_marker_uuid=marker_5b,
             )
             assert ok_5b, (
-                "sub-act 5B: assistant never reached idle after "
-                f"override grant within {SUB_ACT_TIMEOUT_S}s. "
-                f"Pane:\n{driver.capture_pane()}"
+                "sub-act 5B: lead never reached idle after "
+                f"request_override within {SUB_ACT_TIMEOUT_S}s."
             )
 
             # MUST-see: override token file on disk. Operon's
@@ -1539,30 +1548,49 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 f"{{override, ack}}: {override_token}"
             )
 
-            # Step C: still in the implementer's channel. Ask the
-            # implementer to retry the Write. The override token
-            # is now on disk; the PreToolUse hook should consume
-            # it and allow the Write.
+            # Step C: lead routes the retry-probe to implementer
+            # via send_to_member. The override token is on disk;
+            # implementer's PreToolUse hook should consume it and
+            # allow the Write.
+            baseline_5c = inbox_watcher.inbox_baseline(lead_inbox_path_5)
             marker_5c = idle.latest_stop_uuid(observer)
             driver.send(
-                "Now retry the same Write tool call -- create the "
-                f"file {probe_file_path} with content \"probe\". "
-                "The override token is on disk so the retry "
-                "should succeed. After the Write returns, reply "
-                "with ONLY whether the file was created (yes/no) "
-                "and stop."
+                "Call mcp__operon__send_to_member now. Parameters:\n"
+                "  name='implementer'\n"
+                "  text: 'The override token is now on disk. Retry "
+                f"the same Write -- create {probe_file_path} with "
+                "content \"probe\". The retry should succeed. After "
+                "the Write returns, send a SendMessage back to "
+                "team-lead with \"WROTE\" if the file was created.'\n\n"
+                "After send_to_member returns, wait for the "
+                "implementer's WROTE reply in your inbox. Report "
+                "ONLY whether the file was created and stop."
             )
             ok_5c = idle.wait_idle_pre_kill(
                 observer=observer,
-                inboxes_tracker=inbox_tracker,
+                inboxes_tracker=None,
                 timeout_s=SUB_ACT_TIMEOUT_S,
                 k_ms=IDLE_K_MS,
                 after_marker_uuid=marker_5c,
             )
             assert ok_5c, (
-                "sub-act 5C: assistant never reached idle after "
-                f"retry within {SUB_ACT_TIMEOUT_S}s. Pane:\n"
-                f"{driver.capture_pane()}"
+                "sub-act 5C: lead never reached idle after "
+                f"send_to_member within {SUB_ACT_TIMEOUT_S}s."
+            )
+            # Wait for implementer's WROTE reply.
+            impl_reply_5c = inbox_watcher.wait_for_inbox_entry(
+                lead_inbox_path_5,
+                predicate=lambda e: (
+                    e.get("from") == "implementer"
+                    and not inbox_watcher.is_idle_notification(e)
+                ),
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                baseline_count=baseline_5c,
+            )
+            assert impl_reply_5c is not None, (
+                "MUST-see: no reply from implementer landed in "
+                f"team-lead's inbox after retry within "
+                f"{SUB_ACT_TIMEOUT_S}s."
             )
 
             # MUST-see: file exists on disk after retry.
@@ -1665,11 +1693,9 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 ],
             )
 
-            # Post-5: return focus to team-lead for any downstream
-            # sub-acts that expect to talk to the lead. Sub-acts
-            # 6/7 will Shift+Down into specific teammates as
-            # needed; sub-act 8 (advance_phase) is a lead action.
-            driver.focus_main_thread()
+            # Post-5: no focus switch needed -- the entire sub-act
+            # 5 ran from the lead's pane. Sub-acts 6/7 will also
+            # be lead-driven (Q23c design).
 
         # =============== SUB-ACT 6: teammate cross-talk ===============
         # Empirical envelope per Boaz's walk: focus into a
@@ -1693,87 +1719,75 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             },
         )
 
-        # 6.1: composability -> implementer
-        focused_6a = driver.focus_teammate_thread(
-            "composability", max_hops=4
-        )
-        assert focused_6a, (
-            "sub-act 6.1 pre-step: could not focus composability "
-            f"via Shift+Down. current_focus="
-            f"{driver.current_focus()!r}.\n"
-            f"Pane:\n{driver.capture_pane()}"
-        )
-        marker_6a = idle.latest_stop_uuid(observer)
-        driver.send(
-            "Send a SendMessage to teammate 'implementer' with "
-            "text exactly 'hi from composability'. After it "
-            "returns, reply with the literal string 'SENT-6a' "
-            "and stop."
-        )
-        ok_6a = idle.wait_idle_pre_kill(
-            observer=observer,
-            inboxes_tracker=inbox_tracker,
-            timeout_s=SUB_ACT_TIMEOUT_S,
-            k_ms=IDLE_K_MS,
-            after_marker_uuid=marker_6a,
-        )
-        assert ok_6a, (
-            f"sub-act 6.1: timeout. Pane:\n{driver.capture_pane()}"
-        )
-
-        # 6.2: still in composability's channel, send to lead
-        marker_6b = idle.latest_stop_uuid(observer)
-        driver.send(
-            "Now send a SendMessage to teammate 'team-lead' "
-            "with text exactly 'reporting in'. After it "
-            "returns, reply with 'SENT-6b' and stop."
-        )
-        ok_6b = idle.wait_idle_pre_kill(
-            observer=observer,
-            inboxes_tracker=inbox_tracker,
-            timeout_s=SUB_ACT_TIMEOUT_S,
-            k_ms=IDLE_K_MS,
-            after_marker_uuid=marker_6b,
-        )
-        assert ok_6b, (
-            f"sub-act 6.2: timeout. Pane:\n{driver.capture_pane()}"
-        )
-
-        # Inspect both inbox files.
+        # Q23c lead-driven: lead routes via send_to_member to
+        # composability; composability does the two outgoing
+        # SendMessages (to implementer + to team-lead). One lead
+        # send issuing TWO outgoing actions in composability's
+        # turn.
         impl_inbox_path = teams_dir / RUN_NAME / "inboxes" / "implementer.json"
         lead_inbox_path = teams_dir / RUN_NAME / "inboxes" / "team-lead.json"
-        impl_inbox = []
-        if impl_inbox_path.is_file():
-            try:
-                impl_inbox = json.loads(impl_inbox_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                impl_inbox = []
-        lead_inbox = []
-        if lead_inbox_path.is_file():
-            try:
-                lead_inbox = json.loads(lead_inbox_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                lead_inbox = []
-        impl_from_comp = [
-            m for m in impl_inbox
-            if isinstance(m, dict)
-            and m.get("from") == "composability"
-            and "hi from composability" in (m.get("text") or "")
-        ]
-        lead_from_comp = [
-            m for m in lead_inbox
-            if isinstance(m, dict)
-            and m.get("from") == "composability"
-            and "reporting in" in (m.get("text") or "")
-        ]
-        assert impl_from_comp, (
+        baseline_impl_6 = inbox_watcher.inbox_baseline(impl_inbox_path)
+        baseline_lead_6 = inbox_watcher.inbox_baseline(lead_inbox_path)
+
+        marker_6 = idle.latest_stop_uuid(observer)
+        driver.send(
+            "Call mcp__operon__send_to_member now. Parameters:\n"
+            "  name='composability'\n"
+            "  text: 'Two tasks in this single turn:\\n"
+            "  1. Send a SendMessage to teammate \"implementer\" "
+            "with text exactly \"hi from composability\".\\n"
+            "  2. Send a SendMessage to teammate \"team-lead\" "
+            "with text exactly \"reporting in\".\\nAfter both "
+            "SendMessages return, reply with the literal text "
+            "\"SENT-6\" and stop.'\n\n"
+            "After send_to_member returns, wait for composability "
+            "to complete. The completion signal is the 'reporting "
+            "in' message landing in YOUR (team-lead's) inbox. "
+            "Once it lands, reply 'OK' and stop."
+        )
+        ok_6 = idle.wait_idle_pre_kill(
+            observer=observer,
+            inboxes_tracker=None,
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            k_ms=IDLE_K_MS,
+            after_marker_uuid=marker_6,
+        )
+        assert ok_6, (
+            f"sub-act 6: lead never reached idle. "
+            f"Pane:\n{driver.capture_pane()}"
+        )
+        # Wait for composability's two outgoing messages.
+        impl_msg_6 = inbox_watcher.wait_for_inbox_entry(
+            impl_inbox_path,
+            predicate=lambda e: (
+                e.get("from") == "composability"
+                and "hi from composability" in (e.get("text") or "")
+            ),
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            baseline_count=baseline_impl_6,
+        )
+        lead_msg_6 = inbox_watcher.wait_for_inbox_entry(
+            lead_inbox_path,
+            predicate=lambda e: (
+                e.get("from") == "composability"
+                and "reporting in" in (e.get("text") or "")
+            ),
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            baseline_count=baseline_lead_6,
+        )
+
+        # Inspect inbox state for the gate_check.
+        impl_inbox = inbox_watcher.read_inbox(impl_inbox_path)
+        lead_inbox = inbox_watcher.read_inbox(lead_inbox_path)
+        assert impl_msg_6 is not None, (
             "MUST-see: implementer's inbox did not receive a "
             "from=composability entry with text 'hi from "
-            "composability'."
+            "composability' within timeout."
         )
-        assert lead_from_comp, (
+        assert lead_msg_6 is not None, (
             "MUST-see: team-lead's inbox did not receive a "
-            "from=composability entry with text 'reporting in'."
+            "from=composability entry with text 'reporting in' "
+            "within timeout."
         )
         # MUST NOT see: operon receiving the cross-talk.
         operon_inbox_path_6 = teams_dir / RUN_NAME / "inboxes" / "operon.json"
@@ -1805,15 +1819,15 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             notes={
                 "impl_inbox_entries": len(impl_inbox),
                 "lead_inbox_entries": len(lead_inbox),
-                "impl_from_comp_matches": len(impl_from_comp),
-                "lead_from_comp_matches": len(lead_from_comp),
+                "impl_msg_6_excerpt": (impl_msg_6 or {}).get("text", "")[:200],
+                "lead_msg_6_excerpt": (lead_msg_6 or {}).get("text", "")[:200],
             },
         )
         gate_check(
             "sub_act_6",
             must_hold=[
-                ("implementer got hi from composability", bool(impl_from_comp)),
-                ("team-lead got reporting in from composability", bool(lead_from_comp)),
+                ("implementer got hi from composability", impl_msg_6 is not None),
+                ("team-lead got reporting in from composability", lead_msg_6 is not None),
                 ("operon did NOT receive cross-talk", not operon_got_crosstalk),
                 ("under token cap", meter.cumulative.billable <= TOKEN_CAP),
             ],
@@ -1838,63 +1852,80 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
             },
         )
 
-        focused_7 = driver.focus_teammate_thread(
-            "composability", max_hops=3
-        )
-        assert focused_7, (
-            "sub-act 7: could not focus composability."
-        )
+        # Q23c lead-driven: lead routes via send_to_member to
+        # composability; composability sends the OPERON_QUERY to
+        # operon and waits for the [OPERON_REPLY] in its own
+        # inbox; composability then forwards the reply text to
+        # team-lead via SendMessage so we can read it from the
+        # lead's inbox (avoiding the need to peek into the
+        # teammate's pane).
+        baseline_lead_7 = inbox_watcher.inbox_baseline(lead_inbox_path)
         marker_7 = idle.latest_stop_uuid(observer)
         driver.send(
-            "Send a SendMessage to teammate 'operon' with text "
-            "exactly '[OPERON_QUERY] whoami'. Wait for operon's "
-            "[OPERON_REPLY] whoami response to land in YOUR inbox "
-            "(it may take a few seconds because operon polls "
-            "every ~1s). When you see it, reply ONLY with the "
-            "verbatim text of operon's [OPERON_REPLY] line and "
-            "stop. Do NOT do anything else."
+            "Call mcp__operon__send_to_member now. Parameters:\n"
+            "  name='composability'\n"
+            "  text: 'Three-step task:\\n"
+            "  1. Send a SendMessage to teammate \"operon\" with "
+            "text EXACTLY \"[OPERON_QUERY] whoami\".\\n"
+            "  2. Wait for the [OPERON_REPLY] whoami response to "
+            "land in YOUR inbox (operon polls ~1s; allow up to "
+            "30s).\\n"
+            "  3. Once you have the [OPERON_REPLY] line in your "
+            "inbox, send a SendMessage to teammate \"team-lead\" "
+            "with the VERBATIM text of the [OPERON_REPLY] line, "
+            "prefixed by \"FORWARD: \".\\nThen reply WHOAMI-DONE "
+            "and stop.'\n\n"
+            "After send_to_member returns, wait for the FORWARD: "
+            "message to land in YOUR (team-lead's) inbox. Report "
+            "ONLY the forwarded text and stop."
         )
         ok_7 = idle.wait_idle_pre_kill(
             observer=observer,
-            inboxes_tracker=inbox_tracker,
+            inboxes_tracker=None,
             timeout_s=SUB_ACT_TIMEOUT_S,
             k_ms=IDLE_K_MS,
             after_marker_uuid=marker_7,
         )
         assert ok_7, (
-            f"sub-act 7: timeout. Pane:\n{driver.capture_pane()}"
+            f"sub-act 7: lead never reached idle. "
+            f"Pane:\n{driver.capture_pane()}"
         )
-
-        # Inspect composability's inbox for [OPERON_REPLY] whoami.
+        # Wait for composability's FORWARD: message in lead's inbox.
+        forward_msg = inbox_watcher.wait_for_inbox_entry(
+            lead_inbox_path,
+            predicate=lambda e: (
+                e.get("from") == "composability"
+                and "FORWARD:" in (e.get("text") or "")
+                and "[OPERON_REPLY]" in (e.get("text") or "")
+            ),
+            timeout_s=SUB_ACT_TIMEOUT_S,
+            baseline_count=baseline_lead_7,
+        )
+        assert forward_msg is not None, (
+            "MUST-see: composability did not forward an "
+            "[OPERON_REPLY] whoami payload to team-lead's inbox "
+            f"within {SUB_ACT_TIMEOUT_S}s."
+        )
+        forward_txt = forward_msg.get("text") or ""
+        # Also inspect composability's own inbox for the operon
+        # reply (cross-check).
         comp_inbox_path = teams_dir / RUN_NAME / "inboxes" / "composability.json"
-        comp_inbox = []
-        if comp_inbox_path.is_file():
-            try:
-                comp_inbox = json.loads(comp_inbox_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                comp_inbox = []
+        comp_inbox = inbox_watcher.read_inbox(comp_inbox_path)
         operon_replies = [
             m for m in comp_inbox
             if isinstance(m, dict)
             and m.get("from") == "operon"
             and "[OPERON_REPLY] whoami" in (m.get("text") or "")
         ]
-        whoami_payload_ok = False
-        if operon_replies:
-            txt = operon_replies[-1].get("text") or ""
-            whoami_payload_ok = (
-                "composability" in txt
-                and ("source" in txt or "team_roster" in txt)
-            )
-        assert operon_replies, (
-            "MUST-see: composability's inbox did not receive "
-            "any [OPERON_REPLY] whoami entry from operon."
+        whoami_payload_ok = (
+            "composability" in forward_txt
+            and ("source" in forward_txt or "team_roster" in forward_txt)
         )
         assert whoami_payload_ok, (
-            "MUST-see: the [OPERON_REPLY] whoami payload did "
-            "not contain expected identity fields "
+            "MUST-see: the forwarded [OPERON_REPLY] whoami payload "
+            "did not contain expected identity fields "
             f"(composability + source/team_roster). Body: "
-            f"{(operon_replies[-1].get('text') or '')[:400]}"
+            f"{forward_txt[:400]}"
         )
 
         meter.checkpoint("sub_act_7")
@@ -2366,26 +2397,31 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 + driver_10.capture_pane()
             )
 
-            # Step C: focus composability, ask for first-person
-            # recall of the prior session's content.
-            focused_10 = driver_10.focus_teammate_thread(
-                "composability", max_hops=4
-            )
-            assert focused_10, (
-                "sub-act 10C: could not focus composability "
-                "after respawn. current_focus="
-                f"{driver_10.current_focus()!r}.\n"
-                + driver_10.capture_pane()
-            )
+            # Step C: lead routes the recall probe to composability
+            # via send_to_member. The composability subagent's first
+            # turn has the WA1-injected transcripts; it replies via
+            # SendMessage back to team-lead with the recall content.
+            # The harness reads the recall from team-lead's inbox
+            # (no need to peek into the teammate's pane).
+            lead_inbox_path_10 = teams_dir / RUN_NAME / "inboxes" / "team-lead.json"
+            baseline_lead_10 = inbox_watcher.inbox_baseline(lead_inbox_path_10)
             marker_10c = idle.latest_stop_uuid(observer)
             driver_10.send(
-                "What did we discuss before this session? Be "
-                "specific. List in plain prose: (1) any messages "
-                "you sent to implementer or to team-lead, (2) any "
-                "[OPERON_REPLY] payload you received from operon, "
-                "(3) any phase-advance brief you got. Reply with "
-                "the recall content and stop -- no commentary on "
-                "the format."
+                "Call mcp__operon__send_to_member now. Parameters:\n"
+                "  name='composability'\n"
+                "  text: 'What did we discuss before this session? "
+                "Be specific. List in plain prose:\\n"
+                "  (1) any messages you sent to implementer or to "
+                "team-lead;\\n"
+                "  (2) any [OPERON_REPLY] payload you received from "
+                "operon;\\n"
+                "  (3) any phase-advance brief you got.\\n"
+                "Send your full recall as a SendMessage to "
+                "team-lead, prefixed by \"RECALL: \". Then stop.'\n\n"
+                "After send_to_member returns, wait for the "
+                "RECALL: message to land in YOUR (team-lead's) "
+                "inbox. Report ONLY whether the recall arrived "
+                "and stop."
             )
             ok_10c = idle.wait_idle_pre_kill(
                 observer=observer,
@@ -2395,13 +2431,25 @@ def test_project_team_workflow(tmp_cwd, operon_plugin_dir, claude_driver_cls):
                 after_marker_uuid=marker_10c,
             )
             assert ok_10c, (
-                "sub-act 10C: recall query timed out.\n"
+                "sub-act 10C: lead idle wait timeout.\n"
                 + driver_10.capture_pane()
             )
-
-            # Assert concrete-fact recall.
-            recs_10 = observer.all_records()
-            recs_10_blob = json.dumps(recs_10, ensure_ascii=False)
+            # Wait for composability's RECALL: message.
+            recall_msg = inbox_watcher.wait_for_inbox_entry(
+                lead_inbox_path_10,
+                predicate=lambda e: (
+                    e.get("from") == "composability"
+                    and "RECALL:" in (e.get("text") or "")
+                ),
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                baseline_count=baseline_lead_10,
+            )
+            assert recall_msg is not None, (
+                "MUST-see: composability did not send a RECALL: "
+                "message to team-lead's inbox within "
+                f"{SUB_ACT_TIMEOUT_S}s."
+            )
+            recs_10_blob = recall_msg.get("text") or ""
             recall_concrete_facts = [
                 ("hi from composability", "hi from composability" in recs_10_blob),
                 ("reporting in", "reporting in" in recs_10_blob),
