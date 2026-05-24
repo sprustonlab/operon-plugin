@@ -269,22 +269,70 @@ def _try_log_failclosed(
         _log.warning("failclosed audit append skipped: %s", exc)
 
 
-def _resolve_identity() -> tuple[str | None, str | None, str | None]:
-    """Return (agent_name, role, current_phase). All-None fallbacks
-    are safe: role/phase-scoped rules simply don't match when None.
+#: Hook-input ``agent_type`` values that we treat as lead-side and
+#: therefore IGNORE for the role override. CC 2.1.150 was observed
+#: to omit ``agent_type`` entirely on lead-originated tool calls
+#: (the empirical signal Land 8 relies on), but we defensively
+#: filter ``"team-lead"`` in case a future CC version starts
+#: sending the team-config-default value for lead calls. The
+#: bootstrap-resolved role from ``_handles/<handle>.json``
+#: (``coordinator``) is the correct answer in that case.
+_HOOK_AGENT_TYPE_IGNORE = frozenset({"team-lead"})
+
+
+def _resolve_identity(
+    hook_input: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Return (agent_name, role, current_phase).
+
+    Land 8 (2026-05-23 dispatch + Boaz's empirical probe of
+    /tmp/operon-role-check/.operon-pretooluse-probe.log): CC
+    2.1.150's PreToolUse hook propagates the originating
+    teammate's spawn-time ``subagent_type`` as ``agent_type`` in
+    the hook input. The field is present + non-empty on
+    teammate-originated tool calls (e.g. ``"implementer"``,
+    ``"composability"``) and ABSENT on lead-originated calls.
+    Probe data:
+
+      LEAD     tool_name=Agent  agent_type=<MISSING>
+      TEAMMATE tool_name=Write  agent_type="implementer"
+
+    Both calls multiplex through the same MCP transport so
+    session_id / transcript_path are lead-uniform (the B.0 wall).
+    ``agent_type`` is the per-call signal we never inspected
+    before this probe.
+
+    Resolution order:
+
+      1. If ``hook_input["agent_type"]`` is a non-empty string and
+         is not in :data:`_HOOK_AGENT_TYPE_IGNORE`, use it as the
+         resolved role (this scopes guardrail rules to the
+         originating teammate, not the lead).
+      2. Else fall back to the bootstrap-discovered Coordinator
+         handle's ``role`` field (the existing Land-4-regression
+         fix path -- correctly resolves to ``"coordinator"`` for
+         the lead).
+
+    ``agent_name`` and ``current_phase`` still come from the
+    bootstrap handle + phase_state.json. We deliberately do NOT
+    override ``agent_name`` here: operon's singleton-MCP identity
+    IS the lead's Coordinator handle. The audit-log row keeps
+    that fact (``agent: "Coordinator"``) but the ``role`` field
+    correctly reflects the originating teammate so rule
+    projections fire on the right scope.
+
+    All-None fallbacks (no handle, no hook_input override) are
+    safe: role/phase-scoped rules simply don't match when None.
     """
-    handle = identity.read_env_handle()
-    if handle is None:
-        return None, None, None
-    try:
-        record = identity.read_handle_file(handle)
-    except identity.IdentityError as exc:
-        _log.warning("identity read failed: %s", exc)
-        return None, None, None
-    if record is None:
-        return None, None, None
-    name = record.get("agent_name")
-    role = record.get("role")
+    role_override: str | None = None
+    if isinstance(hook_input, dict):
+        candidate = hook_input.get("agent_type")
+        if (
+            isinstance(candidate, str)
+            and candidate
+            and candidate not in _HOOK_AGENT_TYPE_IGNORE
+        ):
+            role_override = candidate
 
     current_phase: str | None = None
     try:
@@ -295,9 +343,32 @@ def _resolve_identity() -> tuple[str | None, str | None, str | None]:
     except workflow.WorkflowError:
         current_phase = None
 
+    handle = identity.read_env_handle()
+    if handle is None:
+        # No bootstrap-resolved handle. Still surface the
+        # hook-input role override so rule projections can scope
+        # correctly even without operon-side identity binding.
+        return None, role_override, current_phase
+    try:
+        record = identity.read_handle_file(handle)
+    except identity.IdentityError as exc:
+        _log.warning("identity read failed: %s", exc)
+        return None, role_override, current_phase
+    if record is None:
+        return None, role_override, current_phase
+    name = record.get("agent_name")
+    bootstrap_role = record.get("role")
+
+    if role_override is not None:
+        resolved_role: str | None = role_override
+    elif isinstance(bootstrap_role, str) and bootstrap_role:
+        resolved_role = bootstrap_role
+    else:
+        resolved_role = None
+
     return (
         name if isinstance(name, str) and name else None,
-        role if isinstance(role, str) and role else None,
+        resolved_role,
         current_phase,
     )
 
@@ -627,90 +698,6 @@ def main() -> None:
         _emit(_allow_output())
         return
 
-    # ---- DISPOSABLE PROBE (2026-05-23 dispatch) --------------------
-    # Dump the FULL hook_input dict to <cwd>/.operon-pretooluse-probe.log
-    # so we can empirically check whether `transcript_path` (an
-    # unexplored signal from Phase A's static analysis) distinguishes
-    # teammate-originated PreToolUse fires from lead-originated ones.
-    # Phase A noted that under in-process Agent Teams each sidechain
-    # has its own JSONL file under
-    # ``~/.claude/projects/<cwd-mangled>/<parent-session>/subagents/
-    # agent-<hash>.jsonl`` while the lead's transcript is the
-    # parent-session JSONL one level up. If the runtime populates
-    # the hook input's ``transcript_path`` from the SOURCE session
-    # (which would be the natural implementation), a teammate's
-    # tool call would land with ``/subagents/agent-`` in its path
-    # and the lead's call would not.
-    #
-    # B.0 (commits b1571bf + 2b4a7c3, rolled back in Land 6) showed
-    # ``meta.model_extra`` and ``clientInfo`` were lead-uniform across
-    # callers. The pretooluse layer is technically a separate plane
-    # from the MCP layer; whether ``transcript_path`` reflects the
-    # caller-session is the open question.
-    #
-    # Probe contract:
-    #   - Gated on OPERON_DEBUG=1 (mirrors B.0 + matches the
-    #     existing _maybe_enable_debug gate).
-    #   - File-only output (Claude Code captures the hook
-    #     subprocess's stderr ONLY during the initial handshake;
-    #     post-handshake stderr is swallowed -- B.0 fix lesson).
-    #   - Path: <cwd>/.operon-pretooluse-probe.log, mode "a", utf-8.
-    #   - One JSONL line per hook fire: {ts, tool_name, hook_input,
-    #     transcript_path_raw, transcript_classification}.
-    #   - try/except wraps the entire probe; failures must never
-    #     block dispatch.
-    #   - Tagged `[PT-PROBE]` for grep so a future cleanup commit
-    #     can find every emission site.
-    #
-    # Self-revert: this block + the helper above it are removed in
-    # the follow-up commit that lands the actual transcript_path-
-    # based fix (if the data supports the alpha path) or that
-    # closes the question (if data supports the beta / universal-
-    # block path).
-    if os.environ.get(_DEBUG_ENV, "").strip().lower() not in {
-        "",
-        "0",
-        "false",
-        "no",
-    }:
-        try:
-            from datetime import datetime, timezone
-            from pathlib import Path
-
-            tp_raw = hook_input.get("transcript_path")
-            tp_class = "unknown"
-            if isinstance(tp_raw, str) and tp_raw:
-                if "/subagents/agent-" in tp_raw and tp_raw.endswith(".jsonl"):
-                    tp_class = "sidechain (teammate)"
-                elif (
-                    "/.claude/projects/" in tp_raw
-                    and tp_raw.endswith(".jsonl")
-                    and "/subagents/" not in tp_raw
-                ):
-                    tp_class = "parent-session (lead)"
-                else:
-                    tp_class = "other"
-            elif tp_raw is None:
-                tp_class = "absent"
-            else:
-                tp_class = f"non-string ({type(tp_raw).__name__})"
-            probe_entry = {
-                "tag": "[PT-PROBE]",
-                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "tool_name": hook_input.get("tool_name"),
-                "transcript_path_raw": tp_raw,
-                "transcript_classification": tp_class,
-                "hook_input": hook_input,
-            }
-            probe_path = (Path.cwd() / ".operon-pretooluse-probe.log").resolve()
-            with open(probe_path, "a", encoding="utf-8") as fp:
-                fp.write(json.dumps(probe_entry, default=str) + "\n")
-        except Exception as exc:  # noqa: BLE001 -- probe must not block
-            try:
-                sys.stderr.write(f"[PT-PROBE] error: {exc!r}\n")
-            except Exception:
-                pass
-
     tool_name = hook_input.get("tool_name", "")
     if not isinstance(tool_name, str) or not tool_name:
         _log.debug("no tool_name in hook input; fail-open")
@@ -769,7 +756,11 @@ def main() -> None:
     # of the failclosed deny (if it fires) and for the full rules
     # engine path below. Identity resolution failure does NOT bypass
     # the deny.
-    agent_name, role, current_phase = _resolve_identity()
+    #
+    # Land 8: pass hook_input through so `_resolve_identity` can
+    # apply the CC 2.1.150 ``agent_type``-based role override when
+    # a teammate originates the call.
+    agent_name, role, current_phase = _resolve_identity(hook_input)
     _log.debug(
         "tool=%s role=%r phase=%r agent=%r failclosed=%s",
         tool_name,
