@@ -1973,9 +1973,10 @@ def test_project_team_coordination_chain(tmp_cwd, operon_plugin_dir, claude_driv
 #: Cap for the advance-lifecycle test. Covers: TeamCreate + activate
 #: + vision->setup advance + spawn + setup->leadership cascade + halt
 #: + restore + recall. Empirically (Group B + extension): cumulative
-#: cost ~80-120K. Cap at 200K for headroom without masking
-#: regressions.
-TOKEN_CAP_ADVANCE_LIFECYCLE = 200_000
+#: cost ~80-120K. Bumped to 230K per Land 14 to absorb up to 2
+#: prose retries per advance_phase attempt (~5-10K each, 2 retries
+#: worst case = ~20K).
+TOKEN_CAP_ADVANCE_LIFECYCLE = 230_000
 
 
 def test_project_team_advance_lifecycle(tmp_cwd, operon_plugin_dir, claude_driver_cls):
@@ -2189,12 +2190,35 @@ def test_project_team_advance_lifecycle(tmp_cwd, operon_plugin_dir, claude_drive
 
         artifact_dir = tmp_cwd / ".project_team" / RUN_NAME
         MAX_ADVANCE_RETRIES = 6
+        MAX_PROSE_RETRIES = 2  # Land 14: retry budget for prose-only responses
         advance_attempts = 0
         observed_check_types: list[str] = []
         first_advance_response_recorded = False
 
+        def _advance_phase_tool_uses_after(records, after_idx: int) -> int:
+            """Count advance_phase tool_use entries from index after_idx onward."""
+            count = 0
+            for i in range(after_idx, len(records)):
+                rec = records[i]
+                if rec.get("isSidechain") is True:
+                    continue
+                if rec.get("type") != "assistant":
+                    continue
+                for c in (rec.get("message", {}).get("content") or []):
+                    if (
+                        isinstance(c, dict)
+                        and c.get("type") == "tool_use"
+                        and "advance_phase" in str(c.get("name", ""))
+                    ):
+                        count += 1
+            return count
+
         for attempt in range(MAX_ADVANCE_RETRIES):
             marker_8 = idle.latest_stop_uuid(observer)
+            # Index baseline for prose-detection.
+            observer.read_new()
+            records_baseline_idx = len(observer.all_records())
+
             if attempt == 0:
                 msg = (
                     "Call mcp__operon__advance_phase now. After "
@@ -2207,26 +2231,84 @@ def test_project_team_advance_lifecycle(tmp_cwd, operon_plugin_dir, claude_drive
                     "Call mcp__operon__advance_phase AGAIN. After "
                     "it returns, report the JSON response. Stop."
                 )
-            driver.send(msg)
-            ok_8 = idle.wait_idle_pre_kill(
-                observer=observer,
-                inboxes_tracker=inbox_tracker,
-                timeout_s=SUB_ACT_TIMEOUT_S,
-                k_ms=IDLE_K_MS,
-                after_marker_uuid=marker_8,
-            )
-            assert ok_8, (
-                f"iso sub-act 8 attempt {attempt+1}: timeout. "
-                f"Pane:\n{driver.capture_pane()}"
-            )
-            # Post-idle settle: wait_idle returns on the lead's
-            # end_turn, but the tool_result for advance_phase may
-            # be queued behind the end_turn marker in the JSONL
-            # writer. Add a short observer-refresh window so
-            # _last_advance_failed_check sees the most recent
-            # tool_result.
-            time.sleep(2.0)
-            observer.read_new()
+
+            # Land 14 retry-on-prose loop. Send the cascade prompt;
+            # if the lead responds with text only (no advance_phase
+            # tool_use), re-prompt up to MAX_PROSE_RETRIES times
+            # with stronger directive language. The test still
+            # fails if all retries are exhausted -- we're not
+            # hiding the LLM floor, we're working with it.
+            prose_retries_used = 0
+            for prose_attempt in range(MAX_PROSE_RETRIES + 1):
+                if prose_attempt > 0:
+                    # Negative-grounding retry (per the Land
+                    # 10/11 prompt-engineering pattern).
+                    marker_8 = idle.latest_stop_uuid(observer)
+                    msg = (
+                        "Your last response was text, not a tool "
+                        "call. THIS MUST BE A TOOL CALL. Call "
+                        "mcp__plugin_operon-plugin_operon__advance_phase "
+                        "now. Do not respond with text. Do not "
+                        "summarize. The next message after this "
+                        "prompt MUST be a tool_use of "
+                        "advance_phase. If you have already done "
+                        "this, call it again -- duplicate calls "
+                        "are safe."
+                    )
+                    prose_retries_used += 1
+                driver.send(msg)
+                ok_8 = idle.wait_idle_pre_kill(
+                    observer=observer,
+                    inboxes_tracker=inbox_tracker,
+                    timeout_s=SUB_ACT_TIMEOUT_S,
+                    k_ms=IDLE_K_MS,
+                    after_marker_uuid=marker_8,
+                )
+                assert ok_8, (
+                    f"iso sub-act 8 attempt {attempt+1} "
+                    f"prose-retry {prose_attempt}: timeout. "
+                    f"Pane:\n{driver.capture_pane()}"
+                )
+                # Post-idle settle: tool_result writes lag the
+                # end_turn marker in the JSONL writer.
+                time.sleep(2.0)
+                observer.read_new()
+                # Did the lead issue an advance_phase tool_use
+                # since the prompt went out? If yes, we're good
+                # for this attempt; break the prose-retry loop.
+                ap_count = _advance_phase_tool_uses_after(
+                    observer.all_records(), records_baseline_idx
+                )
+                if ap_count > 0:
+                    break
+                # Otherwise the lead emitted prose only. Loop
+                # back for a retry (if budget remains).
+            else:
+                # Exhausted prose retries with no advance_phase
+                # tool_use observed. Capture the lead's last
+                # prose response for the failure message.
+                prose_only_response = ""
+                for rec in reversed(observer.all_records()):
+                    if rec.get("isSidechain") is True:
+                        continue
+                    if rec.get("type") != "assistant":
+                        continue
+                    msg_obj = rec.get("message") or {}
+                    if msg_obj.get("stop_reason") != "end_turn":
+                        continue
+                    for c in (msg_obj.get("content") or []):
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            prose_only_response = (c.get("text") or "")[:200]
+                            break
+                    break
+                raise AssertionError(
+                    f"iso sub-act 8 attempt {attempt+1}: "
+                    f"advance_phase tool call never issued after "
+                    f"{MAX_PROSE_RETRIES} retries -- lead emitted "
+                    "prose-only responses. Last prose response: "
+                    f"{prose_only_response!r}"
+                )
+
             advance_attempts += 1
 
             # Capture the lead's response text on the FIRST advance_phase
