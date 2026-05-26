@@ -28,20 +28,35 @@ claude plugin install operon-plugin@operon-plugin-marketplace
 ### Refreshing a marketplace install
 
 `claude plugin install` snapshots the marketplace source at install
-time, so post-install edits to `workflows/`, `rules.yaml`, `.mcp.json`,
-or `hooks/hooks.json` are not visible until the snapshot is refreshed:
+time, and the marketplace catalog itself is cached separately. So
+picking up a new release (a version bump, or edits to `workflows/`,
+`rules.yaml`, `.mcp.json`, or `hooks/hooks.json`) takes two steps --
+refresh the catalog first, then update the plugin:
 
 ```bash
+claude plugin marketplace update operon-plugin-marketplace
 claude plugin update operon-plugin@operon-plugin-marketplace
 ```
 
-Restart Claude Code after updating so the daemon picks up the new
-plugin state. If `update` does not pick up your changes (e.g. the
-marketplace is a local directory and `update` looks for a git rev
-change), the fallback is uninstall + reinstall:
+The first command re-pulls `marketplace.json` from the marketplace
+repo; the second then sees the newer version and pulls the code. Skip
+the first and `update` keeps comparing against the stale cached catalog.
+Restart Claude Code after updating so the daemon picks up the new plugin
+state.
+
+!!! note "Updates are detected by version, not by new commits"
+    `claude plugin update` compares the plugin's `version` string. A
+    release that pushes new code without bumping `version` in
+    `plugins/operon-plugin/.claude-plugin/plugin.json` reports "already
+    at the latest version" and keeps the cached copy -- so bump the
+    version to ship a change to existing installs.
+
+If `update` still reports up-to-date after both commands, clear the
+plugin cache and reinstall:
 
 ```bash
-claude plugin uninstall operon-plugin@operon-plugin-marketplace
+rm -rf ~/.claude/plugins/cache
+# Windows (PowerShell): Remove-Item -Recurse -Force $HOME\.claude\plugins\cache
 claude plugin install operon-plugin@operon-plugin-marketplace
 ```
 
