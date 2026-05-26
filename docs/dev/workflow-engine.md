@@ -1,8 +1,8 @@
 # Workflow Engine
 
 The workflow engine turns a declarative **manifest** into a running,
-phase-structured process. It lives in `src/operon_mcp_server/workflow.py`
-(the loader + phase engine) and `src/operon_mcp_server/checks/` (the
+phase-structured process. It lives in `plugins/operon-plugin/src/operon_mcp_server/workflow.py`
+(the loader + phase engine) and `plugins/operon-plugin/src/operon_mcp_server/checks/` (the
 advance-check implementations). This page covers the manifest schema, the
 3-tier loader, the advance protocol, and how to add a phase.
 

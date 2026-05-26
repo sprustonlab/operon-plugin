@@ -40,7 +40,7 @@ itself:
 ```
 .claude-plugin/marketplace.json   # marketplace manifest (lists ./plugins/operon-plugin)
 plugins/operon-plugin/            # the plugin
-src/operon_mcp_server/            # Python MCP server package
+plugins/operon-plugin/src/operon_mcp_server/            # Python MCP server package
 ```
 
 ## Status
@@ -90,7 +90,7 @@ uv resolves the three deps on first launch and caches them.
 
 ```bash
 # from this repo root
-pip install -e .   # installs operon_mcp_server + the three runtime deps
+pip install -e plugins/operon-plugin   # installs operon_mcp_server + the three runtime deps
 claude --plugin-dir /groups/spruston/home/moharb/operon-plugin/plugins/operon-plugin/
 ```
 

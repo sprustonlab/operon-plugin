@@ -13,7 +13,7 @@ assume you will be reading and editing source.
 operon turns a single Claude Code session into a guided, multi-phase team
 workflow. It plugs into Claude Code at three points:
 
-- an **MCP server** (`src/operon_mcp_server/`) that exposes operon's tools,
+- an **MCP server** (`plugins/operon-plugin/src/operon_mcp_server/`) that exposes operon's tools,
   runs the phase engine, and holds each run's state;
 - a **PreToolUse hook** that evaluates guardrails before any side-effectful
   tool call and injects identity and prior-transcript recall into spawned
@@ -33,39 +33,41 @@ that documents it.
 
 ## Repo layout
 
-!!! note "Paths live under `plugins/operon-plugin/`, not the repo root"
+!!! note "Every plugin surface lives under `plugins/operon-plugin/`"
     operon-plugin is a [single-plugin
     marketplace](../user-guide/install.md): the repository is both the
-    Claude Code marketplace manifest and the one plugin it ships. Almost
-    every plugin surface lives **nested** under
-    `plugins/operon-plugin/`. The one exception is the MCP server Python
-    package, which lives at the repo root in `src/`. When you cite a path
-    in a doc or a comment, use the real nested path -- citing a repo-root
-    path for a nested surface is the single most common way these docs
-    drift.
+    Claude Code marketplace manifest and the one plugin it ships. Every
+    plugin surface -- including the MCP server Python package -- lives
+    **nested** under `plugins/operon-plugin/`, which is exactly the tree
+    a marketplace install copies into `${CLAUDE_PLUGIN_ROOT}`. The repo
+    root holds only the dev/test toolchain (the uv workspace
+    `pyproject.toml`, `mkdocs.yml`, `tests/`). When you cite a path in a
+    doc or comment, use the real nested path -- citing a repo-root path
+    for a nested surface is the single most common way these docs drift.
 
 ```
 operon-plugin/                          # repo root == marketplace root
   .claude-plugin/
     marketplace.json                    # marketplace manifest (lists the plugin)
-  pyproject.toml                        # MCP server package + dev deps (uv-managed)
+  pyproject.toml                        # dev/test workspace root (uv): dev deps + pytest config
   mkdocs.yml                            # this docs site
-  src/
-    operon_mcp_server/                  # the MCP server package (repo ROOT, not nested)
-      server.py                         # entry point: tool registry + role-scoped tools/list
-      workflow.py                       # manifest loader + phase engine + advance protocol
-      rules.py                          # guardrail Rule parsing, matching, evaluation, tokens
-      bootstrap.py                      # auto-bootstrap a Coordinator identity at startup
-      identity.py                       # handle records (OPERON_AGENT_HANDLE -> role)
-      paths.py                          # .operon/ run-dir path resolution (leaf)
-      inbox_reader.py                   # [OPERON_QUERY] inbox-channel reader loop
-      subagent_install.py               # compile role identity.md -> ~/.claude/agents/<role>.md
-      tools/                            # one file per MCP tool (TOOL_NAME + call + descriptor)
-      checks/                           # advance-check implementations (leaf)
   plugins/
-    operon-plugin/                      # the plugin Claude Code loads
+    operon-plugin/                      # the plugin Claude Code loads (== ${CLAUDE_PLUGIN_ROOT})
       .claude-plugin/plugin.json        # plugin manifest (name, version, author)
       .mcp.json                         # registers server "operon" -> bin/operon-mcp-server
+      pyproject.toml                    # the MCP server package: runtime metadata + deps
+      src/
+        operon_mcp_server/              # the MCP server package (bundled inside the plugin)
+          server.py                     # entry point: tool registry + role-scoped tools/list
+          workflow.py                   # manifest loader + phase engine + advance protocol
+          rules.py                      # guardrail Rule parsing, matching, evaluation, tokens
+          bootstrap.py                  # auto-bootstrap a Coordinator identity at startup
+          identity.py                   # handle records (OPERON_AGENT_HANDLE -> role)
+          paths.py                      # .operon/ run-dir path resolution (leaf)
+          inbox_reader.py               # [OPERON_QUERY] inbox-channel reader loop
+          subagent_install.py           # compile role identity.md -> ~/.claude/agents/<role>.md
+          tools/                        # one file per MCP tool (TOOL_NAME + call + descriptor)
+          checks/                       # advance-check implementations (leaf)
       bin/
         operon-mcp-server               # launcher shim (bash); resolves uv -> python3 -> python
         operon-mcp-server.cmd           # Windows launcher
@@ -121,7 +123,7 @@ three of operon's surfaces in order:
 2. **The MCP server handles operon's own tool calls.** When the model
    calls `mcp__operon__advance_phase` (or any operon tool), the request
    goes to the MCP server subprocess, which routes it to the matching
-   handler in `src/operon_mcp_server/tools/`. See [MCP
+   handler in `plugins/operon-plugin/src/operon_mcp_server/tools/`. See [MCP
    Server](mcp-server.md).
 3. **The workflow engine runs the phase machinery.** `advance_phase`
    asks `workflow.py` to evaluate the current phase's advance-checks and,
@@ -139,9 +141,9 @@ Each page below documents one surface's schema and internals.
 
 | Surface | Source of truth | Contributor page |
 |---------|-----------------|-------------------|
-| MCP server + tools + checks | `src/operon_mcp_server/{server,tools,checks}.py` | [MCP Server](mcp-server.md) |
-| Workflows + phases + advance protocol | `plugins/operon-plugin/workflows/<id>/<id>.yaml`, `src/operon_mcp_server/workflow.py` | [Workflow Engine](workflow-engine.md) |
-| Guardrail Rules + enforcement tiers | `plugins/operon-plugin/rules.yaml`, `src/operon_mcp_server/rules.py` | [Rules and Enforcement](rules-and-enforcement.md) |
+| MCP server + tools + checks | `plugins/operon-plugin/src/operon_mcp_server/{server,tools,checks}.py` | [MCP Server](mcp-server.md) |
+| Workflows + phases + advance protocol | `plugins/operon-plugin/workflows/<id>/<id>.yaml`, `plugins/operon-plugin/src/operon_mcp_server/workflow.py` | [Workflow Engine](workflow-engine.md) |
+| Guardrail Rules + enforcement tiers | `plugins/operon-plugin/rules.yaml`, `plugins/operon-plugin/src/operon_mcp_server/rules.py` | [Rules and Enforcement](rules-and-enforcement.md) |
 | Hooks (PreToolUse) | `plugins/operon-plugin/hooks/` | [Hooks](hooks.md) |
 | Skills (slash commands) | `plugins/operon-plugin/skills/<name>/SKILL.md` | [Skills](skills.md) |
 | Tests + harness | `tests/` | [Testing](testing.md) |

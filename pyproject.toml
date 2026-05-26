@@ -1,46 +1,32 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+# Dev/test workspace root for operon-plugin.
+#
+# The distributable plugin -- including the `operon_mcp_server` Python
+# package and its runtime pyproject -- lives in `plugins/operon-plugin/`
+# so a marketplace install (`${CLAUDE_PLUGIN_ROOT}` = that subtree) is
+# fully self-contained. This root project exists ONLY for development:
+# it has no `[build-system]`, so uv treats it as a virtual project (not
+# itself installable), pulls in the plugin as a workspace member, and
+# owns the test + docs toolchain plus pytest discovery config.
+#
+# Common commands (run from repo root):
+#   uv sync --dev          # build the env: operon_mcp_server (editable) + dev deps
+#   uv run pytest          # run the suite
+#   uv run mkdocs build    # build the docs site
 
 [project]
-name = "operon_mcp_server"
+name = "operon-plugin-dev"
 version = "0.0.1"
-description = "MCP server backing operon-plugin: multi-Agent workflows, phase engine, and guardrail Rules for Claude Code."
-readme = "README.md"
-license = { text = "Apache-2.0" }
+description = "Development workspace for operon-plugin; the shipped plugin lives in plugins/operon-plugin."
 requires-python = ">=3.10"
-authors = [
-    { name = "Boaz Mohar", email = "boazmohar@gmail.com" },
-]
-keywords = ["claude-code", "mcp", "plugin", "operon", "workflow"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Operating System :: POSIX :: Linux",
-    "Operating System :: MacOS",
-    "Operating System :: Microsoft :: Windows",
-]
 dependencies = [
-    # Upper bounds pin majors so a breaking SDK release doesn't blow up
-    # users without warning. Bump when we've verified compatibility.
-    "mcp>=1.0,<2",
-    "watchdog>=4.0,<7",
-    "PyYAML>=6.0,<7",
+    "operon_mcp_server",
 ]
 
-[project.scripts]
-operon-mcp-server = "operon_mcp_server.server:main"
+[tool.uv.workspace]
+members = ["plugins/operon-plugin"]
 
-[project.urls]
-Homepage = "https://github.com/SprustonLab/operon-plugin"
-Repository = "https://github.com/SprustonLab/operon-plugin"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/operon_mcp_server"]
+[tool.uv.sources]
+operon_mcp_server = { workspace = true }
 
 [dependency-groups]
 # E2E test infrastructure. The test bed is real subscription-path

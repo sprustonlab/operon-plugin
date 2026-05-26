@@ -1,6 +1,6 @@
 # MCP Server
 
-The MCP server is the Python package `src/operon_mcp_server/`. Claude Code
+The MCP server is the Python package `plugins/operon-plugin/src/operon_mcp_server/`. Claude Code
 launches one instance per session and talks to it over stdio; the server
 exposes operon's MCP tools and drives the phase engine and guardrail
 evaluation. This page covers how the server is built, how it registers and
@@ -11,10 +11,13 @@ For the *catalog* of tools (names, arguments, what each returns), see the
 
 ## Where it lives and how it launches
 
-The server package is the one plugin surface at the repo root rather than
-under `plugins/operon-plugin/`:
+The server package is bundled inside the plugin so a marketplace install
+is self-contained -- everything it needs lives under
+`${CLAUDE_PLUGIN_ROOT}`:
 
-- Package: `src/operon_mcp_server/`
+- Package: `plugins/operon-plugin/src/operon_mcp_server/`
+  (with its runtime `pyproject.toml` alongside, at
+  `plugins/operon-plugin/pyproject.toml`)
 - Registration: `plugins/operon-plugin/.mcp.json` declares one server
   named `operon` whose `command` is
   `${CLAUDE_PLUGIN_ROOT}/bin/operon-mcp-server`.
@@ -55,7 +58,7 @@ transport:
 
 ## Tool registration
 
-Each tool is one file under `src/operon_mcp_server/tools/`. The
+Each tool is one file under `plugins/operon-plugin/src/operon_mcp_server/tools/`. The
 convention every tool file follows:
 
 - `TOOL_NAME` -- the bare name (e.g. `"advance_phase"`), addressed as

@@ -22,8 +22,8 @@ sees a Coordinator-only tool in its tool list. There are three tiers:
   [PreToolUse hook](../dev/hooks.md) under its fully qualified name.
 
 The authoritative visibility map lives in
-`src/operon_mcp_server/server.py` (`_TOOL_VISIBILITY`); the source of
-each tool is `src/operon_mcp_server/tools/<name>.py`.
+`plugins/operon-plugin/src/operon_mcp_server/server.py` (`_TOOL_VISIBILITY`); the source of
+each tool is `plugins/operon-plugin/src/operon_mcp_server/tools/<name>.py`.
 
 ## MCP tools
 

@@ -15,7 +15,7 @@ it ships:
 ```
 .claude-plugin/marketplace.json   # marketplace manifest (lists ./plugins/operon-plugin)
 plugins/operon-plugin/            # the plugin
-src/operon_mcp_server/            # Python MCP server package
+plugins/operon-plugin/src/operon_mcp_server/            # Python MCP server package
 ```
 
 ## What operon gives you
