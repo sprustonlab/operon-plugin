@@ -3,7 +3,7 @@
 
 Phase 14 note: this script is OPTIONAL for normal use. The MCP server
 auto-bootstraps a default Coordinator identity on first launch (see
-`src/operon_mcp_server/bootstrap.py`), so users who just want
+`plugins/operon-plugin/src/operon_mcp_server/bootstrap.py`), so users who just want
 `/project_team my_run` to work no longer need to run this. Keep this
 script around for testing-with-specific-fixtures workflows where you
 want a pre-built operon-session under a known path with a stable

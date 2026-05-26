@@ -107,7 +107,7 @@ outcome.
 ## Roles become Claude Code subagents
 
 Workflow roles and skills are distinct surfaces, but they meet at one
-seam: `src/operon_mcp_server/subagent_install.py`. operon's roles are
+seam: `plugins/operon-plugin/src/operon_mcp_server/subagent_install.py`. operon's roles are
 plain `identity.md` files; Claude Code's spawn mechanism expects subagent
 definitions at `~/.claude/agents/<role>.md` with required frontmatter.
 `install_workflow_subagents` (called from `activate_workflow`) compiles

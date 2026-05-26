@@ -472,13 +472,23 @@ def _emit(payload: dict[str, Any]) -> None:
 def _wa1_cwd_mangled() -> str:
     """Project-dir name for the current cwd per Claude Code convention.
 
-    Each `/` in the absolute cwd becomes `-`. Verified empirically
-    against `~/.claude/projects/-tmp-operon-land4-test/` (Land 4
-    demo, 2026-05-21).
+    Claude Code derives the `~/.claude/projects/<name>` directory by
+    replacing path separators in the absolute cwd with `-`. Verified
+    empirically on POSIX against
+    `~/.claude/projects/-tmp-operon-land4-test/` (Land 4 demo,
+    2026-05-21).
+
+    Cross-platform per SPEC section 2: we replace `\\`, `/`, and `:`
+    so a Windows cwd like `C:\\Users\\me\\proj` mangles to
+    `C--Users-me-proj` instead of being left unchanged. On POSIX the
+    `\\` and `:` replacements are no-ops (a resolved POSIX path holds
+    neither), so this is byte-identical to the prior `/`-only form on
+    the tested platform.
     """
     from pathlib import Path
 
-    return str(Path.cwd().resolve()).replace("/", "-")
+    abs_cwd = str(Path.cwd().resolve())
+    return abs_cwd.replace("\\", "-").replace("/", "-").replace(":", "-")
 
 
 def _wa1_discover_transcripts(agent_type: str) -> list:

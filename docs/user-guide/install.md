@@ -71,7 +71,7 @@ uv resolves the three runtime deps on first launch and caches them.
 # clone the repo, then from the repo root:
 git clone https://github.com/SprustonLab/operon-plugin.git
 cd operon-plugin
-pip install -e .   # installs operon_mcp_server + the three runtime deps
+pip install -e plugins/operon-plugin   # installs operon_mcp_server + the three runtime deps
 claude --plugin-dir plugins/operon-plugin/
 ```
 

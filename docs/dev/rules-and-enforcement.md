@@ -2,7 +2,7 @@
 
 Guardrail Rules are declarative deny/warn/log policies matched on a tool
 call plus its input, scoped by role and phase. The schema and merge logic
-live in `src/operon_mcp_server/rules.py`; the plugin-tier rule set lives in
+live in `plugins/operon-plugin/src/operon_mcp_server/rules.py`; the plugin-tier rule set lives in
 `plugins/operon-plugin/rules.yaml`; enforcement happens in the
 [PreToolUse hook](hooks.md). This page covers the Rule schema, the tier
 merge, the evaluation algorithm, and the escape-token lifecycle. For what

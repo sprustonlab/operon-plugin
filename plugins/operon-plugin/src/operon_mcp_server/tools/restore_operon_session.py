@@ -202,14 +202,22 @@ def _cwd_mangled() -> str:
     """Return the Claude Code project-dir name for the current cwd.
 
     Empirical convention (verified 2026-05-21 against
-    ``~/.claude/projects/-tmp-operon-land4-test/``): each ``/`` in
-    the absolute cwd is replaced with ``-``. A path like
-    ``/tmp/operon-land4-test`` becomes ``-tmp-operon-land4-test``
+    ``~/.claude/projects/-tmp-operon-land4-test/``): Claude Code
+    replaces path separators in the absolute cwd with ``-``. A path
+    like ``/tmp/operon-land4-test`` becomes ``-tmp-operon-land4-test``
     (leading dash from the leading slash). The PreToolUse hook in
-    ``hooks/pretooluse.py`` uses the same convention to locate
-    sidechain transcripts at hook time.
+    ``hooks/pretooluse.py`` (``_wa1_cwd_mangled``) uses the same
+    convention to locate sidechain transcripts at hook time -- keep
+    the two in sync.
+
+    Cross-platform per SPEC section 2: we replace ``\\``, ``/``, and
+    ``:`` so a Windows cwd like ``C:\\Users\\me\\proj`` mangles to
+    ``C--Users-me-proj``. On POSIX the ``\\`` and ``:`` replacements
+    are no-ops, so this matches the prior ``/``-only behavior on the
+    tested platform.
     """
-    return str(Path.cwd().resolve()).replace("/", "-")
+    abs_cwd = str(Path.cwd().resolve())
+    return abs_cwd.replace("\\", "-").replace("/", "-").replace(":", "-")
 
 
 def _discover_sidechain_transcripts(agent_type: str) -> list[Path]:
