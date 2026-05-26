@@ -457,6 +457,20 @@ async def _do_restore(args: dict[str, Any]) -> dict[str, Any]:
     except workflow.WorkflowError as exc:
         raise RestoreOperonSessionError(str(exc)) from exc
 
+    # Claim ownership for the resuming session (from the SessionStart
+    # marker). Before this call the run was owned by the prior session
+    # that activated it, so this session's tool calls were not gated by
+    # the run's workflow rules; resuming binds ownership here so those
+    # rules apply again. Best-effort -- a missing marker leaves the
+    # prior owner in place.
+    try:
+        marker = workflow.read_session_marker()
+        owner_sid = marker.get("session_id") if isinstance(marker, dict) else None
+        if isinstance(owner_sid, str) and owner_sid:
+            workflow.set_owner_session_id(owner_sid)
+    except workflow.WorkflowError:
+        pass
+
     # Read the restored phase state for the response.
     target_phase_state = op_dir / run_name / "phase_state.json"
     workflow_id: str | None = None

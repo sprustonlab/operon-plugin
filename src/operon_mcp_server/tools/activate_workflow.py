@@ -371,6 +371,20 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     except workflow.WorkflowError as exc:
         raise ActivateWorkflowError(str(exc)) from exc
 
+    # Stamp run ownership from the SessionStart marker: the session that
+    # activates the run owns it, so the PreToolUse hook applies this
+    # run's workflow-embedded rules only to this session (not to an
+    # unrelated session later opened in the same project). Best-effort:
+    # a missing/unreadable marker leaves the run unowned rather than
+    # failing activation.
+    try:
+        marker = workflow.read_session_marker()
+        owner_sid = marker.get("session_id") if isinstance(marker, dict) else None
+        if isinstance(owner_sid, str) and owner_sid:
+            workflow.set_owner_session_id(owner_sid)
+    except workflow.WorkflowError:
+        pass
+
     # Land 1 of the Agent Teams pivot (v2.9 plan section 8 Land 1):
     # compile every workflow role's identity.md into Anthropic's
     # subagent-definition schema under ~/.claude/agents/<role>.md,

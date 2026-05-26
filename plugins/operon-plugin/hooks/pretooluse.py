@@ -400,6 +400,24 @@ def _load_active_workflow_manifest():
     return data, decl.source_path
 
 
+def _session_owns_active_run(hook_input: dict[str, Any] | None) -> bool:
+    """Return True iff the calling session owns the active run.
+
+    The hook input carries the real Claude Code `session_id` (unlike the
+    MCP server, which only ever sees a synthesized bootstrap id). We
+    compare it to the `owner_session_id` stamped on the run's state.json
+    at activate / restore time. Fails toward "not owner" on any error so
+    the workflow tier is dropped rather than misapplied.
+    """
+    call_session_id = None
+    if isinstance(hook_input, dict):
+        call_session_id = hook_input.get("session_id")
+    try:
+        return workflow.session_owns_active_run(call_session_id)
+    except Exception:  # noqa: BLE001 -- ownership check never blocks
+        return False
+
+
 def _emit(payload: dict[str, Any]) -> None:
     """Write the hook decision JSON to stdout and exit 0."""
     sys.stdout.write(json.dumps(payload))
@@ -832,6 +850,15 @@ def main() -> None:
     # fail-CLOSED safety net above has already cleared the
     # catastrophic-class patterns by this point.
     workflow_manifest, workflow_source = _load_active_workflow_manifest()
+    # Session-ownership gate. A run's workflow-embedded rules apply only
+    # to the session that activated or resumed it. A different session
+    # open in the same project -- e.g. a fresh session after the owner
+    # quit, before it calls restore_operon_session -- must NOT inherit
+    # the paused run's workflow rules. The 3-tier rules.yaml
+    # (plugin/user/project) still applies to everyone; only the
+    # workflow tier is dropped for a non-owner.
+    if workflow_manifest is not None and not _session_owns_active_run(hook_input):
+        workflow_manifest, workflow_source = None, None
     try:
         rule_list = rules.load_merged_rules(
             workflow_manifest=workflow_manifest,
