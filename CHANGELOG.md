@@ -6,6 +6,21 @@ commits on `main` that make it up. The authoritative design reference
 is the Contributor/Architecture Guide in the docs site
 (`docs/dev/architecture.md`).
 
+## 0.0.2 -- self-contained plugin packaging + Windows cwd-mangle fix
+
+- The `operon_mcp_server` package and its runtime `pyproject.toml` now
+  live INSIDE `plugins/operon-plugin/` so a marketplace install is
+  self-contained. Previously they sat at the repo root, outside
+  `${CLAUDE_PLUGIN_ROOT}`, so the MCP server could not import its own
+  package after `claude plugin install` and failed to start. The repo
+  root is now a virtual uv-workspace holding only the dev/test toolchain.
+- `hooks/pretooluse.py` and `tools/restore_operon_session.py` cwd-mangle
+  helpers now replace `\`, `/`, and `:` (was `/` only), so Claude Code
+  sidechain-transcript discovery resolves on Windows. Byte-identical on
+  POSIX.
+- Docs updated to the nested layout; the dev pip path is now
+  `pip install -e plugins/operon-plugin`.
+
 ## Phase 10 -- polish + e2e smoke + B-tier cleanup
 
 - B1: `subprocess.run(["claude", "stop", ...])` in `workflow.py` and
