@@ -2516,6 +2516,148 @@ def test_project_team_advance_lifecycle(tmp_cwd, operon_plugin_dir, claude_drive
             meter.seen_uuids.clear()
             time.sleep(3.0)
 
+            # ===== STEP F-pre (Sub-act 9b): stale-session guardrail =====
+            # A NEW session is now open in the same cwd, but it has NOT
+            # yet resumed the run (no restore_operon_session call yet).
+            # The prior session's run-dir state still sits on disk and
+            # still names the active run + halted phase. A workflow-
+            # embedded deny rule (no_push_before_testing) must NOT gate
+            # this unrelated session before it claims the run --
+            # ownership binds at restore, not at "a session happens to
+            # be open in the project directory". The global 3-tier
+            # rules (warn_sudo) MUST still fire: ownership gating drops
+            # ONLY the workflow-embedded rules for a non-owner session,
+            # never the plugin/user/project tiers.
+            recorder.set_sub_act("iso_sub_act_9b_stale_session_guardrail")
+            recorder.record(
+                user_observable=(
+                    "Before resuming, the freshly-opened session must "
+                    "not inherit the paused run's workflow guardrails; "
+                    "the global guardrails still apply."
+                ),
+                precise_state={
+                    "halted_phase": new_phase_iso,
+                    "prior_session_id": session_id,
+                    "new_session_id": session_id_10,
+                },
+            )
+            # Precondition: the halted phase must be one where
+            # no_push_before_testing is ACTIVE (not in its
+            # exclude_phases), or the workflow-rule probe is vacuous.
+            # The lifecycle halts in 'leadership', well before the
+            # excluded testing/documentation/signoff phases.
+            assert new_phase_iso not in (
+                "testing-implementation", "documentation", "signoff"
+            ), (
+                "sub-act 9b precondition: halted phase "
+                f"{new_phase_iso!r} is in no_push_before_testing's "
+                "exclude_phases, so the workflow-rule probe cannot "
+                "distinguish gated from skipped."
+            )
+
+            # Probe 1 (MUST-NOT fire): a workflow-embedded deny rule.
+            # Pattern 'git push' matches; --dry-run keeps it harmless
+            # (the fixture cwd has no configured remote). Pre-fix the
+            # hook applies the active run's workflow rules to ANY
+            # session in the cwd, so this fires -- the bug.
+            base_push = len(observer.all_records())
+            marker_9b1 = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "Run the bash command `git push --dry-run` exactly "
+                "as written. If a guardrail message appears, report "
+                "it verbatim and stop -- do not retry, do not "
+                "analyse, do not propose alternatives."
+            )
+            ok_9b1 = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_9b1,
+            )
+            assert ok_9b1, (
+                "sub-act 9b probe 1 (git push): idle wait timeout.\n"
+                + driver_10.capture_pane()
+            )
+            time.sleep(2.0)
+            push_blob = json.dumps(
+                observer.all_records()[base_push:], ensure_ascii=False
+            )
+            workflow_push_fired = (
+                "before it reaches the testing phase" in push_blob
+            )
+
+            # Probe 2 (MUST fire): a global 3-tier rule, proving the
+            # gate drops ONLY the workflow tier for the non-owner
+            # session and leaves the global tiers intact.
+            base_sudo = len(observer.all_records())
+            marker_9b2 = idle.latest_stop_uuid(observer)
+            driver_10.send(
+                "Run the bash command `sudo ls /tmp/` exactly as "
+                "written. If a guardrail message appears, report it "
+                "verbatim and stop -- do not retry, do not analyse."
+            )
+            ok_9b2 = idle.wait_idle_pre_kill(
+                observer=observer,
+                inboxes_tracker=None,
+                timeout_s=SUB_ACT_TIMEOUT_S,
+                k_ms=IDLE_K_MS,
+                after_marker_uuid=marker_9b2,
+            )
+            assert ok_9b2, (
+                "sub-act 9b probe 2 (sudo): idle wait timeout.\n"
+                + driver_10.capture_pane()
+            )
+            time.sleep(2.0)
+            sudo_blob = json.dumps(
+                observer.all_records()[base_sudo:], ensure_ascii=False
+            )
+            global_sudo_fired = "Using sudo" in sudo_blob
+
+            meter.checkpoint("iso_sub_act_9b")
+            bundle.snapshot(
+                "iso_sub_act_9b_stale_session_guardrail",
+                token_state={
+                    "cumulative": meter.cumulative.__dict__,
+                    "billable": meter.cumulative.billable,
+                },
+                notes={
+                    "halted_phase": new_phase_iso,
+                    "workflow_push_fired": workflow_push_fired,
+                    "global_sudo_fired": global_sudo_fired,
+                },
+            )
+            # MUST-NOT-see: the workflow rule gated a session that
+            # never resumed the run. This is the bug under fix; the
+            # assertion is RED until session-ownership gating lands.
+            assert not workflow_push_fired, (
+                "MUST-NOT-see: no_push_before_testing fired for a "
+                "session that has not resumed the run. A stale paused "
+                "run gated an unrelated new session -- the "
+                "session-ownership gate is missing.\n"
+                f"Records excerpt: {push_blob[:600]!r}"
+            )
+            # MUST-see: the global tier still active for the new
+            # session (we dropped only the workflow tier).
+            assert global_sudo_fired, (
+                "MUST-see: warn_sudo (a global 3-tier rule) did not "
+                "fire for the new session. Ownership gating must drop "
+                "ONLY workflow-embedded rules, never the global "
+                "tiers.\n"
+                f"Records excerpt: {sudo_blob[:600]!r}"
+            )
+            gate_check(
+                "iso_sub_act_9b",
+                must_hold=[
+                    ("workflow rule skipped for non-owner session",
+                     not workflow_push_fired),
+                    ("global rule still fires for non-owner session",
+                     global_sudo_fired),
+                    ("under token cap",
+                     meter.cumulative.billable <= TOKEN_CAP_ADVANCE_LIFECYCLE),
+                ],
+            )
+
             # 10A: restore_operon_session.
             marker_10a = idle.latest_stop_uuid(observer)
             driver_10.send(
