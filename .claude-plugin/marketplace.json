@@ -15,7 +15,7 @@
         "email": "boazmohar@gmail.com"
       },
       "category": "development",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "source": "./plugins/operon-plugin",
       "homepage": "https://github.com/SprustonLab/operon-plugin",
       "repository": "https://github.com/SprustonLab/operon-plugin",

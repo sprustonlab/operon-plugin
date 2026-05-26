@@ -6,6 +6,21 @@ commits on `main` that make it up. The authoritative design reference
 is the Contributor/Architecture Guide in the docs site
 (`docs/dev/architecture.md`).
 
+## 0.0.3 -- `/project_team` Python resolution on Windows
+
+- `/project_team` no longer shells out to bare `python`, which on Windows
+  resolves to the Microsoft Store "App Execution Alias" stub ("Python was
+  not found...") and never runs the activation script. The skill now
+  invokes a new `skills/activate/scripts/activate-wrapper` (paired bash +
+  `.cmd`) that resolves a working interpreter the same way the MCP server
+  and hooks do: try `python3` then `python` with a pre-flight `-c ""`
+  check that skips the stub, then fall back to `uv run --no-project
+  python`. `activate.py` is stdlib-only, so unlike the dep-needing
+  wrappers this one prefers a bare interpreter and only uses uv as a last
+  resort.
+- `allowed-tools` for `/project_team` changed from `Bash(python *)` to
+  `Bash(*activate-wrapper*)` to match the new invocation.
+
 ## 0.0.2 -- self-contained plugin packaging + Windows cwd-mangle fix
 
 - The `operon_mcp_server` package and its runtime `pyproject.toml` now

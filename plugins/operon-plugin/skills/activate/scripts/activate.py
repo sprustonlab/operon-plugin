@@ -1,9 +1,16 @@
 #!/usr/bin/env python
 r"""Shared activation script for operon per-workflow slash commands.
 
-Invoked via each per-workflow SKILL.md as a Bash dynamic-context injector:
+Invoked via each per-workflow SKILL.md as a Bash dynamic-context
+injector, through the sibling `activate-wrapper` launcher:
 
-    !`python ${CLAUDE_PLUGIN_ROOT}/skills/activate/scripts/activate.py <workflow_id> $ARGUMENTS`
+    !`"${CLAUDE_PLUGIN_ROOT}/skills/activate/scripts/activate-wrapper" <workflow_id> $ARGUMENTS`
+
+The wrapper resolves a working Python interpreter (a bare `python3` /
+`python`, skipping the Windows Store stub via a pre-flight check, then
+`uv run --no-project python`) and exec's this script. SKILL.md never
+shells out to bare `python`, which on Windows resolves to the Microsoft
+Store alias and fails.
 
 Per SPEC §13b. The script runs as a stdlib-only subprocess of Claude
 Code's foreground (Coordinator) session. It is responsible for:
