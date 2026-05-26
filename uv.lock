@@ -665,7 +665,7 @@ wheels = [
 
 [[package]]
 name = "operon-mcp-server"
-version = "0.0.1"
+version = "0.0.2"
 source = { editable = "plugins/operon-plugin" }
 dependencies = [
     { name = "mcp" },
