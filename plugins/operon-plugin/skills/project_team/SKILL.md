@@ -4,7 +4,7 @@ description: Activate the project_team workflow as a new operon-session. Use onl
 disable-model-invocation: true
 user-invocable: true
 allowed-tools:
-  - "Bash(python *)"
+  - "Bash(*activate-wrapper*)"
   - mcp__operon__activate_workflow
 ---
 
@@ -23,7 +23,7 @@ into one `mcp__operon__activate_workflow` call.
 
 ## Script invocation
 
-!`python ${CLAUDE_PLUGIN_ROOT}/skills/activate/scripts/activate.py project_team $ARGUMENTS`
+!`"${CLAUDE_PLUGIN_ROOT}/skills/activate/scripts/activate-wrapper" project_team $ARGUMENTS`
 
 ## What to do with the script output
 

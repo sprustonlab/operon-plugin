@@ -81,6 +81,7 @@ operon-plugin/                          # repo root == marketplace root
         restore/SKILL.md                # /restore
         rules/SKILL.md                  # /rules
         activate/scripts/activate.py    # shared client-side validator for activation
+        activate/scripts/activate-wrapper(.cmd)  # interpreter-resolution wrapper for /project_team
       workflows/
         project_team/
           project_team.yaml             # THE manifest: 10 phases + workflow-embedded rules

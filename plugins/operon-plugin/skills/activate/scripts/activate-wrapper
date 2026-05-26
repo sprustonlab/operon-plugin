@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Activation-script launcher (cross-platform Python resolver).
+#
+# Invoked from skills/project_team/SKILL.md as a Bash dynamic-context
+# injector:
+#
+#   !`"${CLAUDE_PLUGIN_ROOT}/skills/activate/scripts/activate-wrapper" project_team $ARGUMENTS`
+#
+# Resolves a working Python interpreter, runs activate.py with the given
+# args, and passes stdout/stderr/exit-code straight through so the
+# SKILL.md body sees the OPERON_DISPATCH / ERROR line verbatim.
+#
+# Why a wrapper instead of bare `python`: on Windows a bare `python`
+# usually resolves to the Microsoft Store "App Execution Alias" stub,
+# which prints "Python was not found; run without arguments to install
+# from the Microsoft Store..." and exits non-zero -- no interpreter ever
+# runs. The pre-flight `-c ""` check below skips that stub (and any other
+# non-working name) and falls through to the next candidate.
+#
+# Resolution ladder. This DELIBERATELY differs from bin/operon-mcp-server
+# and the hook wrappers, which are uv-FIRST because they import
+# third-party deps (mcp/watchdog/yaml) that only uv reliably provides.
+# activate.py is stdlib-only, so we prefer a bare interpreter to avoid
+# paying uv's project-sync latency on every /project_team, and fall back
+# to `uv run --no-project python` (a bare uv-managed interpreter, no
+# project deps synced) only when no plain interpreter runs -- the
+# Store-stub-only case.
+
+set -e
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+script="${here}/activate.py"
+
+for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c "" >/dev/null 2>&1; then
+        exec "$py" "$script" "$@"
+    fi
+done
+
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --no-project python "$script" "$@"
+fi
+
+# No working interpreter. Emit a single ERROR: line to STDOUT (not just
+# stderr) so the SKILL.md "Case B" path relays it to the user verbatim.
+echo "ERROR: /project_team could not find a working Python interpreter (tried python3, python, and 'uv run'). Install Python (https://www.python.org/downloads/) or uv (https://docs.astral.sh/uv/), then retry."
+exit 1

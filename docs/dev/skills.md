@@ -21,7 +21,7 @@ description: Activate the project_team workflow as a new operon-session. ...
 disable-model-invocation: true     # the model cannot self-invoke; only the user typing /project_team
 user-invocable: true
 allowed-tools:
-  - "Bash(python *)"
+  - "Bash(*activate-wrapper*)"
   - mcp__operon__activate_workflow
 ---
 ```
@@ -46,8 +46,14 @@ should own. Two patterns realize this.
 runs a stdlib-only script as a dynamic-context injector:
 
 ```
-!`python ${CLAUDE_PLUGIN_ROOT}/skills/activate/scripts/activate.py project_team $ARGUMENTS`
+!`"${CLAUDE_PLUGIN_ROOT}/skills/activate/scripts/activate-wrapper" project_team $ARGUMENTS`
 ```
+
+`activate-wrapper` (a paired bash + `.cmd` launcher beside `activate.py`)
+resolves a working Python interpreter and exec's `activate.py` -- it
+mirrors the `uv`/`python3`/`python` resolution ladder used by the MCP
+server and hooks, with a pre-flight check that skips the Windows
+Microsoft Store `python` stub. SKILL.md never invokes bare `python`.
 
 `activate.py` validates the `run_name` client-side (filesystem-safe, no
 leading dot, <=50 chars) and emits exactly one line: either
