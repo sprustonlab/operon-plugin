@@ -1,7 +1,7 @@
 r"""`activate_workflow` MCP tool (Coordinator-only).
 
 Per SPEC §7 `activate_workflow` row + §11 + §17. Creates a new
-operon-run directory under `<project>/.operon/<run_name>/` and
+operon-session directory under `<project>/.operon/<run_name>/` and
 bootstraps `phase_state.json`, `_active.json`, an empty
 `agents.json`, and the empty mailbox / _handles subtrees.
 

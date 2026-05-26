@@ -1,22 +1,21 @@
 """Guardrail Rules: parsing, matching, evaluation, and audit logging.
 
 Per SPEC §12 (Guardrail Rules) + §7 (`evaluate` tool row) + §17
-(`guardrail_log.jsonl` schema). Ports the matching semantics from
-`claudechic/guardrails/rules.py` verbatim into a single file because
-the operon scope is narrower (no `Injection` separate from `Rule`,
-no `/rules` slash command surface yet -- those land later).
+(`guardrail_log.jsonl` schema). The matching semantics live in a single
+file because the operon scope is narrow (no `Injection` separate from
+`Rule`, no `/rules` slash command surface yet -- those land later).
 
 Architecture:
 
-- `Rule` (frozen dataclass): parsed manifest entry. Fields mirror
-  claudechic's existing schema so a user can hand-edit
+- `Rule` (frozen dataclass): parsed manifest entry. Fields follow
+  the existing schema so a user can hand-edit
   `<plugin>/rules.yaml` or a workflow's `rules:` section using the
   same conventions.
 - `Decision` (frozen dataclass): output of `_evaluate`. Crosses the
   rules-engine -> tool seam.
 - `parse_rules_file(path)`: loads a top-level `- id: ...` list of
-  Rule entries OR a `{"rules": [...]}` wrapper (claudechic uses the
-  latter inside workflow manifests; the standalone `rules.yaml`
+  Rule entries OR a `{"rules": [...]}` wrapper (the latter is used
+  inside workflow manifests; the standalone `rules.yaml`
   files use the bare list form). Both shapes are accepted.
 - `load_merged_rules(workflow_root)`: layers plugin-tier
   `<plugin>/rules.yaml` + user-tier `~/.operon/rules.yaml` +
@@ -83,7 +82,7 @@ class RulesError(RuntimeError):
 
 @dataclass(frozen=True)
 class Rule:
-    """Parsed manifest entry. Mirrors claudechic's `Rule` shape."""
+    """Parsed manifest entry."""
 
     id: str
     trigger: tuple[str, ...]
@@ -350,7 +349,7 @@ def _trigger_matches(rule: Rule, tool_name: str) -> bool:
             if parts[1] == tool_name:
                 return True
         elif parts[0] in {"PreToolUse"}:
-            # Bare "PreToolUse" matches all tools (claudechic convention).
+            # Bare "PreToolUse" matches all tools.
             return True
     return False
 
@@ -397,7 +396,7 @@ def match_rule(
 ) -> bool:
     """Return True iff `rule` fires for this call.
 
-    Pure function. The order mirrors claudechic's pipeline: trigger
+    Pure function. The pipeline order is: trigger
     > role > phase > exclude > detect.
     """
     if not _trigger_matches(rule, tool_name):

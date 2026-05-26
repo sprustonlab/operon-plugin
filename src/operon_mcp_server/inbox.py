@@ -1,8 +1,6 @@
 """Inbox-write primitive for the Anthropic Agent Teams substrate.
 
-Land 2 of the Agent Teams Pivot
-(``docs/AGENT_TEAMS_PIVOT_PLAN.md`` v2.9 section 3.3 rule 1,
-section 4.3 component 3, section 7).
+Land 2 of the Agent Teams Pivot.
 
 Single function :func:`write_to_member_inbox` appends one entry
 to ``~/.claude/teams/<team>/inboxes/<recipient>.json`` -- the

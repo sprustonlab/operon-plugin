@@ -2,11 +2,37 @@
 
 **Operon: A Guided, Self-Revisable plugin for AI Research Software Operations in Claude Code.**
 
-operon-plugin brings claudechic-style multi-Agent orchestration (Agent
-spawning, inter-Agent messaging, workflow + phase engine, and guardrail
-Rules with override / acknowledge) into Claude Code as a native plugin
-so that runtime draws on the Max 20x interactive subscription instead
-of the SDK credit bucket.
+operon-plugin brings guided, self-revisable multi-Agent orchestration
+(Agent spawning, inter-Agent messaging, a workflow + phase engine, and
+guardrail Rules with override / acknowledge) into Claude Code as a
+native plugin so that runtime draws on the Max 20x interactive
+subscription instead of the SDK credit bucket.
+
+## Documentation
+
+Full documentation lives in the docs site (built from `docs/` with
+MkDocs Material). Start there:
+
+- **User Guide** (`docs/user-guide/`) -- for people running operon:
+  [Install](docs/user-guide/install.md),
+  [Quickstart](docs/user-guide/quickstart.md),
+  [Workflows and Phases](docs/user-guide/workflows-and-phases.md),
+  [Agents and Messaging](docs/user-guide/agents-and-messaging.md),
+  [Guardrails](docs/user-guide/guardrails.md),
+  [Sessions](docs/user-guide/sessions.md),
+  [MCP Tools Reference](docs/user-guide/mcp-tools-reference.md).
+- **Contributor/Architecture Guide** (`docs/dev/`) -- the authoritative
+  design reference: [Architecture](docs/dev/architecture.md),
+  [MCP Server](docs/dev/mcp-server.md),
+  [Workflow Engine](docs/dev/workflow-engine.md),
+  [Rules and Enforcement](docs/dev/rules-and-enforcement.md),
+  [Hooks](docs/dev/hooks.md), [Skills](docs/dev/skills.md),
+  [Testing](docs/dev/testing.md),
+  [Contributing](docs/dev/contributing.md).
+
+The reference tables (MCP tools, hooks, env vars, slash commands) are
+owned by the docs pages above; this README links to them rather than
+duplicating them.
 
 This repository is both a **single-plugin marketplace** and the plugin
 itself:
@@ -20,11 +46,11 @@ src/operon_mcp_server/            # Python MCP server package
 ## Status
 
 Pre-release. The MCP server, workflows, hooks, rules, and skills are
-landed phase by phase per the implementation plan in
-`claudechic/.project_team/claude_code_port/SPEC_APPENDIX.md` §F.
-The current phase is whatever the most recent commit on `main` says it
-is; the README intentionally does not pin a phase number to avoid
-drifting from reality.
+landed phase by phase; the authoritative design reference is the
+[Contributor/Architecture Guide](docs/dev/architecture.md). The current
+phase is whatever the most recent commit on `main` says it is; the
+README intentionally does not pin a phase number to avoid drifting from
+reality.
 
 ## Install for development
 
@@ -160,7 +186,7 @@ From there you can:
 - `/rules` -- introspect the active guardrail Rules + escape tokens.
 - `advance_phase()` -- elicit manual-confirm and move to the next
   phase.
-- `/restore` -- pick a different operon-run to switch to.
+- `/restore` -- pick a different operon-session to switch to.
 
 The bundled `_smoke` workflow is still available for verifying the
 install end-to-end without committing to a real project structure;
@@ -178,75 +204,22 @@ bootstrap under `/tmp/test-operon/`. This is the path used by the
 in-process e2e + bg verification scripts; ordinary users never need
 to run it.
 
-## MCP tools
+## MCP tools, skills, hooks, and env vars
 
-All-visible (any agent can call):
+The reference tables for these surfaces live in the docs site and are
+the single source of truth -- this README links to them rather than
+carrying duplicate tables that drift:
 
-| Tool | Purpose |
-| ---- | ------- |
-| `message_agent` | Send a message to another Agent. `requires_answer=true` (default) arms a reply-nudge timer. |
-| `broadcast_message` | Same message to N targets. |
-| `interrupt_agent` | Halt a busy peer. |
-| `whoami` | Caller's identity from env-anchored handle. |
-| `get_phase` | Active workflow + current phase + artifact dir. |
-| `get_applicable_rules` | Rules + advance-checks + active escape tokens for the caller's (role, phase). |
-| `get_agent_info` | Aggregator of the above. |
-| `list_agents` | Current roster snapshot. |
-| `list_operon_sessions` | Discoverable runs under this project. |
-| `acknowledge_warning` | Issue a warn-tier ack token (TTL 60s). |
-| `request_override` | Request a deny-tier override token (one-shot; elicits user approval). |
-| `evaluate` | Hook-internal: PreToolUse rule projection. |
-
-Coordinator-only:
-
-| Tool | Purpose |
-| ---- | ------- |
-| `spawn_agent` | Spawn a worker via `claude --bg`. |
-| `close_agent` | `claude stop` a worker + roster removal. |
-| `spawn_worktree` | Spawn into a git worktree. |
-| `advance_phase` | Run the current phase's advance-checks + advance. |
-| `set_artifact_dir` | Set the per-run artifact directory pointer. |
-| `get_artifact_dir` | Read the artifact-dir pointer. |
-| `activate_workflow` | DESTRUCTIVE: swap `_active.json` to a new run-dir (closes alive workers with confirmation). |
-| `restore_operon_session` | Switch the active pointer to an existing run-dir. |
-
-Hidden (hook-only / internal):
-
-| Tool | Purpose |
-| ---- | ------- |
-| `arm_nudge_timer` | Fire the pending-reply check in-event-loop. |
-
-## Slash commands (skills)
-
-User-invocable. Each is a script-injection skill that proxies to one
-or more MCP tools so the LLM can't be prompt-injected.
-
-| Slash | Backing tool(s) | Purpose |
-| ----- | --------------- | ------- |
-| `/rules` | `get_applicable_rules` | Show active Rules + escape tokens for (role, phase). |
-| `/restore` | `list_operon_sessions` + `restore_operon_session` | Switch active operon-session. |
-
-## Hooks
-
-| Event | Type | Script | Purpose |
-| ----- | ---- | ------ | ------- |
-| `PreToolUse` | `command` | `hooks/pretooluse-wrapper` | Rule enforcement (deny / warn / log) + override + ack consumption. |
-| `Stop` | `command` | `hooks/stop-wrapper` | Phase 8 reply-nudge tap: writes `kind=nudge_check` control envelope when a pending reply is past-due. |
-
-Both wrappers ship in two flavors (`<wrapper>` bash + `<wrapper>.cmd`
-Windows batch) with the same `uv -> python3 -> python` resolution
-ladder as `bin/operon-mcp-server`.
-
-## Configuration env vars
-
-| Var | Default | Purpose |
-| --- | ------- | ------- |
-| `OPERON_AGENT_HANDLE` | (required at runtime) | Env-anchored caller identity. Set by `spawn_agent` for workers; the Coordinator binds this from `_handles/<coord>.json` on session start. |
-| `CLAUDE_PLUGIN_ROOT` | (set by Claude Code) | Plugin install root. Used to resolve the 3-tier workflow loader's plugin tier and the `mcp_tools/` directory. |
-| `OPERON_BG_CHANNELS` | (autodetect) | Whether spawned workers should attach a `--channels` flag (Phase 4 message-push transport). |
-| `OPERON_DEBUG` | unset | Set to any truthy value (`1`, `true`, `yes`) to enable verbose hook + MCP server logging on stderr. |
-| `OPERON_NUDGE_INTERVALS` | `15,30,60` | Comma-separated seconds between successive nudges. Test harnesses use `1,1,1` or `2,2,2` to compress wall-clock. |
-| `OPERON_NUDGE_MAX` | derived | Implicit cap = `len(OPERON_NUDGE_INTERVALS)`. After this many fires, the entry is `nudge_exhausted`. |
+- **MCP tools** (all-visible, Coordinator-only, hidden) ->
+  [MCP Tools Reference](docs/user-guide/mcp-tools-reference.md).
+- **Slash commands (skills)** -- `/rules`, `/restore`, `/project_team`
+  -> [MCP Tools Reference](docs/user-guide/mcp-tools-reference.md)
+  (commands section).
+- **Hooks** (`PreToolUse` rule enforcement, `Stop` reply-nudge tap) ->
+  [Hooks](docs/dev/hooks.md).
+- **Configuration env vars** (`OPERON_AGENT_HANDLE`,
+  `OPERON_NUDGE_INTERVALS`, ...) ->
+  [Install](docs/user-guide/install.md).
 
 ## Cross-platform notes
 
@@ -287,10 +260,9 @@ Expected: 20/20 steps pass in <10s.
 
 ## Specification
 
-The authoritative design lives in the claudechic repository at
-`../claudechic/.project_team/claude_code_port/SPEC.md` and
-`SPEC_APPENDIX.md`. See also `CHANGELOG.md` for a phase-by-phase
-implementation log.
+The authoritative design reference is the
+[Contributor/Architecture Guide](docs/dev/architecture.md) in the docs
+site. See also `CHANGELOG.md` for a phase-by-phase implementation log.
 
 ## License
 

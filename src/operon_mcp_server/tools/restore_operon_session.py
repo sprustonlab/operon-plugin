@@ -1,9 +1,8 @@
 """`restore_operon_session` MCP tool (Coordinator-only).
 
-Land 5 of the Agent Teams Pivot (see
-``docs/AGENT_TEAMS_PIVOT_PLAN.md`` v2.9 section 5.1 + section 8
-Land 5). Boaz's empirical 2026-05-21 finding: ``/resume`` of a
-post-Land-4 operon session does NOT auto-respawn the teammates
+Land 5 of the Agent Teams Pivot. Boaz's empirical 2026-05-21
+finding: ``/resume`` of a
+post-Land-4 operon-session does NOT auto-respawn the teammates
 that were alive at suspend time -- Shift+Down shows no
 composability teammate. Land 5 wires operon-driven RESTORE on
 top of WA1 (Section 5.1) so a previously-activated operon team
@@ -19,7 +18,7 @@ Translation (with the Land 5 v2 amendment, 2026-05-21):
   * OPTIONAL precondition: ``~/.claude/teams/<run>/config.json``.
     When present, the response carries a ``members_to_respawn``
     manifest derived from the team's ``members[]``. When absent,
-    restore still succeeds as a lead-only operon session and
+    restore still succeeds as a lead-only operon-session and
     surfaces a ``suggested_members`` list (derived from prior
     sidechain transcripts on disk) plus a ``call TeamCreate
     first`` lead-instructions hint.
@@ -28,9 +27,8 @@ Translation (with the Land 5 v2 amendment, 2026-05-21):
     lead-side ``/resume``; operon's job is the teammate respawn
     manifest).
 
-Two entry modes (matches the claudechic ``chicsessions.py`` /
-``chicsession_cmd.py`` restore pattern; the WA1 PreToolUse hook
-in ``plugins/operon-plugin/hooks/pretooluse.py`` is the WA1
+Two entry modes (the WA1 PreToolUse hook in
+``plugins/operon-plugin/hooks/pretooluse.py`` is the WA1
 substitute for the SDK ``resume=session_id`` parameter):
 
   * ``run_name`` supplied: skip the picker, validate the
@@ -117,7 +115,7 @@ def tool_descriptor() -> mcp_types.Tool:
             "~/.claude/teams/<run_name>/config.json is OPTIONAL: when "
             "present, the response includes the teammate-respawn "
             "manifest; when absent, restore still succeeds as a "
-            "lead-only operon session and surfaces a "
+            "lead-only operon-session and surfaces a "
             "'call TeamCreate first' lead_instructions hint. Sets "
             "<cwd>/.operon/_active.json to point at the chosen run. "
             "WA1 transcript replay (v2.9 section 5.1) is delivered "
@@ -174,7 +172,7 @@ def _has_operon_state(run_name: str, operon_dir: Path) -> tuple[bool, str | None
 def _has_team_config(run_name: str) -> bool:
     """Return True iff ``~/.claude/teams/<run_name>/config.json``
     exists. Optional precondition -- restore still succeeds when
-    this is False (lead-only operon session).
+    this is False (lead-only operon-session).
     """
     return _team_config_path(run_name).is_file()
 

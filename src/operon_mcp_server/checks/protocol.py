@@ -1,6 +1,6 @@
 """Check protocol + result type. LEAF MODULE (stdlib only).
 
-Mirrors `claudechic/checks/protocol.py`. This module declares the
+This module declares the
 Check-Engine seam: a frozen `CheckResult` value object and a
 `CheckDecl` declaration record. The executable `Check` is an async
 protocol; the engine calls `check()` without knowing the

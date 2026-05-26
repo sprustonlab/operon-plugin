@@ -29,20 +29,28 @@ You do NOT:
 
 ## Workflow Phases (Roadmap)
 
-*Informational mirror of `project_team.yaml`. Source of truth is the workflow engine.*
+*Informational mirror of `project_team.yaml`. Source of truth is the
+workflow engine; the manifest `project_team.yaml` defines the canonical
+phase list and advance-checks.*
 
 Each phase has its own detailed instructions delivered automatically.
-This is just the overview so you know the full flow.
+This is just the overview so you know the full flow. The manifest
+defines **10 phases**, in order:
 
-1. **Vision** -- Understand what the user wants. *
-2. **Setup** -- Determine working directory, check for existing state, initialize project.
-3. **Leadership** -- Spawn all 4 Leadership agents + optional supporting agents.
-4. **Specification** -- Leadership reviews, axis-agents analyze, synthesize findings. *
-5. **Implementation** -- Spawn Implementer agents, Leadership guides. *
-6. **Testing** -- Spawn TestEngineer, fix failures until all pass. *
-7. **Sign-Off** -- All agents confirm READY, integration, E2E check, final user approval. *
+1. **vision** -- Understand what the user wants. *
+2. **setup** -- Determine working directory, check for existing state, set the artifact dir, create STATUS.md + userprompt.md.
+3. **leadership** -- Spawn all 4 Leadership agents + optional supporting agents.
+4. **specification** -- Leadership reviews, axis-agents analyze, synthesize findings into SPECIFICATION.md. *
+5. **implementation** -- Spawn Implementer agents, Leadership guides. *
+6. **testing-vision** -- Agree on what to test; write userprompt_testing.md. *
+7. **testing-specification** -- Write TEST_SPECIFICATION.md. *
+8. **testing-implementation** -- Write + run tests, fix failures until all pass.
+9. **documentation** -- Ensure docs are accurate, complete, and reviewed.
+10. **signoff** -- All agents confirm READY, integration, E2E check, final user approval.
 
-* = User Checkpoint (requires user approval before proceeding)
+* = advance-check with a `manual-confirm` user checkpoint (requires user
+approval before proceeding); see `project_team.yaml` for the exact
+checks per phase.
 
 ---
 

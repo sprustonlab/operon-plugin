@@ -156,8 +156,8 @@ def _find_manifest_file(workflow_dir: Path, workflow_id: str) -> Path | None:
     """Return the manifest YAML inside `workflow_dir`, or None if absent.
 
     Two filenames are accepted, in priority order: `<workflow_id>.yaml`
-    (claudechic convention -- `project_team/project_team.yaml`) then
-    `phases.yaml` (operon convention for minimal manifests).
+    (the bundled `project_team/project_team.yaml` convention) then
+    `phases.yaml` (the convention for minimal manifests).
     """
     for candidate in (workflow_dir / f"{workflow_id}.yaml", workflow_dir / "phases.yaml"):
         if candidate.is_file():
@@ -168,7 +168,7 @@ def _find_manifest_file(workflow_dir: Path, workflow_id: str) -> Path | None:
 def _parse_manifest(text: str, source: Path) -> tuple[str, tuple[PhaseDecl, ...]]:
     """Parse a manifest YAML body. Returns (workflow_id, phases).
 
-    Accepts the claudechic shape::
+    Accepts the manifest shape::
 
         workflow_id: <id>
         phases:
@@ -179,7 +179,7 @@ def _parse_manifest(text: str, source: Path) -> tuple[str, tuple[PhaseDecl, ...]
                 path: ...
 
     If `workflow_id` is absent the loader uses the parent directory
-    name (mirrors claudechic's behavior for hand-rolled workflows).
+    name (the behavior for hand-rolled workflows).
     """
     try:
         data = yaml.safe_load(text)
@@ -421,24 +421,19 @@ class AdvanceOutcome:
 
 
 def _expand_artifact_dir(value: Any, artifact_dir: str | None) -> Any:
-    """Substitute `${ARTIFACT_DIR}` / `${CLAUDECHIC_ARTIFACT_DIR}` in
-    string params with the value from state.json (`set_artifact_dir`).
+    """Substitute `${ARTIFACT_DIR}` in string params with the value from
+    state.json (`set_artifact_dir`).
 
     Recurses into lists. Strings with no placeholder pass through
     unchanged. If `artifact_dir` is None, placeholders are left as-is
     -- the artifact-dir-ready-check should have failed earlier in the
     advance order, so we never reach a substituted file-exists-check
     with no artifact_dir bound.
-
-    Phase 11: ported claudechic workflows use `${CLAUDECHIC_ARTIFACT_DIR}`
-    in file-exists-check paths. Accept both spellings for portability.
     """
     if artifact_dir is None:
         return value
     if isinstance(value, str):
-        return value.replace("${ARTIFACT_DIR}", artifact_dir).replace(
-            "${CLAUDECHIC_ARTIFACT_DIR}", artifact_dir
-        )
+        return value.replace("${ARTIFACT_DIR}", artifact_dir)
     if isinstance(value, list):
         return [_expand_artifact_dir(v, artifact_dir) for v in value]
     return value
@@ -458,9 +453,9 @@ def _inject_seam_params(
     target for `artifact-dir-ready-check`. `elicit` is the closure
     that issues `elicitation/create` for `manual-confirm`.
 
-    Also substitutes `${ARTIFACT_DIR}` / `${CLAUDECHIC_ARTIFACT_DIR}`
-    in `path`/`paths` params from the current run's state.json so
-    workflows can pin advance checks to artifact-dir-relative paths.
+    Also substitutes `${ARTIFACT_DIR}` in `path`/`paths` params from the
+    current run's state.json so workflows can pin advance checks to
+    artifact-dir-relative paths.
     """
     # Best-effort read of state.json for ${ARTIFACT_DIR} expansion.
     # If state.json is missing or artifact_dir unset, placeholders are

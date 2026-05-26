@@ -2188,7 +2188,7 @@ def test_project_team_advance_lifecycle(tmp_cwd, operon_plugin_dir, claude_drive
         time.sleep(5.0)
         observer.read_new()
 
-        artifact_dir = tmp_cwd / ".project_team" / RUN_NAME
+        artifact_dir = tmp_cwd / ".operon" / RUN_NAME
         MAX_ADVANCE_RETRIES = 6
         MAX_PROSE_RETRIES = 2  # Land 14: retry budget for prose-only responses
         advance_attempts = 0

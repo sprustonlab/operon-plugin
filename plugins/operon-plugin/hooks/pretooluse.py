@@ -134,8 +134,8 @@ _FAILCLOSED_DENY: list[dict[str, Any]] = [
         # and update both.
         "pattern": re.compile(r"rm\s+-rf\s+/"),
         "message": (
-            "Dangerous: rm -rf on absolute path. Request override if "
-            "intentional. (operon-plugin fail-closed safety gate)"
+            "rm -rf on an absolute path can irreversibly destroy data. "
+            "(operon-plugin fail-closed safety gate)"
         ),
     },
 ]
@@ -185,10 +185,11 @@ def _deny_with_ack_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
     permission prompt is bypassable by permission mode and out of
     our control; we want a closed-loop signal to the LLM."""
     msg = (
+        f"The user chose to block this action for this reason: "
         f"{rule_message.strip()}\n\n"
-        f"Call mcp__operon__acknowledge_warning("
-        f'rule_id="{rule_id}", reason="<explain why>") '
-        f"if this is intentional, then retry the tool."
+        f"If you still believe this is the appropriate action, you can call "
+        f'mcp__operon__acknowledge_warning(rule_id="{rule_id}", '
+        f'reason="<explain why>") to proceed, then retry the tool.'
     )
     return _deny_output(msg)
 
@@ -198,10 +199,12 @@ def _deny_with_override_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
     request_override. The override is a user-gated escape hatch
     (elicitation/create dialog); the LLM cannot self-grant."""
     msg = (
+        f"The user chose to block this action for this reason: "
         f"{rule_message.strip()}\n\n"
-        f"Call mcp__operon__request_override("
-        f'rule_id="{rule_id}", reason="<explain why>") '
-        f"to request user approval, then retry the tool."
+        f"If you still believe this is the appropriate action, you can call "
+        f'mcp__operon__request_override(rule_id="{rule_id}", '
+        f'reason="<explain why>") to ask the user to approve it, then retry '
+        f"the tool."
     )
     return _deny_output(msg)
 

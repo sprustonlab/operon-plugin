@@ -1,8 +1,7 @@
 """Built-in advance check implementations. LEAF MODULE.
 
 Imports only from `operon_mcp_server.checks.protocol` (and stdlib +
-`re`). Mirrors `claudechic/checks/builtins.py` per SPEC §11.2; the
-five built-in check types are:
+`re`). Per SPEC §11.2; the five built-in check types are:
 
 - `command-output-check` -- run a shell command (30s timeout), regex
   the stdout
@@ -42,7 +41,7 @@ DEFAULT_COMMAND_TIMEOUT_S = 30.0
 def _resolve_against(path: str | Path, base_dir: str | Path | None) -> Path:
     """Resolve `path` against `base_dir` if relative; expand `~` first.
 
-    Mirrors claudechic's helper. The order matters: `~` expansion FIRST
+    The order matters: `~` expansion FIRST
     (a path with a literal `~` segment is not `is_absolute()` so without
     expansion `base_dir` would be silently prepended to `~/...`).
     """
@@ -356,7 +355,7 @@ def build_check(decl: CheckDecl) -> Check:
 def parse_decl(raw: dict[str, Any]) -> CheckDecl:
     """Parse one workflow-yaml check entry into a `CheckDecl`.
 
-    Expected shape per claudechic's existing convention:
+    Expected shape:
 
         - type: file-exists-check
           path: "${ARTIFACT_DIR}/STATUS.md"
