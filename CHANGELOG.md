@@ -6,6 +6,30 @@ commits on `main` that make it up. The authoritative design reference
 is the Contributor/Architecture Guide in the docs site
 (`docs/dev/architecture.md`).
 
+## 0.0.4 -- run_name normalized to match TeamCreate's team slug
+
+- `/project_team <run_name>` now normalizes the run_name to a canonical
+  slug (lowercase; runs of non-alphanumeric characters -> a single
+  hyphen; leading/trailing hyphens stripped) before creating the run
+  and the team -- e.g. `Allen_CCF_Projection` -> `allen-ccf-projection`.
+  Previously operon used the run_name verbatim while Anthropic's
+  `TeamCreate` slugified it, so a name with uppercase/underscores
+  produced `~/.claude/teams/allen-ccf-projection/` while operon looked
+  for `~/.claude/teams/Allen_CCF_Projection/` -- the team was never
+  found and activation looped at `team_not_created`.
+- The slug form was reverse-engineered by probing TeamCreate: it
+  lowercases each ASCII alphanumeric and maps every other character to
+  a single hyphen (no collapsing, no trimming). A canonical slug is a
+  fixed point of that mapping, so the normalized name round-trips
+  through TeamCreate unchanged and operon's `~/.claude/teams/<slug>/`
+  paths line up with what the runtime creates.
+- Normalization is applied in both the client-side `activate.py` and
+  the server-side `activate_workflow` tool (mirrored, idempotent). Names
+  are now rejected only if they normalize to an empty slug (no letters
+  or digits) or exceed 50 characters; underscores, spaces, and mixed
+  case are normalized rather than rejected. Multi-token input
+  (`/project_team Allen CCF Projection`) is joined and normalized too.
+
 ## 0.0.3 -- `/project_team` Python resolution on Windows
 
 - `/project_team` no longer shells out to bare `python`, which on Windows

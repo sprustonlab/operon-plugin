@@ -17,9 +17,13 @@ created under `<project>/.operon/<run_name>/` with `current_phase`
 set to the workflow's first phase (`vision`).
 
 The model never frames the activation question -- the shared
-`activate.py` script validates the user's input client-side and emits
-a single `OPERON_DISPATCH` directive that this skill body translates
-into one `mcp__operon__activate_workflow` call.
+`activate.py` script normalizes the user's run_name to a canonical
+slug (lowercase, hyphens; e.g. `Allen_CCF_Projection` ->
+`allen-ccf-projection`) and validates it client-side, then emits a
+single `OPERON_DISPATCH` directive that this skill body translates
+into one `mcp__operon__activate_workflow` call. Normalizing up front
+makes the slug a fixed point of Anthropic's `TeamCreate`, so the team
+directory it creates matches the path operon derives.
 
 ## Script invocation
 
@@ -60,13 +64,16 @@ on a non-interactive stdin.
 - `/project_team` -- script tries interactive stdin prompt; on a TTY
   this works, otherwise it emits `ERROR: /project_team requires a
   run_name...`.
-- `/project_team my_refactor` -- script validates and emits
-  `OPERON_DISPATCH ... run_name=my_refactor`; LLM calls
+- `/project_team my_refactor` -- script normalizes to `my-refactor`
+  and emits `OPERON_DISPATCH ... run_name=my-refactor`; LLM calls
   `mcp__operon__activate_workflow(workflow_id="project_team",
-  run_name="my_refactor")`.
-- `/project_team invalid/name` -- script emits
-  `ERROR: run_name contains disallowed character(s): '/' ...`; LLM
-  relays the diagnostic; no activation.
+  run_name="my-refactor")`.
+- `/project_team Allen_CCF_Projection` -- normalizes to
+  `allen-ccf-projection` (lowercase, underscores -> hyphens); same
+  dispatch with that slug.
+- `/project_team @@@` -- script emits `ERROR: run_name '@@@'
+  normalizes to an empty slug; it must contain at least one letter or
+  digit`; LLM relays the diagnostic; no activation.
 
 ## What NOT to do
 

@@ -67,7 +67,7 @@ tools so the model cannot be prompt-injected into the action. Source:
 
 | Command | Backing tool(s) | Purpose |
 | ------- | --------------- | ------- |
-| `/project_team [run_name]` | `mcp__operon__activate_workflow` | Activate the `project_team` workflow as a new operon-session. The shared `activate.py` validates the run_name client-side before the tool call. See [Quickstart](quickstart.md) and [Workflows and Phases](workflows-and-phases.md). |
+| `/project_team [run_name]` | `mcp__operon__activate_workflow` | Activate the `project_team` workflow as a new operon-session. The shared `activate.py` normalizes the run_name to a canonical slug (lowercase, hyphens) and validates it client-side before the tool call. See [Quickstart](quickstart.md) and [Workflows and Phases](workflows-and-phases.md). |
 | `/restore [run_name]` | `mcp__operon__list_operon_sessions` + `mcp__operon__restore_operon_session` | Switch the active operon-session, with a picker when no run_name is given. See [Sessions](sessions.md). |
 | `/rules [agent_name]` | `mcp__operon__get_applicable_rules` | Show the active Rules, advance-checks, and escape tokens for the calling agent's current `(role, phase)`. See [Guardrails](guardrails.md). |
 
@@ -77,5 +77,6 @@ tools so the model cannot be prompt-injected into the action. Source:
     `cross_agent_not_implemented`; the skill relays that verbatim.
 
 There is also an internal `activate` skill directory
-(`skills/activate/scripts/activate.py`); it is the shared run_name
-validator that `/project_team` invokes, not a separate user command.
+(`skills/activate/scripts/activate.py`, launched via `activate-wrapper`);
+it is the shared run_name normalizer/validator that `/project_team`
+invokes, not a separate user command.

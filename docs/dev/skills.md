@@ -55,12 +55,18 @@ mirrors the `uv`/`python3`/`python` resolution ladder used by the MCP
 server and hooks, with a pre-flight check that skips the Windows
 Microsoft Store `python` stub. SKILL.md never invokes bare `python`.
 
-`activate.py` validates the `run_name` client-side (filesystem-safe, no
-leading dot, <=50 chars) and emits exactly one line: either
+`activate.py` normalizes the `run_name` to a canonical slug (lowercase;
+runs of non-alphanumeric characters -> a single hyphen; leading/trailing
+hyphens stripped) and validates it client-side (rejecting only an empty
+slug or one over 50 chars), then emits exactly one line: either
 
 ```
-OPERON_DISPATCH tool=mcp__operon__activate_workflow workflow_id=project_team run_name=my_refactor
+OPERON_DISPATCH tool=mcp__operon__activate_workflow workflow_id=project_team run_name=my-refactor
 ```
+
+The slug is chosen so it is a fixed point of Anthropic's `TeamCreate`
+name mangling, keeping operon's `~/.claude/teams/<run_name>/` paths in
+sync with the directory the runtime actually creates.
 
 or `ERROR: <reason>`. The body parses the `OPERON_DISPATCH` line and calls
 `mcp__operon__activate_workflow(workflow_id=..., run_name=...)` with

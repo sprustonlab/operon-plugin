@@ -27,10 +27,12 @@ operon loads automatically when the session starts.
 ### 2. Start the project_team workflow
 
 ```text
-/project_team my_first_run
+/project_team my-first-run
 ```
 
-This starts a run named `my_first_run` at its first phase, `vision`. The
+This starts a run named `my-first-run` at its first phase, `vision`.
+(The name is normalized to a lowercase-hyphen slug, so
+`/project_team My_First_Run` lands at the same `my-first-run`.) The
 [Coordinator](agents-and-messaging.md) leads from here: it delegates to a
 team of specialist agents rather than doing the work itself, so you
 mostly talk to the Coordinator.
