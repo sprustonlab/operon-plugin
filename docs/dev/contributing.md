@@ -60,6 +60,28 @@ The acceptance check for the model: a commit touching
 (by the pre-commit hook locally and the PR guard in CI), while `.operon/`
 runtime state stays ignored on both.
 
+## Recipe: sync develop into main
+
+`main` trails `develop` and takes every change except the `operon-runs/`
+work products. Bring develop's work across with a merge that drops that
+one tree:
+
+```bash
+git checkout main
+git merge --no-ff --no-commit develop   # stage develop's tree, then pause
+git rm -rf operon-runs/                  # keep the work products off main
+git commit --no-verify -m "Merge develop into main (exclude operon-runs/)"
+git push origin main
+git checkout develop                     # resume work on develop
+```
+
+`--no-ff` forces a real merge commit, so a plain fast-forward can never
+carry `operon-runs/` across. `--no-verify` lets the merge commit past the
+`block-operon-runs-on-main` pre-commit hook, which rejects any commit
+touching `operon-runs/` -- including the deletion this recipe makes.
+main's `.gitignore` lists `operon-runs/`, so a later run that regenerates
+those files leaves them untracked rather than staged back onto `main`.
+
 ## Docs deploy
 
 The docs site is built and published by `.github/workflows/docs.yml` on
