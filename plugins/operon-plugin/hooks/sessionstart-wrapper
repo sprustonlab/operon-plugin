@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# SessionStart hook wrapper (session-ownership marker).
+#
+# Resolves a python interpreter that can `import operon_mcp_server.workflow`
+# and invokes `sessionstart.py` with stdin/stdout/stderr passed through.
+# Mirrors the `uv -> python3 -> python` resolution ladder from
+# `pretooluse-wrapper` / `bin/operon-mcp-server`:
+#
+#   1. `uv run --project <plugin-root>` if uv is on PATH.
+#   2. `python3` or `python` with a pre-flight `import mcp, watchdog, yaml`
+#      check.
+#   3. Loud error to stderr, then exit 0 -- the marker is best-effort and
+#      a broken hook environment must never block a session from starting.
+#
+# Always prepends `${CLAUDE_PLUGIN_ROOT}/src` to PYTHONPATH so the
+# operon_mcp_server package is importable without `pip install -e .`.
+
+set -e
+
+plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+script="${plugin_root}/hooks/sessionstart.py"
+
+export PYTHONPATH="${plugin_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --project "${plugin_root}" python "${script}" "$@"
+fi
+
+for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1; then
+        if "$py" -c "import mcp, watchdog, yaml" >/dev/null 2>&1; then
+            exec "$py" "${script}" "$@"
+        fi
+    fi
+done
+
+cat >&2 <<'EOF'
+operon-plugin sessionstart hook: no python with required deps.
+Either install uv (https://docs.astral.sh/uv/) or pip install:
+  pip install 'mcp>=1.0' 'watchdog>=4.0' 'PyYAML>=6.0'
+EOF
+# Exit 0 (no output): the session marker is best-effort. A broken hook
+# environment must not stop the session from starting.
+exit 0
