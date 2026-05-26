@@ -19,9 +19,12 @@ Code's foreground (Coordinator) session. It is responsible for:
    body. `argv[2:]` are the user-typed `$ARGUMENTS` tokens; the first
    non-empty token (if any) is the candidate run_name.
 
-2. Validating `run_name` client-side per SPEC §7 `activate_workflow`
-   rules: filesystem-safe (no `/`, `\`, `:`, `*`, `?`, `<`, `>`, `|`, `"`),
-   no leading `.`, non-empty, <=50 chars.
+2. Normalizing `run_name` to the canonical slug the Anthropic
+   runtime's TeamCreate produces (lowercase; runs of non-[a-z0-9] ->
+   a single `-`; leading/trailing `-` stripped), then validating it.
+   Mirrors `activate_workflow.py`'s `_normalize_run_name`. The only
+   rejections are an empty slug (no alphanumerics) or > 50 chars;
+   underscores, spaces, and case are normalized, not rejected.
 
 3. If no run_name supplied: prompting interactively via stdin (best-
    effort fallback). When stdin is not a TTY (typical in
@@ -29,9 +32,10 @@ Code's foreground (Coordinator) session. It is responsible for:
    ERROR diagnostic telling the user to retry with an explicit name.
 
 4. On valid input: emitting a single `OPERON_DISPATCH ...` directive
-   line to stdout. The companion SKILL.md instructs the LLM to read
-   this line and dispatch `mcp__operon__activate_workflow` with the
-   parsed `workflow_id` + `run_name`.
+   line to stdout carrying the NORMALIZED run_name. The companion
+   SKILL.md instructs the LLM to read this line and dispatch
+   `mcp__operon__activate_workflow` with the parsed `workflow_id` +
+   `run_name`.
 
 5. On invalid input: emitting a single `ERROR: <reason>` line and
    exiting non-zero. SKILL.md tells the LLM to relay the ERROR
@@ -62,44 +66,53 @@ ASCII-only source per the cross-platform rules.
 
 from __future__ import annotations
 
+import re
 import sys
 
-# -- Validation rules ---------------------------------------------------
+# -- Normalization + validation rules -----------------------------------
 #
-# Mirrors `src/operon_mcp_server/tools/activate_workflow.py` SPEC §7.
-# Kept literal here (rather than importing) because the script is
-# stdlib-only by design -- see module docstring.
+# Mirrors `src/operon_mcp_server/tools/activate_workflow.py`
+# (`_normalize_run_name` + `_validate_run_name`). Kept literal here
+# (rather than importing) because the script is stdlib-only by design
+# -- see module docstring.
 
-#: Characters that break paths on at least one supported OS.
-_DISALLOWED_CHARS = frozenset('/\\:*?<>|"')
-
-#: Length cap; keeps the run_name under Windows MAX_PATH headroom
-#: combined with `<project>/.operon/<run_name>/...` ancestry.
+#: Length cap (post-normalization); keeps the run_name under Windows
+#: MAX_PATH headroom combined with `<project>/.operon/<run_name>/...`.
 _MAX_RUN_NAME_LEN = 50
 
 
-def _validate_run_name(run_name: str) -> str | None:
-    """Return None if `run_name` passes every SPEC §7 rule.
+def _normalize_run_name(raw: str) -> str:
+    """Canonicalize `raw` into the slug the Anthropic runtime's
+    TeamCreate produces: lowercase, every run of non-[a-z0-9] -> a
+    single `-`, strip leading/trailing `-`.
 
-    Otherwise return a one-line human-readable diagnostic. The
-    diagnostic intentionally mirrors `activate_workflow.py`'s error
-    messages so the user sees the same vocabulary regardless of
-    which validation layer caught it.
+    The runtime maps team_name -> directory by lowercasing each ASCII
+    alphanumeric and turning every other character into a single `-`
+    (no collapsing, no trimming) -- so a canonical slug is a fixed
+    point and feeding this result to TeamCreate yields it back
+    unchanged. Idempotent. Mirrors `activate_workflow._normalize_run_name`.
     """
-    if not run_name:
+    return re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+
+
+def _validate_run_name(raw: str, normalized: str) -> str | None:
+    """Return None if the (already-normalized) run_name is usable.
+
+    Otherwise return a one-line human-readable diagnostic that mirrors
+    `activate_workflow.py`'s error messages. The only hard failures are
+    an empty slug (raw had no alphanumerics) or one over the length cap.
+    """
+    if not raw.strip():
         return "run_name must be a non-empty string"
-    if len(run_name) > _MAX_RUN_NAME_LEN:
+    if not normalized:
         return (
-            f"run_name exceeds {_MAX_RUN_NAME_LEN} chars "
-            f"(got {len(run_name)})"
+            f"run_name {raw!r} normalizes to an empty slug; it must "
+            "contain at least one letter or digit"
         )
-    if run_name.startswith("."):
-        return "run_name may not start with '.'"
-    bad = sorted(c for c in run_name if c in _DISALLOWED_CHARS)
-    if bad:
+    if len(normalized) > _MAX_RUN_NAME_LEN:
         return (
-            "run_name contains disallowed character(s): "
-            f"{''.join(bad)!r} (none of /, \\, :, *, ?, <, >, |, \")"
+            f"run_name normalizes to {normalized!r}, which exceeds "
+            f"{_MAX_RUN_NAME_LEN} chars (got {len(normalized)})"
         )
     return None
 
@@ -123,7 +136,7 @@ def _elicit_run_name(workflow_id: str) -> str | None:
         return None
     prompt = (
         f"Name for this {workflow_id} operon-session "
-        "(snake_case, e.g. my_feature_refactor): "
+        "(normalized to kebab-case, e.g. my-feature-refactor): "
     )
     try:
         line = input(prompt)
@@ -179,26 +192,28 @@ def main(argv: list[str]) -> int:
     workflow_id = argv[1].strip()
 
     # Claude Code may pass `$ARGUMENTS` as a single space-joined token
-    # or as multiple tokens depending on shell quoting. Treat the first
-    # non-empty token as the candidate run_name; ignore any trailing
-    # tokens (the user typed extra noise).
+    # or as multiple tokens depending on shell quoting. Join them back
+    # into one candidate run_name -- normalization collapses the spaces
+    # to hyphens, so `/project_team Allen CCF Projection` becomes
+    # `allen-ccf-projection` rather than silently dropping tokens.
     user_args = [a.strip() for a in argv[2:] if a.strip()]
-    run_name: str | None = user_args[0] if user_args else None
+    raw_run_name: str | None = " ".join(user_args) if user_args else None
 
-    if run_name is None:
-        run_name = _elicit_run_name(workflow_id)
-        if run_name is None:
+    if raw_run_name is None:
+        raw_run_name = _elicit_run_name(workflow_id)
+        if raw_run_name is None:
             # No TTY for fallback elicitation and no argument supplied.
             # Tell the user how to retry. Stays single-line so the LLM
             # can relay it verbatim per SKILL.md.
             print(
                 f"ERROR: /{workflow_id} requires a run_name. Invoke as: "
-                f"/{workflow_id} <run_name> (snake_case, filesystem-safe, "
+                f"/{workflow_id} <run_name> (normalized to kebab-case, "
                 f"<={_MAX_RUN_NAME_LEN} chars)."
             )
             return 1
 
-    diag = _validate_run_name(run_name)
+    run_name = _normalize_run_name(raw_run_name)
+    diag = _validate_run_name(raw_run_name, run_name)
     if diag is not None:
         print(f"ERROR: {diag}")
         return 1

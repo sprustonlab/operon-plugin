@@ -5,11 +5,14 @@ operon-session directory under `<project>/.operon/<run_name>/` and
 bootstraps `phase_state.json`, `_active.json`, an empty
 `agents.json`, and the empty mailbox / _handles subtrees.
 
-run_name validation (SPEC §7):
-- Reject characters: `/`, `\`, `:`, `*`, `?`, `<`, `>`, `|`, `"`
-- Reject leading `.`
-- Reject empty / longer than 50 chars
-- Reject collision with an existing run directory
+run_name normalization + validation (SPEC §7):
+- Normalize to the canonical slug the Anthropic runtime's TeamCreate
+  produces (lowercase; every run of non-[a-z0-9] -> a single `-`;
+  strip leading/trailing `-`). This makes the run dir + team paths
+  match the directory TeamCreate creates on disk -- see
+  `_normalize_run_name`.
+- Reject if the slug is empty (no alphanumerics) or > 50 chars.
+- Reject collision with an existing run directory.
 
 Identity gate: Coordinator-only per SPEC §7.1.
 
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,10 +41,8 @@ from . import spawn_agent as spawn_agent_tool
 #: MCP tool name. Coordinator-only per SPEC §7.1.
 TOOL_NAME = "activate_workflow"
 
-#: Filesystem-unsafe characters disallowed in `run_name` (SPEC §7).
-_DISALLOWED_RUN_NAME_CHARS = frozenset('/\\:*?<>|"')
-
-#: Cap on run_name length to keep paths sane on Windows MAX_PATH.
+#: Cap on run_name length (post-normalization) to keep paths sane on
+#: Windows MAX_PATH.
 _MAX_RUN_NAME_LEN = 50
 
 INPUT_SCHEMA: dict[str, Any] = {
@@ -57,11 +59,16 @@ INPUT_SCHEMA: dict[str, Any] = {
         "run_name": {
             "type": "string",
             "description": (
-                "Human-readable name for this operon-session. Becomes "
-                "the subdirectory under <project>/.operon/. Must be "
-                "filesystem-safe (no /, \\, :, *, ?, <, >, |, \"), "
-                "not start with `.`, non-empty, <=50 chars, and not "
-                "collide with an existing run."
+                "Name for this operon-session. Operon normalizes it to "
+                "a canonical slug (lowercase; runs of non-alphanumeric "
+                "characters become single hyphens; leading/trailing "
+                "hyphens stripped) so it matches the team directory "
+                "TeamCreate creates -- e.g. 'Allen_CCF_Projection' -> "
+                "'allen-ccf-projection'. The slug becomes the "
+                "subdirectory under <project>/.operon/ and the team "
+                "name. Must contain at least one letter or digit, be "
+                "<=50 chars after normalization, and not collide with "
+                "an existing run."
             ),
         },
     },
@@ -76,16 +83,18 @@ def tool_descriptor() -> mcp_types.Tool:
         name=TOOL_NAME,
         description=(
             "PREREQUISITE: call Anthropic's `TeamCreate(team_name="
-            "<your_run_name>)` MCP tool BEFORE this tool so the "
-            "Anthropic runtime's TUI sees the team (Shift+Down). "
-            "This tool validates that team exists, installs operon's "
-            "workflow content (compiles each role's identity.md into "
+            "<slug>)` MCP tool BEFORE this tool so the Anthropic "
+            "runtime's TUI sees the team (Shift+Down). operon "
+            "normalizes run_name to a canonical slug (lowercase, "
+            "hyphens) and looks for the team under that slug; if the "
+            "team is missing it returns {status: 'team_not_created', "
+            "next_step: 'TeamCreate(team_name=<slug>)'} with the exact "
+            "slug to pass. On success it installs operon's workflow "
+            "content (compiles each role's identity.md into "
             "~/.claude/agents/<role>.md as a subagent definition; "
             "writes initial phase_state.json), registers operon as a "
-            "team member in ~/.claude/teams/<run_name>/config.json, "
-            "and sets <project>/.operon/_active.json to the new run. "
-            "Returns {status: 'team_not_created', next_step: ...} if "
-            "the TeamCreate prerequisite was skipped. "
+            "team member in ~/.claude/teams/<slug>/config.json, and "
+            "sets <project>/.operon/_active.json to the new run. "
             "Coordinator-only."
         ),
         inputSchema=INPUT_SCHEMA,
@@ -96,20 +105,49 @@ class ActivateWorkflowError(RuntimeError):
     """Raised on validation or write failures; becomes a tool error."""
 
 
-def _validate_run_name(run_name: str) -> None:
-    """Raise `ActivateWorkflowError` if `run_name` fails any SPEC §7 rule."""
-    if not run_name:
+def _normalize_run_name(raw: str) -> str:
+    """Canonicalize a user-supplied run_name into the slug the Anthropic
+    runtime's TeamCreate produces, so operon's run dir + team paths match
+    the directory TeamCreate creates on disk.
+
+    The runtime maps a team_name to its directory by lowercasing every
+    ASCII alphanumeric and replacing every other character with a single
+    `-` (no collapsing of consecutive separators, no trimming) --
+    empirically verified 2026-05-26 by probing TeamCreate. A *canonical*
+    slug (lowercase, single `-` separators, no leading/trailing/double
+    `-`) is therefore a fixed point of that mapping. We emit exactly that
+    canonical form: lowercase, collapse every run of non-[a-z0-9] to one
+    `-`, strip leading/trailing `-`. Feeding the result to TeamCreate
+    yields the identical string back, so `team_config_path(run_name)`
+    resolves to the real team directory.
+
+    Idempotent: `_normalize_run_name(_normalize_run_name(x))` equals
+    `_normalize_run_name(x)`.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+
+
+def _validate_run_name(raw: str, normalized: str) -> None:
+    """Raise `ActivateWorkflowError` if the run_name is unusable.
+
+    `raw` is the user's input; `normalized` is `_normalize_run_name(raw)`
+    (the name actually used on disk and passed to TeamCreate). The only
+    hard failures are an empty slug (raw had no alphanumerics) or one
+    that exceeds the length cap; everything else is normalized rather
+    than rejected.
+    """
+    if not raw.strip():
         raise ActivateWorkflowError("'run_name' must be a non-empty string")
-    if len(run_name) > _MAX_RUN_NAME_LEN:
+    if not normalized:
         raise ActivateWorkflowError(
-            f"'run_name' exceeds {_MAX_RUN_NAME_LEN} chars (got {len(run_name)})"
+            f"'run_name' {raw!r} normalizes to an empty slug; it must "
+            "contain at least one letter or digit."
         )
-    if run_name.startswith("."):
-        raise ActivateWorkflowError("'run_name' may not start with '.'")
-    bad = sorted(c for c in run_name if c in _DISALLOWED_RUN_NAME_CHARS)
-    if bad:
+    if len(normalized) > _MAX_RUN_NAME_LEN:
         raise ActivateWorkflowError(
-            f"'run_name' contains disallowed character(s): {''.join(bad)!r}"
+            f"'run_name' normalizes to {normalized!r}, which exceeds "
+            f"{_MAX_RUN_NAME_LEN} chars (got {len(normalized)}); "
+            "choose a shorter name."
         )
 
 
@@ -244,7 +282,13 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
         raise ActivateWorkflowError("'workflow_id' must be a non-empty string")
     if not isinstance(run_name, str):
         raise ActivateWorkflowError("'run_name' must be a string")
-    _validate_run_name(run_name)
+    # Normalize to the canonical slug TeamCreate will produce, then
+    # validate. Everything downstream (run_dir, team paths, the
+    # team_not_created next_step) uses the slug, so it matches the
+    # directory the Anthropic runtime creates on disk.
+    normalized_run_name = _normalize_run_name(run_name)
+    _validate_run_name(run_name, normalized_run_name)
+    run_name = normalized_run_name
 
     coord_record = _require_coordinator()
     coord_handle = identity.read_env_handle()
@@ -390,9 +434,9 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
     # subagent-definition schema under ~/.claude/agents/<role>.md,
     # install the operon-stub subagent definition, and register
     # operon as a team member in ~/.claude/teams/<team>/config.json.
-    # The team name is the operon run_name; this is the natural
-    # identifier the user already named, and run_name is validated
-    # filesystem-safe above. The transformer and registration are
+    # The team name is the operon run_name (the canonical slug
+    # normalized above), so it matches the directory TeamCreate created
+    # for the same name. The transformer and registration are
     # purely additive -- no legacy code is touched (Land 1 deletes
     # nothing per plan section 6 + section 8 Land 1).
     try:

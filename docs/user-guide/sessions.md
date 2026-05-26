@@ -138,10 +138,14 @@ bootstrapped. It is destructive in one respect: if the *current* active
 run has alive workers, you are first asked to confirm closing them, and
 it proceeds only on accept. Declining changes no on-disk state.
 
-The run name you pass is validated -- it rejects the filesystem-unsafe
-characters
-`/ \ : * ? < > | "`, a leading `.`, an empty name, a name longer than
-50 characters, and a collision with an existing run directory.
+The run name you pass is normalized to a canonical slug -- lowercased,
+with every run of non-alphanumeric characters (spaces, underscores,
+punctuation) collapsed to a single hyphen and leading/trailing hyphens
+stripped (so `Allen_CCF_Projection` becomes `allen-ccf-projection`).
+This matches the directory Anthropic's `TeamCreate` creates for the
+same name, so the team and operon's run paths stay in sync. Activation
+is rejected only if the slug is empty (the name had no letters or
+digits), exceeds 50 characters, or collides with an existing run.
 
 For the `state.json` schema and the engine internals behind sessions,
 see the

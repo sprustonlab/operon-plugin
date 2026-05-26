@@ -84,13 +84,13 @@ SUB_ACT_TIMEOUT_S = 240.0
 #: Idle K (ms). Q7 coordinator answer.
 IDLE_K_MS = 1500
 
-#: Run name passed to activate_workflow (sub-act 2). Bounded length
-#: per activate_workflow's validation rules. Use a hyphen rather
-#: than an underscore: empirically, the runtime's TeamCreate
-#: normalizes the team directory name to hyphens, while operon's
-#: internal prerequisite check uses the raw run_name -- so a name
-#: with an underscore causes a mismatch
-#: ("expected scenario_run, got scenario-run") and activation fails.
+#: Run name passed to activate_workflow (sub-act 2). Already a
+#: canonical slug, so operon's `_normalize_run_name` leaves it
+#: unchanged and it matches the directory TeamCreate creates. (As of
+#: 0.0.4 operon normalizes any run_name to this slug form -- lowercase,
+#: hyphens -- so an underscore name like `scenario_run` would also
+#: work; we keep the canonical form here so the expected on-disk paths
+#: below are literal.)
 RUN_NAME = "scenario-run"
 
 #: Debug-hygiene flag (Q18a). When True the harness does NOT delete
