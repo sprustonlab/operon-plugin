@@ -1,16 +1,13 @@
-# Project Team workflow manifest -- operon port of claudechic's
-# `project_team`. Phase ordering, advance checks, and workflow-embedded
-# rules mirror claudechic verbatim with the following surgical
-# adaptations (Phase 11 port):
+# Project Team workflow manifest. Defines the phase ordering, advance
+# checks, and workflow-embedded rules for the multi-agent team flow.
+# Notes on conventions:
 #
-#   - MCP tool prefix `mcp__chic__` -> `mcp__operon__` (rule triggers).
-#   - Template token `${CLAUDECHIC_ARTIFACT_DIR}` -> `${ARTIFACT_DIR}`
-#     (matches operon's convention; see checks/builtins.py docstring).
-#   - Coordinator-spec-edit rule's `.claudechic/runs` path fragment ->
-#     `.operon` (operon's run-dir convention).
-#   - The `hints:` block on the specification phase from claudechic is
-#     omitted -- claudechic's pipeline-hints system is explicitly out
-#     of scope for the operon port (see plan: "Don't try to port hints").
+#   - Rule triggers use the `mcp__operon__` MCP tool prefix.
+#   - The Coordinator-spec-edit rule matches `.operon` run-dir paths
+#     (it also accepts the legacy run-dir layout; see the regex on the
+#     specification-phase rule below).
+#   - No `hints:` block is declared -- the pipeline-hints system is out
+#     of scope here.
 #
 # `${ARTIFACT_DIR}` in advance-check paths is substituted from the
 # active run's `state.json` (set via `set_artifact_dir` MCP tool) at
@@ -44,9 +41,9 @@ phases:
         path: "${ARTIFACT_DIR}/specification/SPECIFICATION.md"
       - type: manual-confirm
         prompt: "Specification approved by user?"
-    # claudechic's manifest declares a `hints:` block here ("Synthesize
-    # all Leadership findings before presenting to user"); omitted in
-    # the operon port because the hints subsystem is not ported.
+    # No `hints:` block is declared here ("Synthesize all Leadership
+    # findings before presenting to user"); the hints subsystem is out
+    # of scope.
   - id: implementation
     file: implementation
     advance_checks:
@@ -106,7 +103,7 @@ rules:
     enforcement: deny
     detect:
       pattern: "git push"
-    message: "No pushing before testing phase"
+    message: "Code should not be pushed before it reaches the testing phase."
     exclude_phases: [testing-implementation, documentation, signoff]
 
   - id: no_force_push

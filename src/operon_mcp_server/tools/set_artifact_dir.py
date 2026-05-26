@@ -31,10 +31,12 @@ INPUT_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "Filesystem path that becomes the operon-session's "
-                "artifact_dir. The recommended default per SPEC §7 is "
-                "the operon-session directory itself (e.g. "
-                "`<project>/.operon/<run_name>/`). May be absolute or "
-                "relative to the active run directory."
+                "artifact_dir for tracked work products. The recommended "
+                "default is the run's work-products directory (e.g. "
+                "`operon-runs/<run_name>/`); the ephemeral, gitignored "
+                "`.operon/<run_name>/` runtime dir is NOT a work-products "
+                "location. May be absolute or relative to the active run "
+                "directory."
             ),
         },
     },

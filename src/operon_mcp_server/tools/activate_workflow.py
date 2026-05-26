@@ -1,7 +1,7 @@
 r"""`activate_workflow` MCP tool (Coordinator-only).
 
 Per SPEC §7 `activate_workflow` row + §11 + §17. Creates a new
-operon-run directory under `<project>/.operon/<run_name>/` and
+operon-session directory under `<project>/.operon/<run_name>/` and
 bootstraps `phase_state.json`, `_active.json`, an empty
 `agents.json`, and the empty mailbox / _handles subtrees.
 
@@ -370,6 +370,20 @@ async def _do_activate(args: dict[str, Any]) -> dict[str, Any]:
         workflow.write_initial_phase_state(workflow_id, first_phase)
     except workflow.WorkflowError as exc:
         raise ActivateWorkflowError(str(exc)) from exc
+
+    # Stamp run ownership from the SessionStart marker: the session that
+    # activates the run owns it, so the PreToolUse hook applies this
+    # run's workflow-embedded rules only to this session (not to an
+    # unrelated session later opened in the same project). Best-effort:
+    # a missing/unreadable marker leaves the run unowned rather than
+    # failing activation.
+    try:
+        marker = workflow.read_session_marker()
+        owner_sid = marker.get("session_id") if isinstance(marker, dict) else None
+        if isinstance(owner_sid, str) and owner_sid:
+            workflow.set_owner_session_id(owner_sid)
+    except workflow.WorkflowError:
+        pass
 
     # Land 1 of the Agent Teams pivot (v2.9 plan section 8 Land 1):
     # compile every workflow role's identity.md into Anthropic's

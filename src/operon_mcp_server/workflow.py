@@ -156,8 +156,8 @@ def _find_manifest_file(workflow_dir: Path, workflow_id: str) -> Path | None:
     """Return the manifest YAML inside `workflow_dir`, or None if absent.
 
     Two filenames are accepted, in priority order: `<workflow_id>.yaml`
-    (claudechic convention -- `project_team/project_team.yaml`) then
-    `phases.yaml` (operon convention for minimal manifests).
+    (the bundled `project_team/project_team.yaml` convention) then
+    `phases.yaml` (the convention for minimal manifests).
     """
     for candidate in (workflow_dir / f"{workflow_id}.yaml", workflow_dir / "phases.yaml"):
         if candidate.is_file():
@@ -168,7 +168,7 @@ def _find_manifest_file(workflow_dir: Path, workflow_id: str) -> Path | None:
 def _parse_manifest(text: str, source: Path) -> tuple[str, tuple[PhaseDecl, ...]]:
     """Parse a manifest YAML body. Returns (workflow_id, phases).
 
-    Accepts the claudechic shape::
+    Accepts the manifest shape::
 
         workflow_id: <id>
         phases:
@@ -179,7 +179,7 @@ def _parse_manifest(text: str, source: Path) -> tuple[str, tuple[PhaseDecl, ...]
                 path: ...
 
     If `workflow_id` is absent the loader uses the parent directory
-    name (mirrors claudechic's behavior for hand-rolled workflows).
+    name (the behavior for hand-rolled workflows).
     """
     try:
         data = yaml.safe_load(text)
@@ -394,7 +394,112 @@ def write_state(
         "artifact_dir": artifact_dir,
         "created_at": created_at,
     }
+    # Preserve run ownership across an artifact-dir write (set_artifact_dir
+    # replaces this file but must not erase the owner stamped at activate
+    # / restore). See `set_owner_session_id`.
+    owner = existing.get("owner_session_id")
+    if isinstance(owner, str) and owner:
+        payload["owner_session_id"] = owner
     return _atomic_write_json(path, payload)
+
+
+# -- session marker + run ownership -------------------------------------
+#
+# The MCP server never receives the real Claude Code session_id (it
+# synthesizes a bootstrap id). The SessionStart hook DOES see it, and
+# drops it in `<project>/.operon/_session.json`. `activate_workflow` /
+# `restore_operon_session` read that marker and stamp `owner_session_id`
+# into the run's state.json: ownership means "this session explicitly
+# activated or resumed the run", not merely "a session is open in the
+# directory". The PreToolUse hook compares the calling session_id to the
+# owner and applies a run's workflow-embedded rules ONLY to its owner --
+# so a stale paused run from a quit session cannot gate an unrelated new
+# session before it resumes.
+
+
+def read_session_marker(start: Path | None = None) -> dict[str, Any] | None:
+    """Read `<project>/.operon/_session.json`. Returns None if absent.
+
+    Never raises: a missing `.operon/` ancestor, a missing marker, or a
+    malformed marker all degrade to None so ownership stamping is
+    best-effort.
+    """
+    try:
+        path = paths.session_marker_file(start)
+    except paths.OperonPathError:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_session_marker(session_id: str, start: Path | None = None) -> Path:
+    """Write the live `session_id` to `<cwd>/.operon/_session.json`.
+
+    Used by the SessionStart hook. Tolerates a not-yet-created `.operon/`
+    (fresh project, before the first activate): resolves an existing
+    `.operon/` ancestor if one exists, otherwise creates `<start>/.operon/`.
+    """
+    try:
+        base = paths.operon_dir(start)
+    except paths.OperonPathError:
+        root = Path(start) if start is not None else Path(os.getcwd())
+        base = root / paths.OPERON_DIRNAME
+    base.mkdir(parents=True, exist_ok=True)
+    payload = {"session_id": session_id, "set_at": _now_iso()}
+    return _atomic_write_json(base / paths.SESSION_MARKER_FILENAME, payload)
+
+
+def set_owner_session_id(session_id: str, start: Path | None = None) -> Path:
+    """Stamp `owner_session_id` into the active run's state.json.
+
+    Merges into any existing state.json (preserving run_name /
+    artifact_dir / created_at), or creates it if absent. Called by
+    `activate_workflow` and `restore_operon_session` after the active
+    pointer is swapped.
+    """
+    path = state_file(start)
+    existing = read_state(start) or {}
+    payload = dict(existing)
+    payload.setdefault("schema_version", SCHEMA_VERSION)
+    payload.setdefault("created_at", _now_iso())
+    payload["owner_session_id"] = session_id
+    return _atomic_write_json(path, payload)
+
+
+def read_owner_session_id(start: Path | None = None) -> str | None:
+    """Return the active run's `owner_session_id`, or None if unset.
+
+    Never raises: any resolution / read error degrades to None.
+    """
+    try:
+        state = read_state(start)
+    except WorkflowError:
+        return None
+    if not state:
+        return None
+    owner = state.get("owner_session_id")
+    return owner if isinstance(owner, str) and owner else None
+
+
+def session_owns_active_run(
+    call_session_id: str | None, start: Path | None = None
+) -> bool:
+    """Return True iff `call_session_id` matches the active run's owner.
+
+    A non-empty owner that equals the caller's session_id means the
+    caller activated or resumed this run. A missing owner, a missing
+    caller id, or a mismatch all return False -- the caller does NOT own
+    the run, so its workflow-embedded rules must not be applied.
+    """
+    if not (isinstance(call_session_id, str) and call_session_id):
+        return False
+    owner = read_owner_session_id(start)
+    return bool(owner) and owner == call_session_id
 
 
 # -- advance protocol (SPEC §11.1) --------------------------------------
@@ -421,24 +526,19 @@ class AdvanceOutcome:
 
 
 def _expand_artifact_dir(value: Any, artifact_dir: str | None) -> Any:
-    """Substitute `${ARTIFACT_DIR}` / `${CLAUDECHIC_ARTIFACT_DIR}` in
-    string params with the value from state.json (`set_artifact_dir`).
+    """Substitute `${ARTIFACT_DIR}` in string params with the value from
+    state.json (`set_artifact_dir`).
 
     Recurses into lists. Strings with no placeholder pass through
     unchanged. If `artifact_dir` is None, placeholders are left as-is
     -- the artifact-dir-ready-check should have failed earlier in the
     advance order, so we never reach a substituted file-exists-check
     with no artifact_dir bound.
-
-    Phase 11: ported claudechic workflows use `${CLAUDECHIC_ARTIFACT_DIR}`
-    in file-exists-check paths. Accept both spellings for portability.
     """
     if artifact_dir is None:
         return value
     if isinstance(value, str):
-        return value.replace("${ARTIFACT_DIR}", artifact_dir).replace(
-            "${CLAUDECHIC_ARTIFACT_DIR}", artifact_dir
-        )
+        return value.replace("${ARTIFACT_DIR}", artifact_dir)
     if isinstance(value, list):
         return [_expand_artifact_dir(v, artifact_dir) for v in value]
     return value
@@ -458,9 +558,9 @@ def _inject_seam_params(
     target for `artifact-dir-ready-check`. `elicit` is the closure
     that issues `elicitation/create` for `manual-confirm`.
 
-    Also substitutes `${ARTIFACT_DIR}` / `${CLAUDECHIC_ARTIFACT_DIR}`
-    in `path`/`paths` params from the current run's state.json so
-    workflows can pin advance checks to artifact-dir-relative paths.
+    Also substitutes `${ARTIFACT_DIR}` in `path`/`paths` params from the
+    current run's state.json so workflows can pin advance checks to
+    artifact-dir-relative paths.
     """
     # Best-effort read of state.json for ${ARTIFACT_DIR} expansion.
     # If state.json is missing or artifact_dir unset, placeholders are

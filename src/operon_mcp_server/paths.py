@@ -32,6 +32,13 @@ OPERON_DIRNAME = ".operon"
 #: Name of the per-project active-run pointer file (SPEC section 17).
 ACTIVE_POINTER_FILENAME = "_active.json"
 
+#: Name of the per-project session marker. The SessionStart hook writes
+#: the live Claude Code session_id here so the MCP server (which never
+#: receives the real session_id) can stamp run ownership at
+#: activate / restore time. Project-scoped (one open session per cwd),
+#: not run-scoped -- it sits beside `_active.json`.
+SESSION_MARKER_FILENAME = "_session.json"
+
 #: Name of the handles subdirectory under each run (SPEC section 17).
 HANDLES_DIRNAME = "_handles"
 
@@ -73,6 +80,18 @@ def operon_dir(start: Path | None = None) -> Path:
 def active_pointer_file(start: Path | None = None) -> Path:
     """Return `<project>/.operon/_active.json`."""
     return operon_dir(start) / ACTIVE_POINTER_FILENAME
+
+
+def session_marker_file(start: Path | None = None) -> Path:
+    """Return `<project>/.operon/_session.json`.
+
+    Resolves against an EXISTING `.operon/` ancestor (like the other
+    pointer helpers). Writers that must tolerate a not-yet-created
+    `.operon/` (the SessionStart hook on a fresh project) compose the
+    path under `<cwd>/.operon/` themselves -- see
+    `workflow.write_session_marker`.
+    """
+    return operon_dir(start) / SESSION_MARKER_FILENAME
 
 
 def _read_active_run_name(start: Path | None = None) -> str:

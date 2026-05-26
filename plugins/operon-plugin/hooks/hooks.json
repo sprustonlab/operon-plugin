@@ -1,6 +1,18 @@
 {
-  "_comment": "operon-plugin hooks. PreToolUse fires pretooluse-wrapper -> pretooluse.py. Branches on tool_name inside the script: (a) Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule evaluation against operon_mcp_server.rules (deny/warn/log + audit log); (b) Agent -> WA1 transcript replay (Land 5) + [OPERON IDENTITY] directive injection (Land 6/7). Land 7 also added an MCP-identity-tool reject branch (matcher entries + _maybe_reject_teammate_identity_call); that was rolled back 2026-05-22 because in-process teammates multiplex MCP through the lead's session, leaving session_id lead-uniform at the hook layer -- the same architectural wall the B.0 probe surfaced for MCP `_meta`. Static MD guidance (subagent_install._OPERON_CONTEXT_QUERIES_FOOTER) and the dynamic WA1 directive remain to steer teammates toward [OPERON_QUERY] via SendMessage.",
+  "_comment": "operon-plugin hooks. SessionStart fires sessionstart-wrapper -> sessionstart.py, which records the live session_id to <cwd>/.operon/_session.json so activate_workflow / restore_operon_session can stamp owner_session_id on the run; the PreToolUse session-ownership gate then applies a run's workflow-embedded rules only to its owner session (a stale paused run from a quit session can't gate an unrelated new session before it resumes). PreToolUse fires pretooluse-wrapper -> pretooluse.py. Branches on tool_name inside the script: (a) Bash|Edit|Write|MultiEdit|NotebookEdit -> guardrail-rule evaluation against operon_mcp_server.rules (deny/warn/log + audit log); (b) Agent -> WA1 transcript replay (Land 5) + [OPERON IDENTITY] directive injection (Land 6/7). Land 7 also added an MCP-identity-tool reject branch (matcher entries + _maybe_reject_teammate_identity_call); that was rolled back 2026-05-22 because in-process teammates multiplex MCP through the lead's session, leaving session_id lead-uniform at the hook layer -- the same architectural wall the B.0 probe surfaced for MCP `_meta`. Static MD guidance (subagent_install._OPERON_CONTEXT_QUERIES_FOOTER) and the dynamic WA1 directive remain to steer teammates toward [OPERON_QUERY] via SendMessage.",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart-wrapper",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Agent|Bash|Edit|Write|MultiEdit|NotebookEdit",

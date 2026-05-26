@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: block-operon-runs-on-main
+        name: Block operon-runs/ on main
+        entry: bash -c 'branch=$(git rev-parse --abbrev-ref HEAD); if [ "$branch" = "main" ]; then echo "operon-runs/ files must not be committed to main (develop only)"; exit 1; fi'
+        language: system
+        files: ^operon-runs/
+        pass_filenames: false

@@ -1,10 +1,9 @@
 """Workflow-content helpers used by surviving Coordinator tools.
 
-Land 4 of the Agent Teams Pivot
-(``docs/AGENT_TEAMS_PIVOT_PLAN.md`` v2.9 section 6, table row for
-``tools/spawn_agent.py``: REFACTOR -- "Strip ``_spawn_subprocess``
-and the ``OPERON_AGENT_HANDLE`` env propagation. Spawn goes
-through Anthropic's ``Agent`` tool invoked by the lead's LLM.").
+Land 4 of the Agent Teams Pivot: REFACTOR -- strip
+``_spawn_subprocess`` and the ``OPERON_AGENT_HANDLE`` env
+propagation. Spawn goes through Anthropic's ``Agent`` tool
+invoked by the lead's LLM.
 
 Pre-Land-4 this module hosted the ``spawn_agent`` MCP tool
 (operon-spawned ``claude --bg`` background workers, per-agent

@@ -5,8 +5,7 @@
 # can override individual rule ids; workflow-embedded `rules:` blocks
 # are additive.
 #
-# Schema (per claudechic convention; mirrored in
-# operon_mcp_server.rules.Rule):
+# Schema (mirrored in operon_mcp_server.rules.Rule):
 #   id: <str>                   required, unique
 #   trigger: <str or list>      e.g. "PreToolUse/Bash"
 #   enforcement: deny|warn|log  required
@@ -21,14 +20,14 @@
 #   phases: [<str>, ...]        only these phases (default: all)
 #   exclude_phases: [<str>, ...]never these phases
 
-# 1) Catastrophic-rm hard block. Mirrors claudechic global rule
-#    `no_rm_rf`. Deny tier; Phase 7 will allow request_override.
+# 1) Catastrophic-rm hard block (`no_rm_rf`). Deny tier; Phase 7
+#    will allow request_override.
 - id: no_rm_rf
   trigger: PreToolUse/Bash
   enforcement: deny
   detect:
     pattern: "rm\\s+-rf\\s+/"
-  message: "Dangerous: rm -rf on absolute path. Request override if intentional."
+  message: "rm -rf on an absolute path can irreversibly destroy data."
 
 # 2) Force-push warning. Force-pushing rewrites history and can
 #    destroy peer work. Warn tier (acknowledge_warning required in
@@ -39,19 +38,19 @@
   enforcement: warn
   detect:
     pattern: "git\\s+push\\s+(--force\\b|-f\\b)"
-  message: "Force-push detected. Confirm you intend to rewrite remote history."
+  message: "Force-push rewrites published history and can discard peers' commits."
 
-# 3) Sudo acknowledgment. Mirrors claudechic's `warn_sudo`. Any
-#    `sudo ...` invocation requires acknowledgment.
+# 3) Sudo acknowledgment (`warn_sudo`). Any `sudo ...` invocation
+#    requires acknowledgment.
 - id: warn_sudo
   trigger: PreToolUse/Bash
   enforcement: warn
   detect:
     pattern: "^sudo\\s"
-  message: "Using sudo -- acknowledge if intentional."
+  message: "Using sudo runs with elevated privileges outside the sandbox."
 
-# 4) Git audit trail. All git operations are logged silently (no
-#    block, no prompt). Mirrors claudechic's `log_git_operations`.
+# 4) Git audit trail (`log_git_operations`). All git operations are
+#    logged silently (no block, no prompt).
 - id: log_git_operations
   trigger: PreToolUse/Bash
   enforcement: log

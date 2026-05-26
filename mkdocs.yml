@@ -1,0 +1,40 @@
+site_name: operon-plugin
+site_description: A Guided, Self-Revisable plugin for AI Research Software Operations in Claude Code
+
+nav:
+  - Home: index.md
+  - User Guide:
+      - Install: user-guide/install.md
+      - Quickstart: user-guide/quickstart.md
+      - Workflows and Phases: user-guide/workflows-and-phases.md
+      - Agents and Messaging: user-guide/agents-and-messaging.md
+      - Guardrails: user-guide/guardrails.md
+      - Sessions: user-guide/sessions.md
+      - MCP Tools Reference: user-guide/mcp-tools-reference.md
+  - Contributor/Architecture Guide:
+      - Architecture: dev/architecture.md
+      - MCP Server: dev/mcp-server.md
+      - Workflow Engine: dev/workflow-engine.md
+      - Rules and Enforcement: dev/rules-and-enforcement.md
+      - Hooks: dev/hooks.md
+      - Skills: dev/skills.md
+      - Testing: dev/testing.md
+      - Contributing: dev/contributing.md
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - content.tabs.link
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html

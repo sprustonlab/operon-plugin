@@ -1,8 +1,6 @@
 """Subagent-definition transformer + operon-as-team-member registration.
 
-Land 1 of the Agent Teams Pivot (see
-``docs/AGENT_TEAMS_PIVOT_PLAN.md`` v2.9 sections 4.3 component 6,
-4.7, 7, and 8 Land 1).
+Land 1 of the Agent Teams Pivot.
 
 This module bridges two schemas:
 

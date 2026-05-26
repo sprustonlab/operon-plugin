@@ -2,9 +2,9 @@
 
 Phase-by-phase implementation log for operon-plugin. Format: each
 entry lists the major capability landed in that phase plus the
-commits on `main` that make it up. Authoritative design lives in
-`../claudechic/.project_team/claude_code_port/SPEC.md` +
-`SPEC_APPENDIX.md`.
+commits on `main` that make it up. The authoritative design reference
+is the Contributor/Architecture Guide in the docs site
+(`docs/dev/architecture.md`).
 
 ## Phase 10 -- polish + e2e smoke + B-tier cleanup
 

@@ -134,8 +134,8 @@ _FAILCLOSED_DENY: list[dict[str, Any]] = [
         # and update both.
         "pattern": re.compile(r"rm\s+-rf\s+/"),
         "message": (
-            "Dangerous: rm -rf on absolute path. Request override if "
-            "intentional. (operon-plugin fail-closed safety gate)"
+            "rm -rf on an absolute path can irreversibly destroy data. "
+            "(operon-plugin fail-closed safety gate)"
         ),
     },
 ]
@@ -185,10 +185,11 @@ def _deny_with_ack_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
     permission prompt is bypassable by permission mode and out of
     our control; we want a closed-loop signal to the LLM."""
     msg = (
+        f"The user chose to block this action for this reason: "
         f"{rule_message.strip()}\n\n"
-        f"Call mcp__operon__acknowledge_warning("
-        f'rule_id="{rule_id}", reason="<explain why>") '
-        f"if this is intentional, then retry the tool."
+        f"If you still believe this is the appropriate action, you can call "
+        f'mcp__operon__acknowledge_warning(rule_id="{rule_id}", '
+        f'reason="<explain why>") to proceed, then retry the tool.'
     )
     return _deny_output(msg)
 
@@ -198,10 +199,12 @@ def _deny_with_override_hint(rule_id: str, rule_message: str) -> dict[str, Any]:
     request_override. The override is a user-gated escape hatch
     (elicitation/create dialog); the LLM cannot self-grant."""
     msg = (
+        f"The user chose to block this action for this reason: "
         f"{rule_message.strip()}\n\n"
-        f"Call mcp__operon__request_override("
-        f'rule_id="{rule_id}", reason="<explain why>") '
-        f"to request user approval, then retry the tool."
+        f"If you still believe this is the appropriate action, you can call "
+        f'mcp__operon__request_override(rule_id="{rule_id}", '
+        f'reason="<explain why>") to ask the user to approve it, then retry '
+        f"the tool."
     )
     return _deny_output(msg)
 
@@ -395,6 +398,24 @@ def _load_active_workflow_manifest():
     if not isinstance(data, dict):
         return None, None
     return data, decl.source_path
+
+
+def _session_owns_active_run(hook_input: dict[str, Any] | None) -> bool:
+    """Return True iff the calling session owns the active run.
+
+    The hook input carries the real Claude Code `session_id` (unlike the
+    MCP server, which only ever sees a synthesized bootstrap id). We
+    compare it to the `owner_session_id` stamped on the run's state.json
+    at activate / restore time. Fails toward "not owner" on any error so
+    the workflow tier is dropped rather than misapplied.
+    """
+    call_session_id = None
+    if isinstance(hook_input, dict):
+        call_session_id = hook_input.get("session_id")
+    try:
+        return workflow.session_owns_active_run(call_session_id)
+    except Exception:  # noqa: BLE001 -- ownership check never blocks
+        return False
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -829,6 +850,15 @@ def main() -> None:
     # fail-CLOSED safety net above has already cleared the
     # catastrophic-class patterns by this point.
     workflow_manifest, workflow_source = _load_active_workflow_manifest()
+    # Session-ownership gate. A run's workflow-embedded rules apply only
+    # to the session that activated or resumed it. A different session
+    # open in the same project -- e.g. a fresh session after the owner
+    # quit, before it calls restore_operon_session -- must NOT inherit
+    # the paused run's workflow rules. The 3-tier rules.yaml
+    # (plugin/user/project) still applies to everyone; only the
+    # workflow tier is dropped for a non-owner.
+    if workflow_manifest is not None and not _session_owns_active_run(hook_input):
+        workflow_manifest, workflow_source = None, None
     try:
         rule_list = rules.load_merged_rules(
             workflow_manifest=workflow_manifest,

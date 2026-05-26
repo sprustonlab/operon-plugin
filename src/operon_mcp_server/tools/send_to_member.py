@@ -1,9 +1,7 @@
 """`send_to_member` MCP tool. All-visible.
 
-Land 2 of the Agent Teams Pivot
-(``docs/AGENT_TEAMS_PIVOT_PLAN.md`` v2.9 section 4.3 component 3,
-section 8 Land 2 -- inbox-write primitive surface only;
-advance_phase brief delivery is Land 3, not here).
+Land 2 of the Agent Teams Pivot -- inbox-write primitive surface
+only; advance_phase brief delivery is Land 3, not here.
 
 Wraps :func:`operon_mcp_server.inbox.write_to_member_inbox` in
 an MCP tool surface so the lead's LLM can write an operon-authored

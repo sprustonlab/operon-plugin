@@ -59,9 +59,8 @@ ENV_DEFAULT_RUN_NAME = "OPERON_DEFAULT_RUN_NAME"
 BOOTSTRAP_WORKFLOW_ID = "_bootstrap"
 BOOTSTRAP_PHASE = "bootstrap"
 
-#: Agent name + role written into the bootstrap handle + roster. Same
-#: canonical values claudechic uses for its TUI's auto-spawned
-#: Coordinator agent.
+#: Agent name + role written into the bootstrap handle + roster. The
+#: canonical default values for the auto-spawned Coordinator agent.
 BOOTSTRAP_AGENT_NAME = "Coordinator"
 BOOTSTRAP_ROLE = "coordinator"
 

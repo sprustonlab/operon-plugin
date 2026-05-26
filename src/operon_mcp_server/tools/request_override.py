@@ -25,10 +25,9 @@ with a reason suggesting `mcp__operon__request_override`). This tool:
      `type=override_granted` or `type=override_declined` AFTER the
      user's decision.
 
-Workers/Coordinator distinction is intentional per claudechic's
-brief. Routing worker override requests through the Coordinator's
-mailbox is a future enhancement (SPEC §9); for Phase 7 we take the
-simple path.
+Workers/Coordinator distinction is intentional. Routing worker
+override requests through the Coordinator's mailbox is a future
+enhancement (SPEC §9); for Phase 7 we take the simple path.
 """
 
 from __future__ import annotations
