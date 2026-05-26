@@ -130,23 +130,29 @@ pip-installed deps (Option B) per the section above.
 ## Refreshing after edits to a marketplace-installed plugin
 
 `claude plugin install` snapshots the marketplace source at install
-time, so post-install edits to `workflows/`, `rules.yaml`, `.mcp.json`,
-or `hooks/hooks.json` are not visible until the snapshot is
-refreshed. Use `claude plugin update`:
+time, and the marketplace catalog is cached separately, so picking up a
+new release (a version bump, or edits to `workflows/`, `rules.yaml`,
+`.mcp.json`, or `hooks/hooks.json`) takes two steps -- refresh the
+catalog first, then update the plugin:
 
 ```bash
+claude plugin marketplace update operon-plugin-marketplace
 claude plugin update operon-plugin@operon-plugin-marketplace
 ```
 
-The note from `claude plugin update --help` says "restart required to
-apply" -- restart Claude Code after updating so the daemon picks up
-the new plugin state. If `update` doesn't pick up your changes (e.g.,
-because the marketplace is a local directory and `update` looks for
-a git rev change), the heavy-handed fallback is uninstall +
-reinstall:
+The first command re-pulls `marketplace.json`; the second then sees the
+newer version and pulls the code. `claude plugin update` compares the
+`version` string in `plugins/operon-plugin/.claude-plugin/plugin.json`,
+so a release must bump that version or `update` reports "already at the
+latest version" and keeps the cached copy. Restart Claude Code after
+updating so the daemon picks up the new plugin state.
+
+If `update` still reports up-to-date after both commands, clear the
+plugin cache and reinstall (Windows PowerShell: `Remove-Item -Recurse
+-Force $HOME\.claude\plugins\cache`):
 
 ```bash
-claude plugin uninstall operon-plugin@operon-plugin-marketplace
+rm -rf ~/.claude/plugins/cache
 claude plugin install operon-plugin@operon-plugin-marketplace
 ```
 
