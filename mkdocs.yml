@@ -1,5 +1,6 @@
 site_name: operon-plugin
 site_description: A Guided, Self-Revisable plugin for AI Research Software Operations in Claude Code
+site_url: https://sprustonlab.github.io/operon-plugin/
 
 nav:
   - Home: index.md
